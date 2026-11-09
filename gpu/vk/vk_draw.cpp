@@ -29,6 +29,11 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
+// (hookshot) Which program keys this build treats specially: the game profile's, not literals here
+// (game/game_profile.h, generated from nx2/game_profile.py). A profile that names none leaves every
+// program ordinary, which is what the renderer already does for a key it does not know.
+#include "game_profile.h"
+
 #include "vk_paths.h"
 #include "vk_draw.h"
 #include "vk_dump.h"
@@ -5925,7 +5930,13 @@ bool movie_upscale(VkCommandBuffer cmd, uint32_t in_handle, uint32_t out_handle,
 // of GPU time (vk_replay.cpp), they are left out from then on, as on AMD: the linear upscale below, the same picture a little
 // softer. The gameplay networks are never left out. RX_VK_NETWORK_KEEP=all: never
 std::atomic<bool> movie_networks_slow{false};
-bool gameplay_network(uint64_t key) { return key == 0xfd029a317a9a4b94ull || key == 0x9dc98871eb7fc101ull; }
+bool gameplay_network(uint64_t key) {
+    // (the game profile's gameplay networks: a profile that names none has no network that is never dropped)
+    static const uint64_t keys[] = GAME_GAMEPLAY_NETWORK_KEYS;
+    for (int i = 0; i < GAME_GAMEPLAY_NETWORK_KEY_COUNT; i++)
+        if (key == keys[i]) return true;
+    return false;
+}
 
 static movie_upscale_policy::Mode movie_upscale_mode() {
     // Read on first dispatch, after host/hos_main.c has loaded hookshot_env.txt.
@@ -6124,7 +6135,7 @@ bool scene_frame_inputs(SceneFrameInputs* out) {
 /// network. taau_key's own default turns itself off where the card can run the real network, which
 /// is the wrong condition for a backend that is meant to replace it.
 static bool upscale_trace_key(uint64_t key) {
-    const char* keys = getenv("RX_VK_UPSCALE_KEYS") ? getenv("RX_VK_UPSCALE_KEYS") : "fd029a317a9a4b94";
+    const char* keys = getenv("RX_VK_UPSCALE_KEYS") ? getenv("RX_VK_UPSCALE_KEYS") : GAME_UPSCALE_TRACE_KEYS;
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
     for (const char* q = keys; *q;) {
@@ -6157,16 +6168,18 @@ static void upscale_bindings(const NvnState& s, const Stage& st, std::vector<ups
     }
 }
 
-/// (hookshot) OoT's gameplay TAAU network (fd029a317a9a4b94) stood in for: its input upscaled into its output
-/// (shaders/taau_upscale.comp). The network's translation loses the blue channel, the yellow cast over every
-/// scene; with this the picture is right, without the network's temporal anti-aliasing.
-/// RX_VK_TAAU_KEYS=<program key prefixes,...> (default fd029a317a9a4b94; "-": none, the network runs)
+/// (hookshot) The game's own gameplay TAAU network stood in for: its input upscaled into its output
+/// (shaders/taau_upscale.comp). For Ocarina (fd029a317a9a4b94) the network's translation loses the blue channel,
+/// the yellow cast over every scene; with this the picture is right, without the network's temporal anti-aliasing.
+/// Which program that is comes from the game profile (game/game_profile.h): a profile that names none stands in for
+/// nothing and the game's own network runs.
+/// RX_VK_TAAU_KEYS=<program key prefixes,...> (default the profile's; "-": none, the network runs)
 bool taau_key(uint64_t key) {
     // (the real network where the card runs it as the console does; on the software multiplies it cost most of a frame on AMD's cards, and a
     // locked 60 with this in its place: Hookshot issue 52)
     static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS")
                               : Shader::Backend::SPIRV::mma_software || getenv("RX_VK_NO_F16")
-                                    ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
+                                    ? GAME_UPSCALE_TAAU_KEYS : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
     bool match = false;
@@ -6521,7 +6534,7 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     // (hookshot) Read here and not at the top: a dispatch this function turns down must not pay for
     // an environment lookup it never uses, which is the property tests/test_taau_env_lookup.py
     // guards. taau_key() above has its own cached answer; this is the stand-in's own list.
-    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
+    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : GAME_UPSCALE_TAAU_KEYS;
     return typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
 }
 

@@ -12,6 +12,9 @@ Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-fu
   --standalone: the standalone build's lift (<work>/sa/image, <work>/sa/gen): the SDK's OS-facing functions hooked
            to the native runtime in host/ or to generated stubs, plus hos_image.c (nx2/standalone.py). It shares the
            chunk boundaries of <work>/image, so its unhooked chunks are the emulator build's, byte for byte.
+
+  Which game this is a lift of, and so which patch sites, offsets and keys apply, comes from the game profile
+  (nx2/game_profile.py; HOOKSHOT_GAME=<key> selects one, default oot). This driver names no game itself.
 """
 import argparse
 import collections
@@ -29,6 +32,7 @@ import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
 import chunks
+import game_profile
 import standalone
 import adr_entries  # noqa: E402
 import nso
@@ -127,6 +131,10 @@ def main():
                    help="no extra entries at the code addresses ADR / ADRP+ADD take (nx2/adr_entries.py)")
     a = p.parse_args()
     a.exefs = a.exefs or kit.need_exefs()
+    # (which game this build is for, and so which patch sites, offsets and keys apply: nx2/game_profile.py)
+    profile = game_profile.active()
+    print("game profile: %s (%s)%s" % (profile.key, profile.game, "" if profile.main_base is not None else
+                                       ", no main base: its patches are off"))
     t0 = time.time()
     hle = ()
     if a.standalone:
@@ -155,13 +163,12 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
-    if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
-        import oot_wide
-        oot_wide.install(L, img)
-        import oot_camera   # (after oot_wide: it appends to the same site)
-        oot_camera.install(L, img)
-        import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
-        oot_occlusion.install(L, img)
+    if a.standalone:
+        # (hookshot) The game profile's patches: C after a few of the game's instructions, at addresses that are one
+        # build of one game's. Which modules those are comes from nx2/game_profile.py and not from imports here,
+        # because this driver is the same for every game the recompiler is pointed at; the profile's order matters
+        # (Ocarina's camera publish appends to the site its widescreen patch writes first).
+        game_profile.install_patches(L, img, profile)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     total = coverage(L, img, img_dir)
@@ -180,9 +187,9 @@ def main():
         gen = os.path.join(out_dir, "gen")
         files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
                              counters=[] if a.no_polls else [poll.stats])
-        import oot_patches
-        main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
-        oot_patches.apply(gen, protect_hearts=a.standalone and main_build == oot_patches.LIFE_BUILD_ID)
+        game_profile.apply_code_patches(
+            gen, profile, standalone=a.standalone,
+            main_build=next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), ""))
         a64_rtgen.write(gen)
         if a.standalone:
             start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)

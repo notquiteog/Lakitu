@@ -8,7 +8,8 @@ the field of view, and camera-derived motion needs the same projection.
 
 The field layout, and how each offset was identified from what the function does with it, is in
 docs/upscaling.md. The site is shared with nx2/oot_wide.py's camera-ratio patch, so this appends to
-whatever is already there rather than replacing it; lift.py installs the ratio first.
+whatever is already there rather than replacing it; the "oot" profile lists oot_wide before
+oot_camera (nx2/game_profile.py), which is what puts the ratio in first.
 
 Which of +0x98 and +0x9C is the near plane depends on the byte at +0x0A, which the function uses to
 swap them before taking their difference. Rather than decide what that flag means, this takes the
@@ -23,7 +24,7 @@ temporary. The view projection a temporal upscaler reprojects with is not the pr
 this window is how the rest of it gets identified from real values instead of a guess.
 """
 
-MAIN = 0x80020000
+import game_profile
 
 # The same four sites nx2/oot_wide.py patches for the camera ratio: sead's perspective projection
 # matrix update and its three inlined copies. The projection object is in a different register in
@@ -59,22 +60,8 @@ def _publish(base, with_matrix):
     ).replace("const uint64_t _cp = c->x[0];", "const uint64_t _cp = c->x[%d];" % base)
 
 
-def install(lifter, img):
+def install(lifter, img, profile=None):
     """Appends the publish to every projection update site. A site whose word differs is left out;
     0 sites leaves the renderer on its own defaults."""
-    n = 0
-    for off, word, base, with_matrix in SITES:
-        pc = MAIN + off
-        try:
-            have = img.word(pc)
-        except Exception:
-            have = None
-        if have != word:
-            print("camera: main+%#x holds %s, not %08x: left out"
-                  % (off, "?" if have is None else "%08x" % have, word))
-            continue
-        lifter.after[pc] = lifter.after.get(pc, "") + "\n" + _publish(base, with_matrix)
-        n += 1
-    print("camera: %d of %d projection sites publish the near plane, far plane and field of view"
-          % (n, len(SITES)))
-    return n
+    sites = tuple((off, word, _publish(base, with_matrix)) for off, word, base, with_matrix in SITES)
+    return game_profile.install_sites(lifter, img, profile or game_profile.active(), sites, "camera")

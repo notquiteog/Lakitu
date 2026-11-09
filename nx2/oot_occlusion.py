@@ -9,29 +9,15 @@ The sites are cLohan's community patch (zortos293/Lichii#641), as Fritchii ships
 "Occlusion Off", ldrb w8, [x0] -> mov w8, wzr). Each site's original word is checked: another game version leaves it out.
 """
 
-MAIN = 0x80020000   # (main's base in this image: nx2/eden_image.py)
+import game_profile
+
 LDRB_W8_X0 = 0x39400008
 OFFSETS = (0x11ACE68, 0x11B828C, 0x11B82A4, 0x11ACEC8, 0x11B82DC, 0x11B82F4)
 TEXT = ("{ extern volatile int hos_occlusion_off; if (hos_occlusion_off) c->x[8] = 0; }   "
         "/* (nx2/oot_occlusion.py: no occlusion queries) */")
+SITES = tuple((off, LDRB_W8_X0, TEXT) for off in OFFSETS)
 
 
-def install(lifter, img):
+def install(lifter, img, profile=None):
     """The sites into lifter.after; a site whose word differs (another game version) is left out"""
-    n = 0
-    for off in OFFSETS:
-        pc = MAIN + off
-        try:
-            have = img.word(pc)
-        except Exception:
-            have = None
-        if have != LDRB_W8_X0:
-            print("occlusion off: main+%#x holds %s, not %08x: left out" % (off, "?" if have is None else "%08x" % have, LDRB_W8_X0))
-            continue
-        if pc in lifter.after:
-            lifter.after[pc] += "\n" + TEXT
-        else:
-            lifter.after[pc] = TEXT
-        n += 1
-    print("occlusion off: %d of %d sites" % (n, len(OFFSETS)))
-    return n
+    return game_profile.install_sites(lifter, img, profile or game_profile.active(), SITES, "occlusion off")
