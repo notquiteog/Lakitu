@@ -435,13 +435,13 @@ use them.
 For example, keep saves somewhere else:
 
 ```powershell
-cd "C:\Games\Hookshot"
-.\bin\hookshot.exe --user "D:\Hookshot data"
+cd "C:\Games\Lakitu"
+.\bin\hookshot.exe --user "D:\Lakitu data"
 ```
 
 ```sh
-cd ~/Games/Hookshot
-./bin/hookshot --user "$HOME/hookshot-data"
+cd ~/Games/Lakitu
+./bin/hookshot --user "$HOME/lakitu-data"
 ```
 
 `hookshot_env.txt` and the other test switches are documented below.

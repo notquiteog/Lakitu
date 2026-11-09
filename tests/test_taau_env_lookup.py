@@ -24,6 +24,8 @@ def fixture(source):
 
 PREFIX = r'''
 #define _CRT_SECURE_NO_WARNINGS
+// (the game profile's key prefixes, as the real file reads them: game/game_profile.h)
+#include "game_profile.h"
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -225,12 +227,14 @@ def main():
         source.write_text(cpp, encoding='utf-8')
         if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
             command = [args.cxx, '/nologo', '/std:c++17', '/EHsc', '/W4', '/WX',
-                       '/I' + str(ROOT / 'gpu' / 'vk'), str(source),
+                       '/I' + str(ROOT / 'gpu' / 'vk'), '/I' + str(ROOT / 'game'), str(source),
                        '/Fo' + str(folder / 'fixture.obj'), '/Fe' + str(exe), *args.cxx_arg]
         else:
-            # (this fork's taau_stand_in includes the seam's own headers, which live in gpu/vk)
+            # (this fork's taau_stand_in includes the seam's own headers, which live in gpu/vk; game/ holds the
+            #  game profile's C view, which is where the default key prefixes come from)
             command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror',
-                       '-I' + str(ROOT / 'gpu' / 'vk'), *args.cxx_arg, str(source), '-o', str(exe)]
+                       '-I' + str(ROOT / 'gpu' / 'vk'), '-I' + str(ROOT / 'game'),
+                       *args.cxx_arg, str(source), '-o', str(exe)]
         subprocess.run(command, cwd=folder, check=True)
         failed = False
         for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes'):

@@ -1,9 +1,10 @@
 /* (hookshot) The update offer: at start, the latest release on GitHub is asked for (a few seconds at most, nothing when offline), and
-   when it is not the release this game folder was built with, the player is asked whether to update. Yes starts the Hookshot Builder
+   when it is not the release this game folder was built with, the player is asked whether to update. Yes starts the builder
    that made the folder (hookshot_version.txt, written by nx2/make_game.py) with --update: it downloads the new release and builds the
    folder again from the game files the folder keeps, and the game closes. A folder with no hookshot_version.txt (built from the
    repository, or before updates came in) is never asked about. HOOKSHOT_NO_UPDATE_CHECK=1 (hookshot_env.txt) turns it off */
 #ifdef _WIN32
+#include "game_profile.h"   /* (the project's name, for the offer's window: game/game_profile.h) */
 #include "hos_paths.h"
 #include <windows.h>
 #include <winhttp.h>
@@ -118,7 +119,7 @@ void hos_update_check(void) {
                    L"The Hookshot Builder that made this folder was not found, so it can't update by itself. Open the download page?\n\n"
                    L"Yes: open the page\nNo: not now (asked again next time)\nCancel: skip this version",
                    wtag, whave);
-    const int answer = MessageBoxW(NULL, text, L"Hookshot update", MB_YESNOCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    const int answer = MessageBoxW(NULL, text, GAME_PROJECT_W L" update", MB_YESNOCANCEL | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
     if (answer == IDCANCEL) {
         wchar_t user[MAX_PATH + 16];
         _snwprintf(user, MAX_PATH + 16, L"%ls\\user", dir);
@@ -146,7 +147,7 @@ void hos_update_check(void) {
         fflush(stderr);
         ExitProcess(0);
     }
-    MessageBoxW(NULL, L"Hookshot Builder could not be started. The game starts as it is.", L"Hookshot update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    MessageBoxW(NULL, L"The builder could not be started. The game starts as it is.", GAME_PROJECT_W L" update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 #elif defined(__linux__)
 #include "hos_paths.h"

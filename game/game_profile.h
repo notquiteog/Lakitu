@@ -8,8 +8,10 @@
 #ifndef GAME_PROFILE_H
 #define GAME_PROFILE_H
 
-/* the project, which is not game data: the window's name, the AppImage's and the builder's */
+/* the project, which is not game data: the window's name, the AppImage's and the builder's.
+ * GAME_PROJECT_W is the same name for the Win32 wide-string calls (MessageBoxW and friends). */
 #define GAME_PROJECT "Lakitu"
+#define GAME_PROJECT_W L"Lakitu"
 
 #define GAME_PROFILE_KEY "oot"
 #define GAME_NAME "The Legend of Zelda: Ocarina of Time"

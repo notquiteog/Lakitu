@@ -76,7 +76,7 @@ static DWORD WINAPI av1_missing_notice(LPVOID unused) {
     (void)unused;
     if (MessageBoxA(NULL, "Hookshot's movies need Microsoft's free AV1 Video Extension, which this PC does not have. Without it they show a green "
                           "screen and the game can stop at a black screen.\n\nOpen its Microsoft Store page now? Install it, then restart the game.",
-                    "Hookshot", MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST) == IDYES)
+                    HOS_GAME_TITLE, MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST) == IDYES)
         ShellExecuteA(NULL, "open", "ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V", NULL, NULL, SW_SHOWNORMAL);
     return 0;
 }

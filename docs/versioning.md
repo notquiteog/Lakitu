@@ -1,6 +1,6 @@
 # Versioning and releases
 
-Hookshot follows [Semantic Versioning 2.0.0](https://semver.org/) and the conventions of
+Lakitu follows [Semantic Versioning 2.0.0](https://semver.org/) and the conventions of
 [semantic-release](https://semantic-release.org/). The current version is **0.1.0**.
 
 The git tag is the only source of truth. No file carries a version that has to be edited for a release: the game reads
@@ -13,7 +13,7 @@ packaged.
 `v0.1.0`: the `v` belongs to the tag, not to the version. Build metadata is not used in tags.
 
 One version covers the whole project: the game (`hookshot.exe` / `hookshot`), the Vulkan back end, the lift pipeline
-and its scripts, Hookshot Builder and the Linux AppImage. They are built from the same commit and released together,
+and its scripts, Lakitu Builder and the Linux AppImage. They are built from the same commit and released together,
 so they never carry different versions.
 
 The "public" surface the rules protect is the command line of `make_game.py` and the builder, the `RX_` and `HOS_`
@@ -60,7 +60,7 @@ semantic-release does not treat major version zero specially: a breaking change 
 This is deliberate. Its documentation says that SemVer's different rules for `0.x` are out of scope, and it recommends
 `1.0.0` as the first release.
 
-Hookshot starts at `0.1.0` anyway, because the first versioned release is not stable. That tag is made once by hand
+Lakitu starts at `0.1.0` anyway, because the first versioned release is not stable. That tag is made once by hand
 (see below); after it, the release workflow is the only thing that creates tags. Consequence: the first breaking change
 merged to `main` releases `1.0.0`, not `0.2.0`.
 
@@ -100,7 +100,7 @@ semantic-release's first release is `1.0.0` when it finds no tag. To make `0.1.0
 commit that introduces this scheme once:
 
 ```sh
-git tag -a v0.1.0 -m "Hookshot 0.1.0"
+git tag -a v0.1.0 -m "Lakitu 0.1.0"
 git push origin v0.1.0
 ```
 
