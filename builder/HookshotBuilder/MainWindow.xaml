@@ -262,7 +262,7 @@
         <!-- ===== the launcher (Hookshot Launcher.exe in the game folder, started with launch and its folder) ===== -->
         <StackPanel x:Name="LaunchPage" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center">
           <TextBlock Style="{StaticResource Label}" Text="THE LEGEND OF ZELDA" HorizontalAlignment="Center"/>
-          <TextBlock Style="{StaticResource Heading}" Text="Ocarina of Time" HorizontalAlignment="Center" FontSize="34" Margin="0,4,0,0"/>
+          <TextBlock Style="{StaticResource Heading}" Text="Mario Kart World" HorizontalAlignment="Center" FontSize="34" Margin="0,4,0,0"/>
           <TextBlock x:Name="LaunchVersion" Style="{StaticResource Sub}" HorizontalAlignment="Center" TextAlignment="Center" Margin="0,8,0,0"/>
           <TextBlock x:Name="LaunchStatus" FontSize="13" Foreground="{StaticResource InkSoft}" Text="Checking for updates…"
                      HorizontalAlignment="Center" Margin="0,16,0,0"/>

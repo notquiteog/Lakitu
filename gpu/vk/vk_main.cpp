@@ -1,6 +1,9 @@
 // The Vulkan back end's start: vulkan-1.dll, the instance, the device (Vulkan 1.3 and the extensions the NVN replay
 // wants where the GPU has them: mesh shaders, host memory import, graphics pipeline libraries), the window's
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
+// (hookshot) the game's name and the project's, for the messages below: the game profile
+#include "game_profile.h"
+
 #include "vk_paths.h"
 #include "vk_loader.h"
 
@@ -929,11 +932,11 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         logf("vk: this GPU has no mesh shaders: the game's foliage, grass and many effects cannot be drawn");
 #ifdef _WIN32
         std::thread([name = std::string(dev.props.deviceName)] {
-            const std::string text = "Your graphics card (" + name + ") or its driver has no mesh shader support, which Ocarina of Time "
-                "uses for foliage, grass and many effects, so parts of the picture will be missing or broken.\n\nHookshot needs a GPU "
+            const std::string text = "Your graphics card (" + name + ") or its driver has no mesh shader support, which " GAME_NAME " "
+                "uses for foliage, grass and many effects, so parts of the picture will be missing or broken.\n\n" GAME_PROJECT " needs a GPU "
                 "with mesh shaders: NVIDIA GeForce RTX 20 series or newer, AMD Radeon RX 6000 series or newer, or Intel Arc. If your "
                 "card is one of those, update its driver.";
-            MessageBoxA(nullptr, text.c_str(), "Hookshot: graphics card", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+            MessageBoxA(nullptr, text.c_str(), GAME_PROJECT ": graphics card", MB_OK | MB_ICONWARNING | MB_TOPMOST);
         }).detach();
 #endif
     }

@@ -1,9 +1,9 @@
 #!/bin/bash
-# The Linux AppImage: Hookshot Builder with everything it needs to build the game on the player's PC. No game data and
+# The Linux AppImage: the builder with everything it needs to build the game on the player's PC. No game data and
 # nothing made from it is in it: the game is built from the player's own copy, as on Windows.
 #
 #   scripts/linux/deps.sh        (first: the compiler, Python, FFmpeg, SDL2, headers into build-linux/deps)
-#   scripts/linux/appimage.sh    -> build-linux/Hookshot-<version>-x86_64.AppImage
+#   scripts/linux/appimage.sh    -> build-linux/<the project's name>-<version>-x86_64.AppImage
 # The same image builds the game and, with --play, starts the one it saved.
 #
 # Built on the oldest system it is for (CI: Ubuntu 22.04): the sysroot it carries is that system's C library, so the
@@ -16,6 +16,9 @@ B=$ROOT/build-linux
 DEPS=${DEPS:-$B/deps}
 APPDIR=$B/AppDir
 VERSION=${HOOKSHOT_VERSION:-$(git describe --tags --always --match "v[0-9]*" 2>/dev/null || echo dev)}
+# The project's name, which names the AppImage: from the one place that holds it (nx2/game_profile.py), so a
+# rename does not have to be remembered here.
+PRODUCT=$(python3 -I -c 'import sys; sys.path.insert(0, "nx2"); import game_profile; print(game_profile.PROJECT)')
 export EMSDK=$DEPS/emsdk RX_CPM=$DEPS/cpm
 PY=$DEPS/python/bin/python3
 
@@ -70,7 +73,7 @@ cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
 cp "$VK" "$L/hookshot_vk.so"
 cp "$DEPS/sdl2/libSDL2-2.0.so.0" "$L/libSDL2-2.0.so.0"
-cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides Hookshot)
+cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides the project)
 
 # the sysroot: this system's C library (headers, start files, the libraries to link against) and GCC's runtime pieces
 S=$L/sysroot
@@ -113,7 +116,7 @@ cp assets/hookshot.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hookshot.pn
 # (the update list, beside AppRun and not inside a hashed part: hookshot-linux.txt names each part's checksum)
 python3 scripts/linux/make_parts.py "$APPDIR" "$VERSION" "$B/parts"
 
-OUT=$B/Hookshot-$VERSION-x86_64.AppImage
+OUT=$B/$PRODUCT-$VERSION-x86_64.AppImage
 rm -f "$OUT"
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$DEPS/appimagetool" --runtime-file "$DEPS/runtime-x86_64" --comp zstd "$APPDIR" "$OUT"
 echo "$OUT: $(du -h "$OUT" | cut -f1)"

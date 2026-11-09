@@ -13,6 +13,7 @@
 #ifndef HOS_H
 #define HOS_H
 #include "a64.h"
+#include "game_profile.h"   /* (the project's name and which game this build is for: game/game_profile.h) */
 #include <stdarg.h>
 
 #define HLE(sym) void imp_##sym(Ctx *c)
@@ -50,7 +51,9 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
 /* (oot-recomp) MKW's own hooks at fixed guest addresses (its frame pacer in nvn_native.c / nn_vi.c, its idle loop in
    hos_thread.c) run only when the lifted main is Mario Kart World's: any other game has other code there */
 int hos_game_is_mkw(void);
-#define HOS_GAME_TITLE "Hookshot"
+/* The window's name, which is the project's name: one constant, in the game profile (game/game_profile.h, generated
+   from nx2/game_profile.py), so renaming the project is a line there rather than a sweep through the tree. */
+#define HOS_GAME_TITLE GAME_PROJECT
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */

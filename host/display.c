@@ -268,7 +268,7 @@ static DWORD WINAPI display_main(void *p) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   /* (nx2/make_icon.py; none in a build without the picture) */
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = "Hookshot";
+    wc.lpszClassName = HOS_GAME_TITLE;   /* (the project's name, from the game profile) */
     RegisterClassA(&wc);
     dpi_aware_thread();
     extern float hos_aspect_ratio;
@@ -280,7 +280,7 @@ static DWORD WINAPI display_main(void *p) {
     RECT r = {0, 0, win_w, win_h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     const int noactivate = getenv("HOS_WINDOW_NOACTIVATE") != NULL;
-    hwnd = CreateWindowA("Hookshot", HOS_GAME_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    hwnd = CreateWindowA(HOS_GAME_TITLE, HOS_GAME_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                          CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
     if (window_dpi(hwnd) != 96) {
         const UINT dpi = window_dpi(hwnd);

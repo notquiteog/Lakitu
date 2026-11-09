@@ -1,8 +1,13 @@
-# Contributing to Hookshot
+# Contributing to Lakitu
 
-Hookshot is a static recompilation of the Switch 2 *The Legend of Zelda: Ocarina of Time* remake: the game's AArch64
-code is lifted to C, the Horizon OS and NVN2 are implemented natively, and the GPU work is replayed on Vulkan. No
-emulator is involved, and the game is built on your PC from your own copy.
+Lakitu is a static recompilation of a Switch 2 title: the game's AArch64 code is lifted to C, the Horizon OS and NVN2
+are implemented natively, and the GPU work is replayed on Vulkan. No emulator is involved, and the game is built on
+your PC from your own copy.
+
+It is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is mkw-recomp (Mario Kart World) retargeted
+to Ocarina of Time, and this fork takes the engine back to Mario Kart World. **Today it still builds Ocarina**
+(`HOOKSHOT_GAME=oot`, the default): the Mario Kart World game profile exists but holds no measured value, because
+there is no dump to measure. The readme's "What a Mario Kart World build still needs" says what is missing.
 
 This page covers what to send, how to build and test it, and the rules that keep the project out of trouble. The
 [development guide](docs/development.md) has the full pipeline and its commands; the [design notes](docs/design.md)
@@ -37,17 +42,18 @@ game data, leave it out.
 
 ## Before you open an issue or a PR
 
-- Try the [newest release](https://github.com/NotRexed/Hookshot/releases/latest) first. It includes every fix before it.
+- Try the [newest upstream release](https://github.com/NotRexed/Hookshot/releases/latest) first. It includes every fix before it.
 - Search the open issues. If yours is already there, add your details instead of opening another.
 - English, please.
 - One topic per issue or pull request. Do not mix a fix with a refactor or a batch of unrelated changes.
 - Report the version you actually ran: the release name, or the first line of `hookshot_log.txt`.
 - Test without ReShade, shader-cache tools, overlays and frame-generation injectors when you report a graphics or
-  performance problem. They change what Hookshot does.
+  performance problem. They change what the game does.
 
 ## Development setup
 
-You need your own supported dump: program `0400486024DEC000`, update v131072, build `e0f3ccfa`. Other versions do
+You need your own supported dump. For the default `oot` profile that is program `0400486024DEC000`, update
+v131072, build `e0f3ccfa` (the game profile holds those: `python -I nx2/game_profile.py`). Other versions do
 not work, and the build reads the dump where it lies without changing it. Builds need about 60 GB free and a run uses
 about 10 GB of RAM.
 
@@ -77,7 +83,7 @@ about 10 GB of RAM.
 
 ### Linux
 
-Either use the `Hookshot-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
+Either use the upstream `Hookshot-<version>-x86_64.AppImage` from the Releases page, or build the environment and the AppImage
 yourself:
 
 ```sh
@@ -88,7 +94,7 @@ scripts/linux/appimage.sh   # the AppImage, in build-linux/
 The AppImage needs glibc 2.35 or newer and a Vulkan 1.3 driver with mesh shaders. `HOOKSHOT_JOBS` sets how many files
 compile at once. The README's [Linux section](readme.md#on-linux) has the details and the runtime paths.
 
-### Hookshot Builder
+### The builder
 
 The builder is a .NET 8 WPF app. Open `builder/HookshotBuilder.sln` in Visual Studio 2022 with the .NET desktop
 workload, or build it from a developer prompt:
@@ -108,8 +114,8 @@ window, including one started to update a game, uses Automatic again.
 
 | Command | What it does |
 |---|---|
-| `python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Hookshot" --language en-US` | Build a complete game folder from a `.nup`. A build takes about 40 minutes. |
-| `python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out "C:\Games\Hookshot"` | The same, from extracted folders. |
+| `python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Lakitu" --language en-US` | Build a complete game folder from a `.nup`. A build takes about 40 minutes. |
+| `python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out "C:\Games\Lakitu"` | The same, from extracted folders. |
 | `python -I nx2/make_game.py --check --nup "C:\path\your-game.nup"` | Check the game and its version without building. |
 | `python -I nx2/dump.py --dump <folder with exefs/ and romfs/> --set` | Record the dump in `work/dump.txt`. |
 | `python -I nx2/lift.py --standalone --write` | Lift the game to C in `work/sa/gen`. |
@@ -172,9 +178,21 @@ gigabytes and are derived from the game.
 
 - Match the file you are editing: there is no formatter configuration, so use the indentation, comment style and
   naming around you. Do not reformat unrelated code in the same change.
-- Keep OoT-specific code in new files where possible. `nx2/`, `host/` and `gpu/` are kept close to mkw-recomp so
+- Keep game-specific code in new files where possible. `nx2/`, `host/` and `gpu/` are kept close to mkw-recomp so
   upstream fixes can be applied as a patch; keeping the paths and the shared files recognizable is what makes that
   work. Each sync names its new mkw-recomp base commit in the commit message.
+- **Anything that is one game's goes in the game profile** (`nx2/game_profile.py`; the C side reads the generated and
+  committed `game/game_profile.h`, which `python -I nx2/game_profile.py --emit-header` rewrites). Addresses, offsets
+  into the game's own modules, shader program keys and the list of patch modules belong there, not as literals in
+  `nx2/lift.py`, `host/` or `gpu/vk/`. A value a profile does not know is `None` with a comment saying what it is and
+  how it would be found; the code it guards then leaves its field alone and says so once. Do not put a plausible
+  number in: a wrong address is a crash or silent memory corruption, while a `None` is a feature that is simply off.
+- **A patch site always carries the instruction word it expects.** Install sites through
+  `game_profile.install_sites()`, which checks that word and leaves the site out when the game does not have it
+  there. That check is what makes a profile safe to be wrong about, and `tests/test_game_profile.py` fails if a patch
+  module stops doing it or if `nx2/lift.py` goes back to importing a game's modules by name.
+- `namespace mkwvk`, `MkwVkRenderer` and `host/mkw_glue.c` keep their names: they came from mkw-recomp and are
+  correct for this game. Renaming them would be a huge diff for nothing.
 - Do not modify `third_party/`. Its parts are unmodified upstream copies with their notices in `PROVENANCE.md`; add a
   new folder and a provenance note rather than editing one.
 - Treat the local mkw-recomp and Eglantine checkouts as read-only references: read from them, run them, never edit
@@ -212,7 +230,7 @@ the trailers that describe it; if you wrote the change yourself, there is nothin
 
 ## Licensing
 
-Hookshot is free software under the [GNU General Public License, version 3 or later](LICENSE). By submitting a change
+Lakitu is free software under the [GNU General Public License, version 3 or later](LICENSE). By submitting a change
 you agree to license it under those terms. Only send code you can license that way. Do not paste code from a project
 with an incompatible license, and do not paste decompiled game code or anything generated from the dump into a PR.
 

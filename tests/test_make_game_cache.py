@@ -151,7 +151,8 @@ class NupCacheTests(unittest.TestCase):
             self.run_to_lift(self.new_nup, supported=False)
         self.assertEqual(self.extractions, [self.new_nup])
         self.assertEqual(result.exception.code, 1)
-        self.assertIn("This is build 01234567. Hookshot supports build %s." % make_game.BUILD_ID, self.output)
+        self.assertIn("This is build 01234567. %s supports build %s." % (make_game.PRODUCT, make_game.BUILD_ID),
+                      self.output)   # (the project's name and the profile's build: nx2/game_profile.py)
         self.assertEqual(self.cache(), before)
 
     def test_missing_romfs_preserves_the_previous_cache_and_save(self):

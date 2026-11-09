@@ -1,20 +1,21 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/hookshot.png" alt="Hookshot" width="200">
+  <img src="assets/hookshot.png" alt="Lakitu" width="200">
 </a>
 
   <br>
-  <b>Hookshot</b>
+  <b>Lakitu</b>
   <br>
 </h1>
 
-<h4 align="center">The Legend of Zelda: Ocarina of Time (Nintendo Switch 2) running natively on Windows & Linux, with no emulator.
+<h4 align="center">Mario Kart World (Nintendo Switch 2) running natively on Windows &amp; Linux, with no emulator.
 </h4>
 
 
 <p align="center">
   <a href="#project-status">Status</a> |
+  <a href="#what-a-mario-kart-world-build-still-needs">Mario Kart World</a> |
   <a href="#install-and-play">Install and play</a> |
   <a href="#in-game-menu">In-game menu</a> |
   <a href="#if-something-goes-wrong">Problems</a> |
@@ -25,7 +26,7 @@
   <a href="#license">License</a>
 </p>
 
-Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows or Linux program,
+Lakitu is a static recompilation. The game's code is translated to C and compiled into a Windows or Linux program,
 the console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
 **on your PC, from your own copy of the game**.
 <br>
@@ -37,12 +38,33 @@ the console's system software is reimplemented, and the Switch 2 graphics are re
 Discord: https://discord.gg/DVQQJphbBf
 <br>
 
+> [!WARNING]
+> **Lakitu does not run Mario Kart World yet. Only the scaffolding for it exists.**
+>
+> Lakitu is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is itself mkw-recomp (the Mario Kart
+> World static recompilation) retargeted to Ocarina of Time. This fork takes the engine back to the game it came
+> from, so the recompiler, the Horizon runtime and the Vulkan back end are already a Switch 2 and Mario Kart World
+> lineage &mdash; but every address, offset and shader key in the game-specific layer is still Ocarina's.
+>
+> What exists today: a game profile seam ([`nx2/game_profile.py`](nx2/game_profile.py)) that holds the game-specific
+> values in one place, with Ocarina's measured values as the `oot` profile and an **empty** `mkw` profile beside it.
+> Nothing in the `mkw` profile has been measured, because nothing of Mario Kart World has been dumped, lifted, built
+> or booted here. Unknown values are `None` and the features that need them are off, rather than filled in with
+> numbers that look plausible &mdash; a wrong address there is a crash or silent corruption.
+>
+> So: the build this repository produces today is still the Ocarina one (`HOOKSHOT_GAME=oot`, the default), and
+> everything below about installing and playing describes that. "[What a Mario Kart World build still
+> needs](#what-a-mario-kart-world-build-still-needs)" lists what has to be found first.
+
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
 > need your own copy. Everything the build creates (`hookshot.exe`, the generated code, the shader caches and your
 > saves) comes from your game and stays on your PC. Never share those files.
 
 ## Project status
+
+The table below is the **`oot` profile**: Ocarina of Time, which is what this engine plays today. There is no
+Mario Kart World row because there is nothing to put in one yet.
 
 Experimental. Most testing so far has been around the start of the game. Players have reported on many PCs since:
 the table says what works and what does not yet.
@@ -65,9 +87,45 @@ the table says what works and what does not yet.
 | Cards without mesh shaders (such as AMD RX 5000 and older) | ❌ Not supported: parts of the picture are missing. A fallback was tried and taken out again for now ([#640](https://github.com/NotRexed/Hookshot/issues/640)) |
 | Linux | ✅ Works with the AppImage. Tested on several distributions (CachyOS, Fedora, Bazzite, SteamOS) and cards, with open problems on some AMD cards ([#604](https://github.com/NotRexed/Hookshot/issues/604), [#528](https://github.com/NotRexed/Hookshot/issues/528)) |
 
+## What a Mario Kart World build still needs
+
+The engine is already a Switch 2 one and already came from Mario Kart World, so none of the hard parts (the AArch64
+lift, Horizon, NVN2, the Ampere shader path) are in question. What is missing is the game-specific layer, which lives
+in one place: the `mkw` profile in [`nx2/game_profile.py`](nx2/game_profile.py). Every field in it is `None` or empty,
+with a comment saying what it is and how it would be found. Nothing below has been guessed at.
+
+Somebody with a Mario Kart World dump has to find, in roughly this order:
+
+1. **The dump's identity** &mdash; program id, version and `main`'s build id. `python -I nx2/dump.py --dump <folder
+   with exefs/ and romfs/> --set` prints all three. Fills in `program_id`, `version`, `build_id`.
+2. **`main`'s base in the lifted image.** Eden's layout puts `rtld` first, so this is `0x80000000` plus that dump's
+   page-aligned `rtld` size, not Ocarina's `0x80020000`. `nx2/lift.py` prints it on its `image:` line, and the seam
+   warns when the profile disagrees with the image. Fills in `main_base`. Every patch offset is relative to it, so
+   nothing else can be filled in first.
+3. **The graphics module's offsets** &mdash; the frame limiter, the nominal frame rate, the variable-refresh gate and
+   the adaptive controller's words, found the way Ocarina's were: by reading the function that sleeps to the limiter
+   and the one that writes it. Until then `host/nn_vi.c` leaves those fields alone and says so once, game time steps
+   whole frames, and the game paces itself as it ships. Fills in `gfx`.
+4. **The shader program keys** the renderer should treat specially &mdash; a cooperative-matrix program that resolves
+   the scene, from a real boot's program census. Until then no program gets a stand-in and none is handed to an
+   upscaler backend. Fills in `upscale`.
+5. **Patch modules, if they are wanted at all.** Widescreen, the camera publish for a temporal upscaler and the
+   occlusion-query switch are three tables of Ocarina addresses (`nx2/oot_wide.py`, `nx2/oot_camera.py`,
+   `nx2/oot_occlusion.py`); none of them transfers. A Mario Kart World equivalent is a new module, listed in the
+   profile's `patch_modules`. Note that Mario Kart World already has a frame pacer the runtime knows from mkw-recomp
+   (`hos_mkw_pacer`), reached through `host/nvn_native.c` and not through the profile.
+6. **Whatever a first boot turns up** &mdash; the NVN2 procs this game asks for that Ocarina did not, its device
+   limits, its romfs layout, its movies. That is stage S3 onwards in the [design notes](docs/design.md), and it is
+   the same work for any new game.
+
+Until step 1, `HOOKSHOT_GAME=mkw` builds and runs: it simply has no patches, no pacing fields and no special shader
+keys. That is deliberate. An unknown offset is a feature that is off; a *wrong* offset is a crash or silently
+corrupted memory in somebody's game, which is why the profile holds `None` rather than a plausible number, and why
+every patch site carries the instruction word it expects and is skipped when the game does not have it there.
+
 ## Install and play
 
-The game does not come ready-made: Hookshot Builder builds it on your PC from your copy. You do this once. After that
+The game does not come ready-made: Lakitu Builder builds it on your PC from your copy. You do this once. After that
 you start the game from its launcher, which also updates it.
 
 ### What you need
@@ -87,18 +145,18 @@ you start the game from its launcher, which also updates it.
 ### On Windows
 
 1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download `HookshotBuilder.exe`.
-2. Run it. It downloads the rest of Hookshot Builder (about 500 MB), checks it, and opens it.
+2. Run it. It downloads the rest of Lakitu Builder (about 500 MB), checks it, and opens it.
 3. Pick your game. The builder looks for `.nup` files in your Downloads, Desktop and Documents folders and lists them
    under **Found on this PC**. Not listed? Press **Browse…**, drop the file on the window, or choose
    **romfs and exefs folders**. The builder checks that it is the right version.
-4. Under **Install the game to**, keep the folder (`Games\Hookshot` in your user folder) or press **Change**. Choose
+4. Under **Install the game to**, keep the folder (`Games\Lakitu` in your user folder) or press **Change**. Choose
    the **Game language**.
 5. Press **Build the game**. It takes about 10 to 45 minutes, depending on your CPU and memory. You can use your PC in
    the meantime.
 6. When it says **Your game is ready**, press **Play**. The **Desktop shortcut** and **Start menu entry** boxes are
    ticked: untick them if you don't want them.
 
-Next time, start the game from the Hookshot shortcut, or `hookshot.exe` in the game folder. That is the launcher: it
+Next time, start the game from the Lakitu shortcut, or `hookshot.exe` in the game folder. That is the launcher: it
 has **Play**, and **Update** when a newer release is out.
 
 The first start prepares the game's shaders, which takes a while. Later starts are faster.
@@ -106,18 +164,18 @@ The first start prepares the game's shaders, which takes a while. Later starts a
 ### On Linux
 
 1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download
-   `Hookshot-<version>-x86_64.AppImage`. It is Hookshot Builder with everything it needs inside.
+   `Lakitu-<version>-x86_64.AppImage`. It is Lakitu Builder with everything it needs inside.
 2. Allow it to run as a program. In most file managers: right-click it, open **Properties**, and turn on
    "Allow executing file as program" (the words differ between desktops). Or in a terminal:
-   `chmod +x Hookshot-*-x86_64.AppImage`.
-3. Double-click it. The Hookshot Builder window opens.
+   `chmod +x Lakitu-*-x86_64.AppImage`.
+3. Double-click it. The Lakitu Builder window opens.
 4. Under **Game files**, choose **.nup file** or **romfs and exefs**, then press **Browse** to pick them. The builder
    checks the version.
-5. Under **Save the game to**, keep `~/Games/Hookshot` or choose another folder. Choose a **Language**.
+5. Under **Save the game to**, keep `~/Games/Lakitu` or choose another folder. Choose a **Language**.
 6. Press **Build**. It takes about 10 to 45 minutes, depending on your CPU and memory.
 7. When it says "Your game is ready", press **Play**.
 
-The game is also added to your applications menu as "Hookshot". That entry, and `hookshot` in the game folder, open the
+The game is also added to your applications menu as "Lakitu". That entry, and `hookshot` in the game folder, open the
 launcher: **Play**, and **Update** when a newer release is out. Keep the AppImage where it is: the launcher uses it to
 update.
 
@@ -166,7 +224,7 @@ with `--update <game folder>`.
 | Problem | What to do |
 |---|---|
 | Where is the log? | `hookshot_log.txt` in the game folder holds the last run. The four runs before are `hookshot_log.1.txt` (the last) to `.4.txt`. Started from a terminal, the game prints there instead |
-| "Hookshot supports build e0f3ccfa" or "This version isn't supported" | Check that you chose the right game with its update installed |
+| "Lakitu supports build e0f3ccfa" or "This version isn't supported" | Check that you chose the right game with its update installed |
 | The game opens and closes, or the log says "device lost" | Update your graphics driver. On AMD cards there are known crashes ([#708](https://github.com/NotRexed/Hookshot/issues/708), [#614](https://github.com/NotRexed/Hookshot/issues/614)) |
 | Parts of the picture are missing, or a message says your card has no mesh shader support | The card or its driver has no mesh shaders. Update the driver; older cards are not supported ([#640](https://github.com/NotRexed/Hookshot/issues/640)) |
 | Linux: the game does not start or the picture is broken | The game needs a Vulkan 1.3 driver with mesh shaders. Check with `vulkaninfo \| grep mesh`: it should list `VK_EXT_mesh_shader`. Update Mesa or the NVIDIA driver |
@@ -276,7 +334,7 @@ layout emulators use: `mods/<name>/romfs/...` holds files that replace or add to
 `mods/contents/<title id>/<name>/romfs` work too. A folder whose name starts with `-` or `_` is off. When two mods
 have the same file, the one whose folder name sorts last wins, so name them `01-...`, `02-...` to set the order.
 
-Only RomFS mods are loaded. `exefs` patches (`.pchtxt`, `.ips`) are left out: Hookshot compiles the game's code ahead
+Only RomFS mods are loaded. `exefs` patches (`.pchtxt`, `.ips`) are left out: Lakitu compiles the game's code ahead
 of time, so patching its instructions would need a rebuild. The log (`hookshot_log.txt`) names each mod and the files
 read from it.
 
@@ -289,8 +347,8 @@ For developers, and for players who prefer the command line. The builder windows
 <summary>Windows, from the command line</summary>
 
 ```powershell
-python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Hookshot" --language en-US
-python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out "C:\Games\Hookshot" --language en-US
+python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Lakitu" --language en-US
+python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out "C:\Games\Lakitu" --language en-US
 ```
 
 Add `--check` with your `.nup` or `--exefs` to only check the game's version. It builds nothing.
@@ -324,10 +382,10 @@ You need:
 <summary>Linux, the AppImage from the command line</summary>
 
 ```sh
-./Hookshot-<version>-x86_64.AppImage --cli --nup ~/your-game.nup --out ~/Games/Hookshot   # make_game.py's options
-./Hookshot-<version>-x86_64.AppImage --play                    # the game the builder built last, without the window
-./Hookshot-<version>-x86_64.AppImage --play ~/Games/Hookshot   # the game in that folder
-./Hookshot-<version>-x86_64.AppImage --update ~/Games/Hookshot # the new release, and that folder built again
+./Lakitu-<version>-x86_64.AppImage --cli --nup ~/your-game.nup --out ~/Games/Lakitu   # make_game.py's options
+./Lakitu-<version>-x86_64.AppImage --play                    # the game the builder built last, without the window
+./Lakitu-<version>-x86_64.AppImage --play ~/Games/Lakitu   # the game in that folder
+./Lakitu-<version>-x86_64.AppImage --update ~/Games/Lakitu # the new release, and that folder built again
 ```
 
 `HOOKSHOT_JOBS=<n>` (or `--jobs <n>` with `--cli`) limits how many files compile at once.
@@ -432,7 +490,7 @@ looks like.
 
 ## Credits
 
-Hookshot exists thanks to the work of many people:
+Lakitu, and the Hookshot it is forked from, exist thanks to the work of many people:
 
 - **NotRexed**: Hookshot, BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
 - **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.
@@ -454,10 +512,10 @@ Hookshot exists thanks to the work of many people:
 
 ## License
 
-Hookshot is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later).
+Lakitu is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later).
 It includes code from Eden, suyu and Orchid, which are under the GPL too. Third-party parts under other licenses that
 work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic and the a64-kit tools) keep their own notices
 in their folders.
 
-Hookshot is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina of
-Time are trademarks of Nintendo.
+Lakitu is an unofficial fan project, not affiliated with or endorsed by Nintendo. Mario Kart, The Legend of Zelda and
+Ocarina of Time are trademarks of Nintendo.
