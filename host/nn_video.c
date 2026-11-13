@@ -56,6 +56,14 @@ typedef struct {
 } Pool;
 /* the preference MakeDecodeImagePreference returns (the caller's buffer is larger: only these fields are ours) */
 typedef struct { uint32_t magic; uint16_t w, h; uint32_t format, tiling; } Pref;
+/* (dkb) the preference of SDK 20's MakeDecodeImagePreference(w, h, OutputFormat, CodecMode), as Donkey Kong Bananza
+   3.2.0 asks for it. The SDK's own (sdk 0x82b0aa50 on that build) fills 64 bytes at x8: a word from its format table,
+   u16 width - 1 and height - 1 at +8 and +10, zeros to +0x40; so the callers' buffers hold 64 (Bananza's two are 72 and
+   64 bytes on the stack, main 0x80e3be7c and 0x80e3bef8). This writes 20 of them, with width - 1 and height - 1 where
+   the SDK keeps them in case the game reads them, and ours around them. */
+#define PREF20_MAGIC 0x32465250u   /* 'PRF2' */
+typedef struct { uint32_t magic; uint16_t w, h; uint16_t w_minus_1, h_minus_1; uint32_t format, mode; } Pref20;
+_Static_assert(sizeof(Pref20) <= 64, "SDK 20's preference is 64 bytes: the callers' buffers hold no more");
 
 /* (rgba NULL: a picture decoded as NV12 is kept as that alone; its pool makes the RGBA if a reader wants it) */
 typedef struct { uint8_t *rgba, *nv12; int w, h; int64_t pts; int last; } Picture;
@@ -174,39 +182,29 @@ HLE(_ZN2nn5codec5video8FinalizeEv) { RET(0); }
 
 /* ---- image pools ---- */
 /* MakeDecodeImagePreference(u16 w, u16 h, OutputFormat, TilingMode) -> the preference (returned through x8) */
-static void make_pref(Ctx *c) {
+HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_15ImageTilingModeE) {
     const uint64_t out = c->x[8];
     Pref p = {PREF_MAGIC, (uint16_t)ARG(0), (uint16_t)ARG(1), (uint32_t)ARG(2), (uint32_t)ARG(3)};
     if (out) memcpy(GP(out), &p, sizeof p);
     RET(out);
 }
-HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_15ImageTilingModeE) { make_pref(c); }
-/* (hookshot) The older SDK's names of the same calls, which Mario Kart World 1.0.0 makes: its last argument is a CodecMode
-   rather than a tiling mode (kept in the same field, which nothing here reads), and the "ForCompat" twin. Without
-   them the 1.0.0 movie thread got 0s from the generic stub and stopped at svcBreak when a Grand Prix's opening movie
-   started. The signatures, and what each one does, are mkw-recomp's (adriadam10/mkw-recomp@5ff4fbb,
-   runtime/sdk/ov/ov_codec.c, MIT, Copyright (c) 2026 Adria) */
-HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) { make_pref(c); }
-HLE(_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) { make_pref(c); }
 /* CalculateDecoderImagePoolBuffer(u64* size, u64* alignment, Preference const&, u32 count) */
 HLE(_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImagePreferenceEj) {
     const Pref *p = (const Pref *)GP(ARG(2));
-    const uint64_t one = p->magic == PREF_MAGIC ? (uint64_t)p->w * p->h * 4 : 0x400000;
+    const Pref20 *p20 = (const Pref20 *)GP(ARG(2));   /* (dkb: SDK 20's preference) */
+    const uint64_t one = p->magic == PREF_MAGIC ? (uint64_t)p->w * p->h * 4 :
+                         p20->magic == PREF20_MAGIC ? (uint64_t)p20->w * p20->h * 4 : 0x400000;
     if (ARG(0)) G64(ARG(0)) = ((one * (uint32_t)ARG(3)) + 0xFFF) & ~0xFFFull;
     if (ARG(1)) G64(ARG(1)) = 0x1000;
     RET(0);
 }
-/* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count) */
-static void pool_init(Ctx *c);
-HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) { pool_init(c); }
-/* (hookshot) the older SDK's, with a CodecMode after the count (Mario Kart World 1.0.0; mkw-recomp's signature) */
-HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEjNS0_9CodecModeE) { pool_init(c); }
-static void pool_init(Ctx *c) {
-    const Pref *p = (const Pref *)GP(ARG(3));
+/* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count): pool_init, for a preference of
+   either layout (0 x 0: the default 1280 x 720, format 2) */
+static void pool_init(Ctx *c, int pw, int ph, int format) {
     Pool *o = (Pool *)calloc(1, sizeof *o);
     if (!o) hos_fatal(NULL, "video: out of memory for an image pool");
-    o->w = p->magic == PREF_MAGIC && p->w ? p->w : 1280, o->h = p->magic == PREF_MAGIC && p->h ? p->h : 720;
-    o->format = p->magic == PREF_MAGIC ? (int)p->format : 2;
+    o->w = pw ? pw : 1280, o->h = ph ? ph : 720;
+    o->format = format;
     o->count = (int)ARG(4) > 0 ? (int)ARG(4) : 1;
     o->rgba = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 4);
     /* (hookshot, issue 342: an allocation that failed went on as a NULL picture, and the movie thread read address 0) */
@@ -231,6 +229,37 @@ static void pool_init(Ctx *c) {
     set_host(ARG(0), POOL_MAGIC, o);
     RET(0);
 }
+HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) {
+    const Pref *p = (const Pref *)GP(ARG(3));
+    const int ok = p->magic == PREF_MAGIC;
+    pool_init(c, ok ? p->w : 0, ok ? p->h : 0, ok ? (int)p->format : 2);
+}
+/* (dkb) SDK 20's forms, as Donkey Kong Bananza 3.2.0 calls them for its guide movies (Movie/Guide*.webm, VP9): the
+   preference takes a CodecMode, and InitializeDecoderImagePool(pool, memory, size, preference, u32 count, CodecMode).
+   The SDK's pool is 24 bytes (its initialiser zeroes and fills +0..+0x18, sdk 0x82b0ac20); nothing past that is the
+   pool's. The game's movie player keeps the size it asked for right after it, at +0x20 / +0x22, and format and mode
+   at +0x24 / +0x28, and writes them itself once the call succeeds (main 0x80e3bf40), so they are left alone here. */
+HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) {
+    const uint64_t out = c->x[8];
+    const uint16_t w = (uint16_t)ARG(0), h = (uint16_t)ARG(1);
+    Pref20 p = {PREF20_MAGIC, w, h, (uint16_t)(w - 1), (uint16_t)(h - 1), (uint32_t)ARG(2), (uint32_t)ARG(3)};
+    if (out) memcpy(GP(out), &p, sizeof p);
+    RET(out);
+}
+/* (hookshot) the same preference's "ForCompat" twin, which Mario Kart World 1.0.0 (SDK 21.4) calls; mkw-recomp answers
+   both names with one function (adriadam10/mkw-recomp@5ff4fbb, runtime/sdk/ov/ov_codec.c, MIT, Copyright (c) 2026 Adria) */
+HLE(_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) {
+    imp__ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE(c);
+}
+HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEjNS0_9CodecModeE) {
+    const Pref20 *p = (const Pref20 *)GP(ARG(3));
+    const int ok = p->magic == PREF20_MAGIC;
+    const uint16_t w = ok && p->w ? p->w : 1280, h = ok && p->h ? p->h : 720;
+    pool_init(c, w, h, ok ? (int)p->format : 2);
+}
+/* (dkb) GetDecoderImagePoolNativeImageHandle(pool, u32 index) -> NativeImageHandle: no GPU image (the movie player's
+   other path; it reads the NV12 through ReadDecoderOutputImageNv12 when there is none) */
+HLE(_ZN2nn5codec36GetDecoderImagePoolNativeImageHandleEPKNS0_25VideoDecoderImagePoolTypeEj) { RET(0); }
 HLE(_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeE) {
     Pool *o = (Pool *)host_of(ARG(0), POOL_MAGIC);
     if (o && o->sws) sws_freeContext(o->sws);
@@ -811,11 +840,9 @@ static void dec_release(Ctx *c) {
     if (d && (uint32_t)ARG(1) < MAX_SLOTS) d->busy[(uint32_t)ARG(1)] = 0;
     RET(0);
 }
-/* GetXDecoderOutputBufferProperties(u16* w, u16* h, u16* display w, u16* display h, TimeSpan* pts, bool* last,
-   decoder, u32 index) */
-/* (width, height, width, height[, ColorSpace *], TimeSpan *pts, bool *last, decoder, u32 index): colour_space is the
-   ColorSpace pointer's argument (the older SDK's, Mario Kart World 1.0.0), or -1 where the call has none. With it the
-   index is the ninth argument, on the guest stack */
+/* GetXDecoderOutputBufferProperties(u16* w, u16* h, u16* display w, u16* display h[, ColorSpace*], TimeSpan* pts,
+   bool* last, decoder, u32 index). colour_space is the ColorSpace pointer's argument (the older SDK's form, Mario Kart
+   World 1.0.0), or -1 where the call has none; with it the index is the ninth argument, on the guest stack */
 static void dec_properties_cs(Ctx *c, int colour_space);
 static void dec_properties(Ctx *c) { dec_properties_cs(c, -1); }
 static void dec_properties_cs(Ctx *c, int colour_space) {
@@ -849,29 +876,31 @@ static uint64_t ready_event(void) {
     return event;
 }
 
-/* (hookshot) The older SDK's decoder calls (Mario Kart World 1.0.0), as mkw-recomp names and answers them
-   (adriadam10/mkw-recomp@5ff4fbb, runtime/sdk/ov/ov_codec.c, MIT): Initialize<X>Decoder with a work buffer (void *, size)
-   or without, before the ByTransferMemory / ByRemoteMemory names and their output mode; the VP9 work buffer's size, in
-   which nothing is kept here; the submission event through an out pointer rather than returned; and the output
-   properties with a ColorSpace pointer. */
+/* VP9 */
+HLE(_ZN2nn5codec36InitializeVp9DecoderByTransferMemoryEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
+HLE(_ZN2nn5codec34InitializeVp9DecoderByRemoteMemoryEPNS0_14Vp9DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
+/* (dkb) SDK 20's forms (Donkey Kong Bananza 3.2.0): InitializeVp9Decoder(decoder, void* work, size_t, size_t, u16 width,
+   u16 height, u32, InputFormat, OutputFormat) and the forms without work memory, (decoder, size_t, size_t, u16, u16, ...)
+   and (decoder, size_t, u16, u16, ...); the work buffer's size (size_t* size, size_t* alignment, size_t, u16, u16):
+   one page, the pictures being host memory; the submission-ready event through an out pointer, with a Result. */
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(4), (int)(uint16_t)ARG(5));
+}
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(3), (int)(uint16_t)ARG(4));
+}
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(2), (int)(uint16_t)ARG(3));
+}
 HLE(_ZN2nn5codec29CalculateVp9DecoderWorkBufferEPmS1_mtt) {
     if (ARG(0)) G64(ARG(0)) = 0x1000;
     if (ARG(1)) G64(ARG(1)) = 0x1000;
     RET(0);
 }
-HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
-HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
-HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
-HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
 HLE(_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPPNS_2os15SystemEventTypeEPNS0_14Vp9DecoderTypeE) {
     if (ARG(0)) G64(ARG(0)) = ready_event();
     RET(0);
 }
-HLE(_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj) { dec_properties_cs(c, 4); }
-
-/* VP9 */
-HLE(_ZN2nn5codec36InitializeVp9DecoderByTransferMemoryEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
-HLE(_ZN2nn5codec34InitializeVp9DecoderByRemoteMemoryEPNS0_14Vp9DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
 HLE(_ZN2nn5codec18FinalizeVp9DecoderEPNS0_14Vp9DecoderTypeE) { dec_finalize(c); }
 HLE(_ZN2nn5codec24RegisterVp9DecoderBufferEPNS0_14Vp9DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj) { dec_register(c); }
 HLE(_ZN2nn5codec26UnregisterVp9DecoderBufferEPNS0_14Vp9DecoderTypeEj) { dec_unregister(c); }
@@ -888,6 +917,8 @@ HLE(_ZN2nn5codec36SubmitEncryptedVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEP
 HLE(_ZN2nn5codec29AcquireVp9DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Vp9DecoderTypeE) { dec_acquire(c); }
 HLE(_ZN2nn5codec29ReleaseVp9DecoderOutputBufferEPNS0_14Vp9DecoderTypeEjNS_2gs16NativeSyncHandleE) { dec_release(c); }
 HLE(_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj) { dec_properties(c); }
+/* (hookshot) the older SDK's, with a ColorSpace pointer after the sizes (Mario Kart World 1.0.0; mkw-recomp's signature) */
+HLE(_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj) { dec_properties_cs(c, 4); }
 
 /* (hookshot) AV1: OoT's movies. FFmpeg's AV1 decoder if the build has one, else dav1d (host/dav1d_av1.c) when the build has
    it, else Media Foundation (host/mf_av1.c).
@@ -913,6 +944,14 @@ HLE(_ZN2nn5codec35GetAv1DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEP
 /* VP8 */
 HLE(_ZN2nn5codec36InitializeVp8DecoderByTransferMemoryEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
 HLE(_ZN2nn5codec34InitializeVp8DecoderByRemoteMemoryEPNS0_14Vp8DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
+/* (hookshot) the older SDK's forms, as for VP9 above: with work memory (decoder, void*, size_t, size_t, u16 w, u16 h, ...)
+   or without (decoder, size_t, size_t, u16 w, u16 h, ...). Mario Kart World 1.0.0 imports both; mkw-recomp's signatures */
+HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP8, "VP8", (int)(uint16_t)ARG(4), (int)(uint16_t)ARG(5));
+}
+HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP8, "VP8", (int)(uint16_t)ARG(3), (int)(uint16_t)ARG(4));
+}
 HLE(_ZN2nn5codec18FinalizeVp8DecoderEPNS0_14Vp8DecoderTypeE) { dec_finalize(c); }
 HLE(_ZN2nn5codec24RegisterVp8DecoderBufferEPNS0_14Vp8DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj) { dec_register(c); }
 HLE(_ZN2nn5codec26UnregisterVp8DecoderBufferEPNS0_14Vp8DecoderTypeEj) { dec_unregister(c); }
