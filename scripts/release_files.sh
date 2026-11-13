@@ -102,7 +102,7 @@ publish() {   # tag -> its release published
 table() {
     local appimage="the \`.AppImage\`" zip="the \`-Windows-x64.zip\`"
     if [[ $1 =~ ^v[0-9] ]]; then
-        appimage="\`Hookshot-$1-x86_64.AppImage\`"
+        appimage="\`$("$(dirname "${BASH_SOURCE[0]}")/product_name.sh")-$1-x86_64.AppImage\`"
         zip="\`Hookshot-$1-Windows-x64.zip\`"
     fi
     cat <<EOF

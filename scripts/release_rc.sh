@@ -18,6 +18,7 @@
 set -euo pipefail
 shopt -s inherit_errexit
 FILES=$(dirname "$0")/release_files.sh
+PRODUCT=$("$(dirname "$0")/product_name.sh")   # (the AppImage's name: scripts/linux/appimage.sh names it so)
 RC=rc
 TITLE="Latest release candidate"
 
@@ -47,10 +48,10 @@ candidates=$(jq -r '[.[] | select((.draft | not) and (.tag_name | test("^v[0-9]+
 src= tag= files=
 while read -r id t; do
     [[ -n $id ]] || continue
-    files=$(assets "$id" | jq -c --arg a "Hookshot-$t-x86_64.AppImage" \
+    files=$(assets "$id" | jq -c --arg a "$PRODUCT-$t-x86_64.AppImage" \
         '[.[] | select(.name == $a or .name == ($a + ".zsync")) | {id, name, digest}] | sort_by(.name)')
     if [[ $(jq length <<<"$files") == 2 ]]; then src=$id tag=$t; break; fi
-    echo "$t has no Hookshot-$t-x86_64.AppImage and .zsync: passed over"
+    echo "$t has no $PRODUCT-$t-x86_64.AppImage and .zsync: passed over"
 done <<<"$candidates"
 if [[ -z $src ]]; then
     echo "no published release candidate or release has its AppImage and .zsync: $RC is left as it is"

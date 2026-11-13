@@ -18,9 +18,9 @@ APPDIR=$B/AppDir
 # (--long: a nightly built on a tagged commit is v2.1.0-rc.1-0-g1a2b3c4, so the updaters know it is the nightly:
 # builder/linux/linux_update.py track_of)
 VERSION=${HOOKSHOT_VERSION:-$(git describe --tags --long --always --match "v[0-9]*" 2>/dev/null || echo dev)}
-# The project's name, which names the AppImage: from the one place that holds it (nx2/game_profile.py), so a
-# rename does not have to be remembered here.
-PRODUCT=$(python3 -I -c 'import sys; sys.path.insert(0, "nx2"); import game_profile; print(game_profile.PROJECT)')
+# The project's name, which names the AppImage: from the one place that holds it (nx2/game_profile.py, through
+# scripts/product_name.sh, which the checks and the release scripts that find the image read too)
+PRODUCT=$(scripts/product_name.sh)
 export EMSDK=$DEPS/emsdk RX_CPM=$DEPS/cpm
 PY=$DEPS/python/bin/python3
 

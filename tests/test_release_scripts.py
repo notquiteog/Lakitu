@@ -26,6 +26,11 @@ import unittest
 RUN_ALL_SKIP = {"windows": "the release scripts are bash, run by Linux runners; exercised on Linux"}
 
 ROOT = Path(__file__).resolve().parents[1]
+# (the AppImage's name, as scripts/linux/appimage.sh and the release scripts take it: scripts/product_name.sh, from
+# nx2/game_profile.py PROJECT. The Windows zip keeps its own name, which windows-builder.yml gives it)
+sys.path.insert(0, str(ROOT / "nx2"))
+import game_profile  # noqa: E402
+PRODUCT = game_profile.PROJECT
 REPO = "owner/repo"
 COMMIT = "c" * 40
 
@@ -254,7 +259,7 @@ class ReleaseScripts(unittest.TestCase):
         self.state_file = self.dir / "state.json"
         self.files = self.dir / "dist"
         self.files.mkdir()
-        for name in ("Hookshot-v2.1.0-x86_64.AppImage", "hookshot-linux.txt"):
+        for name in (PRODUCT + "-v2.1.0-x86_64.AppImage", "hookshot-linux.txt"):
             (self.files / name).write_text("built " + name, encoding="utf-8")
         self.env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"], GH_REPO=REPO,
                         GH_TOKEN="x", FAKE_GH_STATE=str(self.state_file))
@@ -292,7 +297,7 @@ class ReleaseScripts(unittest.TestCase):
         draft = self.state()["releases"][0]
         self.assertTrue(draft["draft"])
         self.assertEqual(draft["body"], "promote notes")
-        self.assertEqual(sorted(a["name"] for a in draft["assets"]), ["Hookshot-v2.1.0-x86_64.AppImage", "hookshot-linux.txt"])
+        self.assertEqual(sorted(a["name"] for a in draft["assets"]), [PRODUCT + "-v2.1.0-x86_64.AppImage", "hookshot-linux.txt"])
         self.assertFalse(self.creates())
         uploads = [a for c in self.state()["calls"] for a in c if "uploads.github.com" in a]
         self.assertTrue(uploads and all("/releases/5/assets?" in u for u in uploads), uploads)
@@ -331,7 +336,7 @@ class ReleaseScripts(unittest.TestCase):
         (made,) = self.state()["releases"]
         self.assertFalse(made["draft"])
         names = sorted(a["name"] for a in made["assets"])
-        self.assertEqual(names, ["Hookshot-v2.1.0-x86_64.AppImage", "SHA256SUMS", "hookshot-linux.txt"])
+        self.assertEqual(names, [PRODUCT + "-v2.1.0-x86_64.AppImage", "SHA256SUMS", "hookshot-linux.txt"])
         sums = next(a["content"] for a in made["assets"] if a["name"] == "SHA256SUMS")
         self.assertEqual(sums, (self.dir / "SUMS").read_text(encoding="utf-8"))
         self.assertIn("Which file do I download?", made["body"])
@@ -363,7 +368,7 @@ class ReleaseScripts(unittest.TestCase):
         out = self.dir / ("dist-" + platform + "-" + sha[:7])
         out.mkdir(exist_ok=True)
         version = "v2.1.0-rc.3-%d-g%s" % ({self.Z: 1, self.A: 2, self.B: 3}.get(sha, 9), sha[:8])
-        names = (["Hookshot-%s-x86_64.AppImage" % version, "Hookshot-%s-x86_64.AppImage.zsync" % version,
+        names = ([PRODUCT + "-%s-x86_64.AppImage" % version, PRODUCT + "-%s-x86_64.AppImage.zsync" % version,
                   "hookshot-linux.txt"] if platform == "linux" else
                  ["HookshotBuilder.exe", "hookshot-setup.txt", "Hookshot-%s-Windows-x64.zip" % version])
         for name in names:
@@ -397,10 +402,10 @@ class ReleaseScripts(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.state()["tags"]["nightly"], self.A)
         files = self.nightly_assets()
-        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
-        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage.zsync", files)
-        self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-x86_64.AppImage", files)
-        self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-x86_64.AppImage.zsync", files)
+        self.assertIn(PRODUCT + "-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertIn(PRODUCT + "-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage.zsync", files)
+        self.assertNotIn(PRODUCT + "-v2.1.0-rc.3-1-g11111111-x86_64.AppImage", files)
+        self.assertNotIn(PRODUCT + "-v2.1.0-rc.3-1-g11111111-x86_64.AppImage.zsync", files)
         self.assertEqual(files["hookshot-linux.txt"], "linux v2.1.0-rc.3-2-gaaaaaaaa hookshot-linux.txt")
         self.assertIn("SHA256SUMS", files)
         # (no force: a fast-forward, which GitHub refuses when the tag moved past this commit)
@@ -432,7 +437,7 @@ class ReleaseScripts(unittest.TestCase):
         files = self.nightly_assets()
         self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-Windows-x64.zip", files)
         self.assertNotIn("Hookshot-v2.1.0-rc.3-1-g11111111-Windows-x64.zip", files)
-        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertIn(PRODUCT + "-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
         self.assertFalse([c for c in self.state()["calls"] if "PATCH" in c and any("git/refs" in a for a in c)])
 
     def test_nightly_platforms_move_on_their_own(self):
@@ -442,12 +447,12 @@ class ReleaseScripts(unittest.TestCase):
         files = self.nightly_assets()
         self.assertEqual(self.state()["tags"]["nightly"], self.B)
         self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-Windows-x64.zip", files)
-        self.assertIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertIn(PRODUCT + "-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
         r = self.nightly(self.B, "linux")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         files = self.nightly_assets()
-        self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-x86_64.AppImage", files)
-        self.assertNotIn("Hookshot-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
+        self.assertIn(PRODUCT + "-v2.1.0-rc.3-3-gbbbbbbbb-x86_64.AppImage", files)
+        self.assertNotIn(PRODUCT + "-v2.1.0-rc.3-2-gaaaaaaaa-x86_64.AppImage", files)
 
     def test_nightly_race_lost_to_a_newer_commit_changes_nothing(self):
         # (Linux of A looked at the tag (Z) before Windows of B moved it; its fast-forward from B to A is refused)
@@ -487,10 +492,10 @@ class ReleaseScripts(unittest.TestCase):
                 self.assertIn("Hookshot-v2.1.0-rc.3-3-gbbbbbbbb-Windows-x64.zip", files)
                 # (Linux's files are A's, or still Z's when it lost the race: never a mix)
                 linux = sorted(n for n in files if ".AppImage" in n)
-                self.assertIn(linux, [["Hookshot-v2.1.0-rc.3-%s-x86_64.AppImage" % v,
-                                       "Hookshot-v2.1.0-rc.3-%s-x86_64.AppImage.zsync" % v]
+                self.assertIn(linux, [[PRODUCT + "-v2.1.0-rc.3-%s-x86_64.AppImage" % v,
+                                       PRODUCT + "-v2.1.0-rc.3-%s-x86_64.AppImage.zsync" % v]
                                       for v in ("1-g11111111", "2-gaaaaaaaa")])
-                self.assertIn(linux[0].split("-x86_64")[0].split("Hookshot-")[1], files["hookshot-linux.txt"])
+                self.assertIn(linux[0].split("-x86_64")[0].split(PRODUCT + "-")[1], files["hookshot-linux.txt"])
 
     def test_nightly_made_when_there_is_no_tag(self):
         self.given_nightly(None)
@@ -636,7 +641,7 @@ class ReleaseScripts(unittest.TestCase):
     # release_rc.sh
 
     def linux(self, tag):
-        return ["Hookshot-%s-x86_64.AppImage" % tag, "Hookshot-%s-x86_64.AppImage.zsync" % tag]
+        return [PRODUCT + "-%s-x86_64.AppImage" % tag, PRODUCT + "-%s-x86_64.AppImage.zsync" % tag]
 
     def released(self, rid, tag, prerelease=None, files=None):
         prerelease = "-" in tag if prerelease is None else prerelease
