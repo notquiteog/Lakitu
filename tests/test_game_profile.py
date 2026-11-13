@@ -284,6 +284,16 @@ def check_profiles_are_honest():
             check(p.upscale == game_profile.EMPTY_UPSCALE,
                   "the %s profile names no patches but has upscale program keys" % key)
     check("mkw" in game_profile.GAMES, "there is no mkw profile")
+    # (the identity it does hold: Mario Kart World 1.0.0, checked against a dump, and mkw-recomp's row for that build)
+    mkw = game_profile.GAMES.get("mkw")
+    if mkw:
+        check(mkw.program_id == "0400C3F00006E000" and mkw.version == 0,
+              "the mkw profile's title is not Mario Kart World's base game (0400C3F00006E000 v0)")
+        check(mkw.build_id and mkw.build_id.startswith("9e244438") and len(mkw.build_id) >= 16,
+              "the mkw profile's build is not 1.0.0's main (9e244438c3d8ef1c)")
+        text = game_profile.emit_header(mkw)
+        check("#define GAME_HAVE_VERSION 1" in text and "#define GAME_VERSION 0" in text,
+              "version 0 is emitted as an unknown version")
     mkw = game_profile.GAMES.get("mkw")
     if mkw:
         check(mkw.main_base is None and not mkw.patch_modules and mkw.gfx == game_profile.EMPTY_GFX

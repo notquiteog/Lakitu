@@ -91,13 +91,15 @@ what does not yet. Open problems are collected in tracking issues, linked below.
 
 The engine is already a Switch 2 one and already came from Mario Kart World, so none of the hard parts (the AArch64
 lift, Horizon, NVN2, the Ampere shader path) are in question. What is missing is the game-specific layer, which lives
-in one place: the `mkw` profile in [`nx2/game_profile.py`](nx2/game_profile.py). Every field in it is `None` or empty,
-with a comment saying what it is and how it would be found. Nothing below has been guessed at.
+in one place: the `mkw` profile in [`nx2/game_profile.py`](nx2/game_profile.py). Apart from the game's identity,
+every field in it is `None` or empty, with a comment saying what it is and how it would be found. Nothing below has
+been guessed at.
 
 Somebody with a Mario Kart World dump has to find, in roughly this order:
 
-1. **The dump's identity** &mdash; program id, version and `main`'s build id. `python -I nx2/dump.py --dump <folder
-   with exefs/ and romfs/> --set` prints all three. Fills in `program_id`, `version`, `build_id`.
+1. ~~**The dump's identity**~~ &mdash; done for **1.0.0**: program `0400C3F00006E000`, version 0, `main` build
+   `9e244438c3d8ef1c`, checked against a dump with `nx2/make_game.py --check` and matching mkw-recomp's row for that
+   version. 1.8.0 (`main` build `d00e4f399e411d06`) is a different executable and would be a profile of its own.
 2. **`main`'s base in the lifted image.** Eden's layout puts `rtld` first, so this is `0x80000000` plus that dump's
    page-aligned `rtld` size, not Ocarina's `0x80020000`. `nx2/lift.py` prints it on its `image:` line, and the seam
    warns when the profile disagrees with the image. Fills in `main_base`. Every patch offset is relative to it, so

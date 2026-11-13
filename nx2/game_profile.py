@@ -124,11 +124,17 @@ MKW = Profile(
     # read a pacing field out of the middle of some other object. Each comment says what the value is and how it
     # would be found.
     #
-    #   program_id / version / build_id: `python -I nx2/dump.py --dump <exefs+romfs> --set` prints all three, and
-    #       prints them again on every lift, so the profile can be filled in from the first run against the dump.
-    program_id=None,
-    version=None,
-    build_id=None,
+    #   program_id / version / build_id: Mario Kart World 1.0.0, the version of the one dump there is to check
+    #       against. Measured on 2026-11-13 from a dump on the PC this was written on (`nx2/make_game.py --check`:
+    #       title 0400c3f00006e000 v0, main's build id 9e244438...). The same build id and that dump's RomFS count
+    #       (205,660 files) are mkw-recomp's 1.0.0 row (adriadam10/mkw-recomp@5ff4fbb, recomp/versions.py, MIT,
+    #       Copyright (c) 2026 Adria), which gives the first 8 bytes; make_game compares the first 4. These say which
+    #       copy a build is for and nothing more: they place no patch and read no memory. 1.8.0 is main build
+    #       d00e4f399e411d06 (the same row's other entry, and what host/hos_main.c hos_game_is_mkw still names); it is
+    #       a different executable, with other addresses, and is not this profile's build.
+    program_id="0400C3F00006E000",
+    version=0,                      # (the base game, as the dump's title reports it: 1.0.0)
+    build_id="9e244438c3d8ef1c",
     #   main_base: main's base in the lifted image. Eden's layout (nx2/image.py) puts rtld first, so this is
     #       0x80000000 + rtld's page-aligned image size, which is this dump's rtld, not Ocarina's. lift.py prints it
     #       on the "image:" line as main@<base>+<size>; install_sites() below also reads it off the image and warns
@@ -158,7 +164,7 @@ MKW = Profile(
     #       specially: no stand-in, nothing handed to an upscaler backend, and cooperative-matrix programs are left
     #       out on cards that would run them in software, which is the existing behaviour for an unlisted key.
     upscale=EMPTY_UPSCALE,
-    notes="Scaffolding only: nothing here has been measured, because there is no dump to measure it on.",
+    notes="Identity only (1.0.0, checked against a dump): no address, offset or key here has been measured yet.",
 )
 
 GAMES = collections.OrderedDict((p.key, p) for p in (OOT, MKW))
@@ -337,7 +343,7 @@ def emit_header(profile=None):
     w('#define GAME_PROGRAM_ID "%s"' % (p.program_id or ""))
     w("#define GAME_HAVE_PROGRAM_ID %d" % (1 if p.program_id else 0))
     w("#define GAME_VERSION %d" % (p.version or 0))
-    w("#define GAME_HAVE_VERSION %d" % (1 if p.version else 0))
+    w("#define GAME_HAVE_VERSION %d" % (1 if p.version is not None else 0))   # (0 is a version: the base game)
     w("")
     w("/* main's base in the lifted image; every patch offset in the profile is relative to it */")
     w("#define GAME_MAIN_BASE 0x%xull" % (p.main_base or 0))
