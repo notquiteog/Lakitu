@@ -5,9 +5,9 @@ are implemented natively, and the GPU work is replayed on Vulkan. No emulator is
 your PC from your own copy.
 
 It is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is mkw-recomp (Mario Kart World) retargeted
-to Ocarina of Time, and this fork takes the engine back to Mario Kart World. **Today it still builds Ocarina**
-(`HOOKSHOT_GAME=oot`, the default): the Mario Kart World game profile exists but holds no measured value, because
-there is no dump to measure. The readme's "What a Mario Kart World build still needs" says what is missing.
+to Ocarina of Time, and this fork takes the engine back to Mario Kart World. **The default build is still Ocarina**
+(`HOOKSHOT_GAME=oot`). `HOOKSHOT_GAME=mkw` builds Mario Kart World 1.0.0, which reaches its title screen; its game
+profile holds the game's identity and no other measured value yet. The readme's "What a Mario Kart World build still needs" says what is missing.
 
 This page covers what to send, how to build and test it, and the rules that keep the project out of trouble. The
 [development guide](docs/development.md) has the full pipeline and its commands; the [design notes](docs/design.md)

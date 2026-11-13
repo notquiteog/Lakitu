@@ -39,21 +39,23 @@ Discord: https://discord.gg/rexed
 <br>
 
 > [!WARNING]
-> **Lakitu does not run Mario Kart World yet. Only the scaffolding for it exists.**
+> **Lakitu boots Mario Kart World 1.0.0 to its title screen, and no further has been tried.**
 >
 > Lakitu is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is itself mkw-recomp (the Mario Kart
 > World static recompilation) retargeted to Ocarina of Time. This fork takes the engine back to the game it came
 > from, so the recompiler, the Horizon runtime and the Vulkan back end are already a Switch 2 and Mario Kart World
-> lineage &mdash; but every address, offset and shader key in the game-specific layer is still Ocarina's.
+> lineage &mdash; but the game-specific layer (patches, graphics-module offsets, shader keys) is still Ocarina's.
 >
 > What exists today: a game profile seam ([`nx2/game_profile.py`](nx2/game_profile.py)) that holds the game-specific
-> values in one place, with Ocarina's measured values as the `oot` profile and an **empty** `mkw` profile beside it.
-> Nothing in the `mkw` profile has been measured, because nothing of Mario Kart World has been dumped, lifted, built
-> or booted here. Unknown values are `None` and the features that need them are off, rather than filled in with
-> numbers that look plausible &mdash; a wrong address there is a crash or silent corruption.
+> values in one place, with Ocarina's measured values as the `oot` profile and an `mkw` profile beside it that knows
+> only which copy it is for (1.0.0). Unknown values are `None` and the features that need them are off, rather than
+> filled in with numbers that look plausible &mdash; a wrong address there is a crash or silent corruption. On
+> 2026-11-13 a `HOOKSHOT_GAME=mkw` build of a 1.0.0 dump lifted, compiled and reached the animated title screen
+> ("Press L + R to start") on Linux with an RTX 5060 Ti ([tested configurations](docs/tested-configurations.md)).
+> Nothing past the title screen has been tried: no menu, no race, no input.
 >
-> So: the build this repository produces today is still the Ocarina one (`HOOKSHOT_GAME=oot`, the default), and
-> everything below about installing and playing describes that. "[What a Mario Kart World build still
+> So: the default build is still the Ocarina one (`HOOKSHOT_GAME=oot`), and everything below about installing and
+> playing describes that. A Mario Kart World build is `HOOKSHOT_GAME=mkw` from source. "[What a Mario Kart World build still
 > needs](#what-a-mario-kart-world-build-still-needs)" lists what has to be found first.
 
 > [!IMPORTANT]
@@ -101,9 +103,10 @@ Somebody with a Mario Kart World dump has to find, in roughly this order:
    `9e244438c3d8ef1c`, checked against a dump with `nx2/make_game.py --check` and matching mkw-recomp's row for that
    version. 1.8.0 (`main` build `d00e4f399e411d06`) is a different executable and would be a profile of its own.
 2. **`main`'s base in the lifted image.** Eden's layout puts `rtld` first, so this is `0x80000000` plus that dump's
-   page-aligned `rtld` size, not Ocarina's `0x80020000`. `nx2/lift.py` prints it on its `image:` line, and the seam
-   warns when the profile disagrees with the image. Fills in `main_base`. Every patch offset is relative to it, so
-   nothing else can be filled in first.
+   page-aligned `rtld` size. `nx2/lift.py` prints it on its `image:` line, and the seam warns when the profile
+   disagrees with the image. For 1.0.0 it was measured on 2026-11-13: `main@0x80020000+0x3410000` (`rtld` takes
+   0x20000, as Ocarina's does). It goes into `main_base` with the first patch module, since the profile's rule is
+   that an empty profile holds no address. Every patch offset is relative to it.
 3. **The graphics module's offsets** &mdash; the frame limiter, the nominal frame rate, the variable-refresh gate and
    the adaptive controller's words, found the way Ocarina's were: by reading the function that sleeps to the limiter
    and the one that writes it. Until then `host/nn_vi.c` leaves those fields alone and says so once, game time steps
