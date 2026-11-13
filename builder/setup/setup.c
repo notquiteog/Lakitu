@@ -623,7 +623,7 @@ static void wanted_tag(char *out, size_t n) {
 /* (hookshot) the repository the setup installs from, owner/name: given by CI (.github/workflows/windows-builder.yml) from the
    repository it builds in, so a fork's setup installs the fork's release */
 #ifndef HOOKSHOT_REPOSITORY
-#define HOOKSHOT_REPOSITORY "NotRexed/Hookshot"
+#define HOOKSHOT_REPOSITORY "notquiteog/Hookshot"
 #endif
 #define HOOKSHOT_WIDEN2(s) L##s
 #define HOOKSHOT_WIDEN(s) HOOKSHOT_WIDEN2(s)

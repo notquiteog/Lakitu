@@ -3,11 +3,11 @@ using System.IO;
 using System.Text.RegularExpressions;
 
 /// (hookshot) The GitHub repository releases come from, as owner/name: tools/repository.txt, written when the release is
-/// packaged from the repository its CI ran in (scripts/release_parts.py package), else NotRexed/Hookshot. A fork's Builder
+/// packaged from the repository its CI ran in (scripts/release_parts.py package), else notquiteog/Hookshot. A fork's Builder
 /// then updates from the fork. nx2/version.py repository() is the same rule for the game's own update check.
 static class Repository
 {
-    const string Default = "NotRexed/Hookshot";
+    const string Default = "notquiteog/Hookshot";
     static readonly Lazy<string> name = new(Read);
     public static string Name => name.Value;
 

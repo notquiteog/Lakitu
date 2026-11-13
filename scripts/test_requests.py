@@ -22,7 +22,7 @@ with the request's ID and the action, so people can read it and type it by hand 
     🧪 T-7KQ2 claim: until 2026-11-12 16:40Z
     🧪 T-7KQ2 renew: until 2026-11-12 18:10Z
     🧪 T-7KQ2 release
-    🧪 T-7KQ2 done pass: https://github.com/NotRexed/Hookshot/pull/2711#issuecomment-123
+    🧪 T-7KQ2 done pass: https://github.com/notquiteog/Hookshot/pull/2711#issuecomment-123
     🧪 T-7KQ2 cancel
 
 The room's messages are the only record: list and every check below replay them in order. A request stays open until
@@ -65,12 +65,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import team_chat  # noqa: E402  (same folder; python -I does not add it to the path)
 
 ROOM = "#test-requests:magicbean.dev"
-REPO = "https://github.com/NotRexed/Hookshot"
+REPO = "https://github.com/notquiteog/Hookshot"
 MARK = "\N{TEST TUBE}"
 ID_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
 DEFAULT_TTL = 90
 MAX_TTL = 480
-PR_API = "https://api.github.com/repos/NotRexed/Hookshot/pulls/%d"
+PR_API = "https://api.github.com/repos/notquiteog/Hookshot/pulls/%d"
 LABEL = "testing wanted"
 TRUSTED = ("OWNER", "MEMBER", "COLLABORATOR")
 HISTORY_LIMIT = 50000  # messages read back; renews add one per tester every half hour
@@ -79,8 +79,8 @@ EXIT_REFUSED = team_chat.EXIT_REFUSED
 LINE = re.compile(r"^%s\s*(T-[%s]{4})\s+(request|claim|renew|release|done|cancel|update)\b(?:\s+(pass|fail|mixed))?\s*:?\s*(.*)$"
                   % (MARK, ID_CHARS))
 UNTIL = re.compile(r"until\s+(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d)Z", re.I)
-PR_URL = re.compile(r"https://github\.com/NotRexed/Hookshot/pull/(\d+)")
-COMMENT_URL = re.compile(r"^https://github\.com/NotRexed/Hookshot/pull/(\d+)"
+PR_URL = re.compile(r"https://github\.com/notquiteog/Hookshot/pull/(\d+)")
+COMMENT_URL = re.compile(r"^https://github\.com/notquiteog/Hookshot/pull/(\d+)"
                          r"#(?:issuecomment-\d+|pullrequestreview-\d+|discussion_r\d+)$")
 COMMIT = re.compile(r"[0-9a-fA-F]{7,40}")
 
@@ -298,7 +298,7 @@ def pr_commit(number, commit, head):
     """Resolve a non-head commit and require that it is an ancestor of the PR head."""
     if not commit or same_commit(commit, head):
         return head
-    url = "https://api.github.com/repos/NotRexed/Hookshot/compare/%s...%s?per_page=1" % (commit, head)
+    url = "https://api.github.com/repos/notquiteog/Hookshot/compare/%s...%s?per_page=1" % (commit, head)
     comparison = github_json(url, number)
     sha = (comparison.get("base_commit") or {}).get("sha", "")
     if comparison.get("status") not in ("ahead", "identical") or not isinstance(sha, str) \

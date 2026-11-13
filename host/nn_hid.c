@@ -1349,10 +1349,18 @@ HLE(_ZN2nn3hid6detail28FlushEnqueuedVibrationValuesEv) { RET(0); }
    states written: one, with no touches (the lifted SDK version read the touch screen's shared memory, which this
    runtime does not have). TouchScreenState<16>: {s64 sampling number, s32 count, s32 reserved, TouchState[16]}. */
 HLE(_ZN2nn3hid21InitializeTouchScreenEv) {}
+static volatile LONG64 touch_sampling;
 HLE(_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi) {
-    static volatile LONG64 sampling;
     if ((int)ARG(1) < 1) { RET(0); return; }
     memset(GP(ARG(0)), 0, 16 + 16 * 0x28);
-    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&sampling);
+    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&touch_sampling);
     RET(1);
+}
+/* (dkb) GetTouchScreenState<1>(TouchScreenState<1>*): the latest state alone, with no touch, as the plural above. The
+   lifted SDK's read aborted: Donkey Kong Bananza reads the touch screen this way on its first frames
+   (svcBreak, from nn::hid::GetTouchScreenState<1>, lr 0x82e7eee0 on its 3.2.0 sdk). TouchScreenState<1>:
+   {s64 sampling number, s32 count, s32 reserved, TouchState[1]}. */
+HLE(_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE) {
+    memset(GP(ARG(0)), 0, 16 + 1 * 0x28);
+    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&touch_sampling);
 }

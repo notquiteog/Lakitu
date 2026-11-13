@@ -26,11 +26,11 @@ The script also shows which commit to build and which commit each result tested,
 or PR link. For example, after the head moves while a test is running:
 
 ```
-T-7KQ2  OPEN  https://github.com/NotRexed/Hookshot/pull/2731  Test the change
+T-7KQ2  OPEN  https://github.com/notquiteog/Hookshot/pull/2731  Test the change
     asked by @requester:magicbean.dev on 2026-11-12 12:00Z
     commit: bce3d17e
     head moved since the request: bce3d17e -> 309e6c35; requested commit is still bce3d17e. Ask the requester to confirm which commit is wanted.
-    pass by @tester:magicbean.dev (commit bce3d17e) (tested an earlier commit; PR head at result: 309e6c35): https://github.com/NotRexed/Hookshot/pull/2731#issuecomment-123
+    pass by @tester:magicbean.dev (commit bce3d17e) (tested an earlier commit; PR head at result: 309e6c35): https://github.com/notquiteog/Hookshot/pull/2731#issuecomment-123
 ```
 
 The Discord card is made by a separate server relay, not this script. Its owner must confirm support for the added

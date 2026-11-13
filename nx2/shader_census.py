@@ -36,8 +36,12 @@ SLOTS = (8, 16, 24, 32, 40, 48, 56, 64, 72)
 
 
 def dictionaries(romfs, zs):
-    """The game's zstd dictionaries: the files of a SARC, Pack/ZsDic.pack.zs"""
-    raw = zs.ZstdDecompressor().decompress(open(os.path.join(romfs, "Pack", "ZsDic.pack.zs"), "rb").read(), max_output_size=1 << 28)
+    """The game's zstd dictionaries: the files of a SARC, Pack/ZsDic.pack.zs. (dkb) None when the game has no such pack:
+    Donkey Kong Bananza's .zs files are plain zstd, and the census stopped with FileNotFoundError at every build"""
+    path = os.path.join(romfs, "Pack", "ZsDic.pack.zs")
+    if not os.path.exists(path):
+        return []
+    raw = zs.ZstdDecompressor().decompress(open(path, "rb").read(), max_output_size=1 << 28)
     start = struct.unpack_from("<I", raw, 0x0c)[0]
     out = []
     for k in range(struct.unpack_from("<H", raw, 0x1a)[0]):

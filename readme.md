@@ -156,7 +156,7 @@ you start the game from its launcher, which also updates it.
 For a portable install on an external SSD, run the downloaded setup with `--portable`; see
 [Portable Hookshot Builder](docs/windows-portable-builder.md) for folder, move and repair behavior.
 
-1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download `HookshotBuilder.exe`.
+1. Open the [latest release](https://github.com/notquiteog/Hookshot/releases/latest) and download `HookshotBuilder.exe`.
 2. Run it. It downloads the rest of Lakitu Builder (about 500 MB), checks it, and opens it.
 3. Pick your game. The builder looks for `.nup` files in your Downloads, Desktop and Documents folders and lists them
    under **Found on this PC**. Not listed? Press **Browse…**, drop the file on the window, or choose
@@ -175,7 +175,7 @@ The first start prepares the game's shaders, which takes a while. Later starts a
 
 ### On Linux
 
-1. Open the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) and download
+1. Open the [latest release](https://github.com/notquiteog/Hookshot/releases/latest) and download
    `Lakitu-<version>-x86_64.AppImage`. It is Lakitu Builder with everything it needs inside.
 2. Allow it to run as a program. In most file managers: right-click it, open **Properties**, and turn on
    "Allow executing file as program" (the words differ between desktops). Or in a terminal:
@@ -222,7 +222,7 @@ When a new release is out, the launcher says "Update available". Press **Update*
 `hookshot` (or the AppImage) on Linux. It downloads only the parts that changed and builds the game again in the same
 folder. The build files of the last build are gone by then (see [Where the files go](#where-the-files-go)), so an
 update takes about as long as the first build. Your saves and settings are kept. What changed is on the
-[Releases page](https://github.com/NotRexed/Hookshot/releases).
+[Releases page](https://github.com/notquiteog/Hookshot/releases).
 
 <details>
 <summary>What an update keeps and replaces, and updating from the command line</summary>
@@ -247,7 +247,7 @@ with `--update <game folder>`.
 ### Latest development build
 
 Want a fix before it is in a release? The
-[latest development build](https://github.com/NotRexed/Hookshot/releases/tag/nightly) is made from `main` after every
+[latest development build](https://github.com/notquiteog/Hookshot/releases/tag/nightly) is made from `main` after every
 change, with the same files as a release. It is untested and may break your saves or settings: copy them first (see
 above).
 
@@ -255,7 +255,7 @@ above).
   (without `--tag nightly` it installs the latest release instead).
 - **Linux:** download `Hookshot-<version>-x86_64.AppImage` from it and use it as above.
 
-To go back, install the [latest release](https://github.com/NotRexed/Hookshot/releases/latest) the usual way.
+To go back, install the [latest release](https://github.com/notquiteog/Hookshot/releases/latest) the usual way.
 
 ### Where the files go
 
@@ -295,7 +295,7 @@ the network or with other programs:
 - On Linux the game starts through a small script (`play-diagnostics.sh`). It keeps the game's first error messages in
   `hookshot_startup.log` in the game folder, using a private temporary folder there that it removes when the game exits.
 
-Only download Hookshot from this repository's [Releases](https://github.com/NotRexed/Hookshot/releases). Each release
+Only download Hookshot from this repository's [Releases](https://github.com/notquiteog/Hookshot/releases). Each release
 lists its files' checksums in `SHA256SUMS`. A copy from anywhere else may not be ours.
 
 ### If something goes wrong

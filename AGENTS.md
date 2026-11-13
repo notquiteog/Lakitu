@@ -8,6 +8,12 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md): its rules apply to agents as to every
 anything made from them leave the PC. The [development guide](docs/development.md) has the layout and the commands; the
 [design notes](docs/design.md) have the architecture and the rules the GPU replay keeps.
 
+**Hookshot is the engine for four games** (Ocarina of Time here, Mario Kart World in Lakitu, Kirby Air Riders in
+Dragoon, Donkey Kong Bananza), and the aim is one release and one launcher entry for all four. Before working on a fork
+or on anything shared, read [docs/one-engine.md](docs/one-engine.md). In short, an engine change (rendering,
+performance, the runtime, the lifter, the builder) goes to Hookshot `main` as its own pull request, every fork merges
+`main`, and a game's own code goes behind the game profile.
+
 What CONTRIBUTING.md does not spell out, and agents trip on:
 
 - **Tests read the source.** Many checks in `tests/` cut a function out of a source file by its text and compile it

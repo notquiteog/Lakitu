@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Thanks for testing. Before you start:
-        - **Check the [newest release](https://github.com/NotRexed/Hookshot/releases/latest) first.** Every release includes all the fixes before it, and yours may already be fixed.
+        - **Check the [newest release](https://github.com/notquiteog/Hookshot/releases/latest) first.** Every release includes all the fixes before it, and yours may already be fixed.
         - **Search the open issues.** If yours is there, add your details to it instead.
         - English, please.
         - **Never attach game files**: no hookshot.exe, image.bin, the `.bin` caches, romfs or exefs files, keys or saves.
@@ -36,7 +36,7 @@ body:
       label: What happened
       description: >-
         What you saw, and what you expected instead. For low FPS or stutter, note the FPS before and after
-        and whether it happens on a second pass through the same spot. See [Low FPS or stutter](https://github.com/NotRexed/Hookshot#low-fps-or-stutter)
+        and whether it happens on a second pass through the same spot. See [Low FPS or stutter](https://github.com/notquiteog/Hookshot#low-fps-or-stutter)
         for what to compare and which logs to attach.
     validations:
       required: true

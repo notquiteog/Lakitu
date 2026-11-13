@@ -58,14 +58,14 @@ def fingerprint(root=ROOT):
     return h.hexdigest()[:8]
 
 
-DEFAULT_REPOSITORY = "NotRexed/Hookshot"
+DEFAULT_REPOSITORY = "notquiteog/Hookshot"
 
 
 def repository(root=ROOT):
     """(hookshot) The GitHub repository this release came from, as owner/name: where the game's update check, the Builder's
     updater and the setup look for releases. HOOKSHOT_REPOSITORY, else a repository.txt at the root (written when a release
     is packaged, from the repository its CI ran in: scripts/release_parts.py package, scripts/linux/appimage.sh), else
-    NotRexed/Hookshot. A fork's release then updates from the fork, and a source build from this repository as before."""
+    notquiteog/Hookshot. A fork's release then updates from the fork, and a source build from this repository as before."""
     name = os.environ.get("HOOKSHOT_REPOSITORY", "").strip()
     if not name:
         try:

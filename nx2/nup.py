@@ -32,6 +32,7 @@ from time import monotonic
 
 
 ZSTD = b"\x28\xb5\x2f\xfd"
+ABSENT = 0xffffffff   # a title part (exefs or romfs) the package does not carry: an add-on content title has no exefs
 WINDOWS_DEVICES = {"CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL"} | {p + n for p in ("COM", "LPT") for n in "123456789¹²³"}
 
 
@@ -199,7 +200,9 @@ class Nup:
         return self.strings[off:off + n].decode("utf-8")
 
     def walk(self, d, prefix=""):
-        """(relative path, file record) for every file under dir d."""
+        """(relative path, file record) for every file under dir d. ABSENT (an add-on content title's exefs) has none."""
+        if d == ABSENT:
+            return
         no, nl, first, n = self.dirs[d]
         for k in self.kids[first:first + n]:
             if k < self.nd:
@@ -374,7 +377,10 @@ def verify(nup, titles=None, only=None):
 
 def pick_title(nup, want):
     if want is None:
-        return max(nup.titles, key=lambda t: t["version"])   # (the newest: the update over the base)
+        # (the newest program: the update over the base. A package can also carry add-on content, a title with a romfs
+        # and no exefs (Donkey Kong Bananza's), which is never the game)
+        programs = [t for t in nup.titles if t["exefs"] != ABSENT] or nup.titles
+        return max(programs, key=lambda t: t["version"])
     for t in nup.titles:
         if str(t["index"]) == want or str(t["version"]) == want or "%016x" % t["id"] == want.lower():
             return t
@@ -763,9 +769,9 @@ def main():
     for t in nup.titles:
         ex = list(nup.walk(t["exefs"]))
         ro = list(nup.walk(t["romfs"]))
-        print("title %d: %016x v%d  exefs %d files (%s)  romfs %d files, %.2f GB" % (
+        print("title %d: %016x v%d  exefs %d files (%s)  romfs %d files, %.2f GB%s" % (
             t["index"], t["id"], t["version"], len(ex), ", ".join("%s %d" % (p, r[2]) for p, r in ex),
-            len(ro), sum(r[2] for _, r in ro) / 1e9))
+            len(ro), sum(r[2] for _, r in ro) / 1e9, "  (add-on content: no exefs)" if t["exefs"] == ABSENT else ""))
         same = sum(1 for _, r in ro if r[2] != r[4])
         if same:
             print("  (%d romfs files with two different sizes)" % same)

@@ -66,7 +66,7 @@ python -I scripts/test_requests.py update T-XXXX --commit <new-sha>
   older entry in `results` must not stop a tester taking a card updated to a new commit. A moved PR head alone does
   not update the card. Read each result:
   `gh api repos/NotRexed/Hookshot/issues/comments/<number after #issuecomment->` (a review:
-  `gh api repos/NotRexed/Hookshot/pulls/<pr>/reviews/<number>`), or `gh pr view <pr> --comments`.
+  `gh api repos/notquiteog/Hookshot/pulls/<pr>/reviews/<number>`), or `gh pr view <pr> --comments`.
 - Report it to the user in a few lines: who tested, which commit, on what, the result, the numbers or the failure.
   If it failed, continue with the failure on the PR (reproduce, fix, push), then `update T-XXXX --commit <new-sha>`
   to request the new commit on the same card. Only the requester can update it. Earlier results stay in the record
@@ -93,7 +93,7 @@ Needs: AMD RX 6000 or newer, Windows                (then the PR link, then the 
 🧪 T-7KQ2 claim: until 2026-11-12 16:40Z
 🧪 T-7KQ2 renew: until 2026-11-12 18:10Z
 🧪 T-7KQ2 release
-🧪 T-7KQ2 done pass: https://github.com/NotRexed/Hookshot/pull/2711#issuecomment-123
+🧪 T-7KQ2 done pass: https://github.com/notquiteog/Hookshot/pull/2711#issuecomment-123
 🧪 T-7KQ2 cancel
 ```
 

@@ -356,7 +356,7 @@ class UpdateTests(unittest.TestCase):
         import urllib.request
         handlers = [h for h in linux_update._OPENER.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
         self.assertEqual([type(h) for h in handlers], [linux_update._HttpsRedirects])   # (in place of urllib's, not beside it)
-        first = urllib.request.Request("https://github.com/NotRexed/Hookshot/releases/download/v9/part.zip",
+        first = urllib.request.Request("https://github.com/notquiteog/Hookshot/releases/download/v9/part.zip",
                                        headers={"User-Agent": "Hookshot"})
         onward = handlers[0].redirect_request(first, None, 302, "Found", {}, "https://objects.example.invalid/part.zip")
         self.assertEqual(onward.full_url, "https://objects.example.invalid/part.zip")
@@ -389,8 +389,8 @@ class UpdateTests(unittest.TestCase):
         http = next(h for h in linux_update._OPENER.handlers if type(h) is urllib.request.HTTPHandler)
         with mock.patch.object(https, "https_open", https_open), mock.patch.object(http, "http_open", http_open), \
                 self.assertRaisesRegex(ValueError, "not an https link: 'http://objects.example.invalid/part.zip'"):
-            linux_update._request("https://github.com/NotRexed/Hookshot/releases/download/v9/part.zip", 5)
-        self.assertEqual(asked, ["https://github.com/NotRexed/Hookshot/releases/download/v9/part.zip"])
+            linux_update._request("https://github.com/notquiteog/Hookshot/releases/download/v9/part.zip", 5)
+        self.assertEqual(asked, ["https://github.com/notquiteog/Hookshot/releases/download/v9/part.zip"])
 
     def test_a_link_chain_cannot_leave_the_staging_tree(self):
         # x/../.. is inside the folder as written, but the system resolves x first: a link made after it (in the same zip

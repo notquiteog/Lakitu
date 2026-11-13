@@ -51,7 +51,7 @@ cp -a nx2 host game scripts LICENSE readme.md assets "$T/"
 printf '%s
 ' "$VERSION" > "$T/VERSION"   # (no git history in here: nx2/version.py reads the release name from it)
 # (hookshot) the repository releases come from, for the update checks (nx2/version.py repository, builder/linux/linux_update.py)
-printf '%s\n' "${GITHUB_REPOSITORY:-NotRexed/Hookshot}" > "$T/repository.txt"
+printf '%s\n' "${GITHUB_REPOSITORY:-notquiteog/Hookshot}" > "$T/repository.txt"
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
 cp -a builder/linux "$T/builder/"
 cp -a gpu/render/*.h "$T/gpu/render/"
@@ -160,15 +160,15 @@ cp assets/hookshot.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hookshot.pn
 
 # (the update list, beside AppRun and not inside a hashed part: hookshot-linux.txt names each part's checksum)
 # (the parts are served from the linux-parts release of the repository this is built in, where
-# scripts/linux/publish_parts.sh uploads them: without --base the list named NotRexed/Hookshot's release, which a fork's
+# scripts/linux/publish_parts.sh uploads them: without --base the list named notquiteog/Hookshot's release, which a fork's
 # CI does not upload to, so a fork's update list named parts that were not there)
 python3 scripts/linux/make_parts.py "$APPDIR" "$VERSION" "$B/parts" \
-    --base "https://github.com/${GITHUB_REPOSITORY:-NotRexed/Hookshot}/releases/download/linux-parts"
+    --base "https://github.com/${GITHUB_REPOSITORY:-notquiteog/Hookshot}/releases/download/linux-parts"
 
 # The update information AppImageUpdate and Gear Lever read: the newest .zsync of this repository's latest release (or of
 # the release HOOKSHOT_UPDATE_RELEASE names). appimagetool writes it into the image and makes the .zsync beside it with
 # its bundled zsyncmake, which names the AppImage by its file name, next to the .zsync on the same release.
-UPDATE_REPO=${GITHUB_REPOSITORY:-notquiteog/Lakitu}
+UPDATE_REPO=${GITHUB_REPOSITORY:-notquiteog/Hookshot}
 UPDATE_INFO=${HOOKSHOT_UPDATE_INFO:-"gh-releases-zsync|${UPDATE_REPO%%/*}|${UPDATE_REPO#*/}|${HOOKSHOT_UPDATE_RELEASE:-latest}|$PRODUCT-*-x86_64.AppImage.zsync"}
 OUT=$B/$PRODUCT-$VERSION-x86_64.AppImage
 rm -f "$OUT" "$OUT.zsync"

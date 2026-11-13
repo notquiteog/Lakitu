@@ -27,7 +27,7 @@ LIST_NAME = "hookshot-linux.txt"
 
 def _repository():
     """(hookshot) owner/name of the repository releases come from: repository.txt in the AppImage's tools (written by
-    scripts/linux/appimage.sh from the repository its CI ran in), else NotRexed/Hookshot. nx2/version.py's rule"""
+    scripts/linux/appimage.sh from the repository its CI ran in), else notquiteog/Hookshot. nx2/version.py's rule"""
     import re
     here = os.environ.get("HOOKSHOT_TOOLS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     try:
@@ -37,7 +37,7 @@ def _repository():
             return name
     except OSError:
         pass
-    return "NotRexed/Hookshot"
+    return "notquiteog/Hookshot"
 
 
 REPOSITORY = _repository()

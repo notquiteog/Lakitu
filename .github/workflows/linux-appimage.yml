@@ -155,7 +155,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -f work/hot_order.txt ]; then echo "work/ is in the repository"; exit 0; fi
-          python3 -I scripts/release_parts.py previous /tmp/setup.txt --repo "$GITHUB_REPOSITORY" --repo NotRexed/Hookshot \
+          python3 -I scripts/release_parts.py previous /tmp/setup.txt --repo "$GITHUB_REPOSITORY" --repo notquiteog/Hookshot \
             --skip-tag "$RELEASE_TAG" ||
             { echo "no release with a setup list: built without the profile"; exit 0; }
           python3 -I scripts/release_parts.py profile /tmp/setup.txt work ||

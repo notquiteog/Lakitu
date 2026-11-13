@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.3.0-rc.2](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.1...v2.3.0-rc.2) (2026-11-13)
+
+
+### Bug Fixes
+
+* **census:** a game without Ocarina's zstd dictionaries is counted too ([#17](https://github.com/notquiteog/Hookshot/issues/17)) ([2200326](https://github.com/notquiteog/Hookshot/commit/2200326c7fcd90927d91f4a7e3e6ccf4045d9ca0))
+* **hid:** answer GetTouchScreenState&lt;1&gt;, the single-state touch read ([#15](https://github.com/notquiteog/Hookshot/issues/15)) ([9dc643b](https://github.com/notquiteog/Hookshot/commit/9dc643b97a9afcc78965638be0c07c03fd443694))
+* **nup:** a package with add-on content lists and extracts its game ([#12](https://github.com/notquiteog/Hookshot/issues/12)) ([c32a8d3](https://github.com/notquiteog/Hookshot/commit/c32a8d34e493e1c7fbab9384c69635ae3681ed7d))
+* **release:** releases, updates and the launcher come from notquiteog/Hookshot ([#6](https://github.com/notquiteog/Hookshot/issues/6)) ([52ec9c9](https://github.com/notquiteog/Hookshot/commit/52ec9c90ad8dadc291ebd7cdd641dc23e5f5b039))
+
+
+### Documentation
+
+* one engine for four games, and how a fix made for one reaches the others ([#5](https://github.com/notquiteog/Hookshot/issues/5)) ([c61f107](https://github.com/notquiteog/Hookshot/commit/c61f107a70bbfd7e993a76b0c4947df1940c94ac))
+
 ## [2.3.0-rc.1](https://github.com/notquiteog/Hookshot/compare/v2.2.0...v2.3.0-rc.1) (2026-11-13)
 
 

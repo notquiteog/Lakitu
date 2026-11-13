@@ -46,7 +46,7 @@ break. Claim in Discord #dev-work before you start.
 
 ## Before you open an issue or a PR
 
-- Try the [newest upstream release](https://github.com/NotRexed/Hookshot/releases/latest) first. It includes every fix before it.
+- Try the [newest upstream release](https://github.com/notquiteog/Hookshot/releases/latest) first. It includes every fix before it.
 - Search the open issues. If yours is already there, add your details instead of opening another.
 - English, please.
 - One topic per issue or pull request. Do not mix a fix with a refactor or a batch of unrelated changes.
@@ -357,7 +357,7 @@ NVIDIA's DLSS SDK is not one of them: it is never in the repository, and nothing
 
 - **Issues:** [use the forms](https://github.com/NotRexed/Hookshot/issues/new/choose).
 - **Discord:** https://discord.gg/rexed. Use the `dev-work` channel for prs.
-- **Newest release:** https://github.com/NotRexed/Hookshot/releases/latest
+- **Newest release:** https://github.com/notquiteog/Hookshot/releases/latest
 
 Thanks for testing, reporting and sending fixes. Every report from a different GPU and every area played further than
 before moves the port forward.

@@ -92,7 +92,7 @@ class DownloadTests(unittest.TestCase):
         with mock.patch.object(linux_update._OPENER, "open", opened), \
                 mock.patch.object(linux_update.time, "sleep", lambda s: self.fail("waited to try again")):
             with self.assertRaises(linux_update.Cancelled) as raised:
-                linux_update.fetch_bytes("https://github.com/NotRexed/Hookshot/releases/download/v9/part.zip", stop=stop)
+                linux_update.fetch_bytes("https://github.com/notquiteog/Hookshot/releases/download/v9/part.zip", stop=stop)
         self.assertEqual(str(raised.exception), "The update was cancelled.")
         self.assertEqual([a.reads for a in answers], [3])   # (one download, three of its eight megabytes; not the API's either)
 

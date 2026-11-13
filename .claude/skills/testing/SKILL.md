@@ -100,7 +100,7 @@ Result: ... (numbers in a small table when comparing; the log lines that matter;
 Then mark it done with that comment's link (the URL `gh pr comment` prints):
 
 ```
-python -I scripts/test_requests.py done T-XXXX --commit <built-sha> --result pass --comment https://github.com/NotRexed/Hookshot/pull/<pr>#issuecomment-<n>
+python -I scripts/test_requests.py done T-XXXX --commit <built-sha> --result pass --comment https://github.com/notquiteog/Hookshot/pull/<pr>#issuecomment-<n>
 ```
 
 Name the commit actually built in `done --commit`, even if the head or the card changed while testing. Without it,

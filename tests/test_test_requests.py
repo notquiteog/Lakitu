@@ -39,7 +39,7 @@ def load(path, name):
 tr = load(args.source, "test_requests")
 
 T = "\N{TEST TUBE}"
-PR = "https://github.com/NotRexed/Hookshot/pull/2711"
+PR = "https://github.com/notquiteog/Hookshot/pull/2711"
 COMMENT = PR + "#issuecomment-123"
 FAILS = []
 CHECKS = 0
@@ -140,7 +140,7 @@ def test_done_cancel():
     check("@dan:magicbean.dev" in state([walk_in], 4)["results"], "done without a claim counts")
     redo = ev("bob", 9, "%s T-7KQ2 done pass: %s" % (T, PR + "#issuecomment-9"))
     check(state([bob, done, redo], 10)["results"][BOB]["result"] == "pass", "a later result replaces the earlier")
-    wrong = ev("bob", 5, "%s T-7KQ2 done pass: https://github.com/NotRexed/Hookshot/pull/1#issuecomment-1" % T)
+    wrong = ev("bob", 5, "%s T-7KQ2 done pass: https://github.com/notquiteog/Hookshot/pull/1#issuecomment-1" % T)
     check(not state([bob, wrong], 6)["results"], "done on another PR ignored")
     nolink = ev("bob", 5, "%s T-7KQ2 done pass: works" % T)
     check(not state([bob, nolink], 6)["results"], "done needs a comment link")
