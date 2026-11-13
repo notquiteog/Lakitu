@@ -39,7 +39,7 @@ Discord: https://discord.gg/rexed
 <br>
 
 > [!WARNING]
-> **Lakitu boots Mario Kart World 1.0.0 to its title screen, and no further has been tried.**
+> **Lakitu runs Mario Kart World 1.0.0 from its title screen into a Grand Prix race. That is as far as it has been tried.**
 >
 > Lakitu is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is itself mkw-recomp (the Mario Kart
 > World static recompilation) retargeted to Ocarina of Time. This fork takes the engine back to the game it came
@@ -51,8 +51,10 @@ Discord: https://discord.gg/rexed
 > only which copy it is for (1.0.0). Unknown values are `None` and the features that need them are off, rather than
 > filled in with numbers that look plausible &mdash; a wrong address there is a crash or silent corruption. On
 > 2026-11-13 a `HOOKSHOT_GAME=mkw` build of a 1.0.0 dump lifted, compiled and reached the animated title screen
-> ("Press L + R to start") on Linux with an RTX 5060 Ti ([tested configurations](docs/tested-configurations.md)).
-> Nothing past the title screen has been tried: no menu, no race, no input.
+> on Linux with an RTX 5060 Ti; driven headless through the control bridge (L+R, Single Player, Grand Prix, Mushroom
+> Cup, 50cc), it plays the cup's opening and the first race on Mario Bros. Circuit, and the kart drives
+> ([tested configurations](docs/tested-configurations.md)). Not tried: a whole race or cup, other modes, a window, a
+> real controller, sound.
 >
 > So: the default build is still the Ocarina one (`HOOKSHOT_GAME=oot`), and everything below about installing and
 > playing describes that. A Mario Kart World build is `HOOKSHOT_GAME=mkw` from source. "[What a Mario Kart World build still

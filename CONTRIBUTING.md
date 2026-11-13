@@ -6,7 +6,7 @@ your PC from your own copy.
 
 It is a fork of [Hookshot](https://github.com/NotRexed/Hookshot), which is mkw-recomp (Mario Kart World) retargeted
 to Ocarina of Time, and this fork takes the engine back to Mario Kart World. **The default build is still Ocarina**
-(`HOOKSHOT_GAME=oot`). `HOOKSHOT_GAME=mkw` builds Mario Kart World 1.0.0, which reaches its title screen; its game
+(`HOOKSHOT_GAME=oot`). `HOOKSHOT_GAME=mkw` builds Mario Kart World 1.0.0, which reaches a Grand Prix race; its game
 profile holds the game's identity and no other measured value yet. The readme's "What a Mario Kart World build still needs" says what is missing.
 
 This page covers what to send, how to build and test it, and the rules that keep the project out of trouble. The
