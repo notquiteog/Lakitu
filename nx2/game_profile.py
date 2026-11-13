@@ -34,6 +34,7 @@ Which profile a build uses: HOOKSHOT_GAME=<key>, default "oot".
 import argparse
 import collections
 import importlib
+import inspect
 import os
 import sys
 
@@ -91,7 +92,7 @@ OOT = Profile(
     build_id="e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348",
     # main sits after rtld in Eden's layout (nx2/image.py), which for this dump's rtld is 0x20000 bytes.
     main_base=0x80020000,
-    patch_modules=("oot_wide", "oot_camera", "oot_occlusion"),
+    patch_modules=("oot_wide", "oot_fov", "oot_jitter", "oot_occlusion"),
     code_patch_module="oot_patches",
     gfx=Gfx(
         frame_limiter=0xfc,         # int: the rate f_8042cd20 sleeps to
@@ -133,10 +134,11 @@ MKW = Profile(
     #       on the "image:" line as main@<base>+<size>; install_sites() below also reads it off the image and warns
     #       when the profile disagrees, so it can be checked rather than trusted.
     main_base=None,
-    #   patch_modules: none yet. Each of Ocarina's (nx2/oot_wide.py, nx2/oot_camera.py, nx2/oot_occlusion.py) is a
-    #       table of addresses in Ocarina's main, so none of them can be reused; a Mario Kart World widescreen or
-    #       camera patch is a new module, found the same way theirs were (the instruction that loads the picture
-    #       size, the projection update, the occlusion-query flag) and named here once it exists.
+    #   patch_modules: none yet. Each of Ocarina's (nx2/oot_wide.py, nx2/oot_fov.py, nx2/oot_jitter.py,
+    #       nx2/oot_occlusion.py) is a table of addresses in Ocarina's main, so none of them can be reused; a Mario
+    #       Kart World widescreen, lens or jitter patch is a new module, found the same way theirs were (the
+    #       instruction that loads the picture size, the projection update, the view's projection load, the
+    #       occlusion-query flag) and named here once it exists.
     patch_modules=(),
     #   code_patch_module: the equivalent of nx2/oot_patches.py, which rewrites named lifted functions
     #       (f_80b1e140 and friends). Those names are Ocarina's addresses; a Mario Kart World module would be new.
@@ -194,17 +196,24 @@ def site_word(img, pc):
         return None
 
 
+def site_words(word):
+    """A site's expected instruction words: one word, or a tuple of consecutive ones the site needs together."""
+    return tuple(word) if isinstance(word, (tuple, list)) else (word,)
+
+
 def install_sites(lifter, img, profile, sites, what, log=print):
     """Install each site's C after the game's instruction at it, and return how many went in.
 
     sites is ((offset from main, the instruction word expected there, the C to add), ...), or a function of main's
-    base returning that, for a patch whose C text holds absolute addresses of its own. A site whose word is not
+    base returning that, for a patch whose C text holds absolute addresses of its own. The word may be a tuple of the
+    consecutive words the site needs (a patch that relies on the two instructions after its own as well, as
+    nx2/oot_fov.py's does); every one of them is checked, and the C goes after the first. A site whose word is not
     the expected one is logged and left out: that is the whole safety story of a game profile, because it is what
     turns "this profile is for another build" from a corrupted game into a feature that is off. A profile with no
     main base patches nothing at all, for the same reason.
 
-    The C is appended where a site already has some, so two patch modules can share a site (nx2/oot_wide.py's camera
-    ratio and nx2/oot_camera.py's publish do) in the order lift.py installs them.
+    The C is appended where a site already has some, so two patch modules can share a site, in the order the profile
+    lists them.
     """
     base = profile.main_base
     if base is None:
@@ -219,10 +228,15 @@ def install_sites(lifter, img, profile, sites, what, log=print):
     n = 0
     for off, word, text in sites:
         pc = base + off
-        have = site_word(img, pc)
-        if have != word:
+        wrong = None
+        for i, want in enumerate(site_words(word)):
+            have = site_word(img, pc + 4 * i)
+            if have != want:
+                wrong = (off + 4 * i, have, want)
+                break
+        if wrong:
             log("%s: main+%#x holds %s, not %08x: left out"
-                % (what, off, "?" if have is None else "%08x" % have, word))
+                % (what, wrong[0], "?" if wrong[1] is None else "%08x" % wrong[1], wrong[2]))
             continue
         lifter.after[pc] = (lifter.after[pc] + "\n" + text) if pc in lifter.after else text
         n += 1
@@ -230,41 +244,57 @@ def install_sites(lifter, img, profile, sites, what, log=print):
     return n
 
 
-def install_patches(lifter, img, profile=None, log=print):
+def load_module(name):
+    """A game's patch module by the name its profile holds. This file is the one place the lift imports a module by a
+    name made at run time; nx2/make_game.py lift_sources takes every profile's modules into the lift's cache key
+    because its walk of import statements cannot see these (tests/test_lift_cache.py)."""
+    return importlib.import_module(name)
+
+
+def install_module(module, lifter, img, profile, build_id=None):
+    """One patch module's install(lifter, img, ...), handed what its signature asks for: build_id (main's build id
+    as the image holds it, for a module gated on one build, as nx2/oot_fov.py is) and profile."""
+    params = inspect.signature(module.install).parameters
+    kw = {}
+    if "build_id" in params:
+        kw["build_id"] = build_id or ""
+    if "profile" in params:
+        kw["profile"] = profile
+    return module.install(lifter, img, **kw)
+
+
+def install_patches(lifter, img, profile=None, build_id=None, log=print):
     """Install the active profile's lift patch modules, in the order the profile lists them.
 
     lift.py calls this instead of importing a game's modules by name, which is the point: adding a game is a profile
-    entry and a new module, not an edit to the lift driver.
+    entry and a new module, not an edit to the lift driver. build_id is main's build id as the image holds it
+    (install_module hands it to the modules that ask for it).
     """
     profile = active() if profile is None else profile
     if not profile.patch_modules:
         log("patches: the %s profile has no lift patch modules" % profile.key)
         return 0
-    total = 0
-    for name in profile.patch_modules:
-        total += importlib.import_module(name).install(lifter, img)
-    return total
+    return sum(install_module(load_module(name), lifter, img, profile, build_id)
+               for name in profile.patch_modules)
 
 
-def apply_code_patches(gen, profile=None, main_build=None, standalone=False, log=print):
-    """Run the active profile's changes to the lifted C, after it has been written.
+def code_patches(profile=None, main_build=None, standalone=False):
+    """(module name or None, supported): what nx2/chunks.py edit_c runs over the lifted C, after it has been written.
 
     main_build is the build id the image really holds, and standalone says whether this is the standalone lift.
     A code patch module may hold patches that apply only to the one build it was written against and are unsafe on
-    any other (Ocarina's player-state patches, gated on nx2/oot_patches.py's LIFE_BUILD_ID). The module owns that
-    constant; this passes its gate only when the image holds exactly that build, so another build of the same game
-    still gets the module's other patches and not those. A module without such a constant takes no gate.
+    any other (Ocarina's player-state and output-size edits, gated on nx2/oot_patches.py's LIFE_BUILD_ID). The module
+    owns that constant; supported is true only when the image holds exactly that build in a standalone lift, so another
+    build of the same game still gets the module's other patches and not those. A module without such a constant is
+    never "supported" in that sense. A profile without a code patch module gets (None, False): edit_c then makes only
+    the engine's own edits.
     """
     profile = active() if profile is None else profile
     if not profile.code_patch_module:
-        log("patches: the %s profile has no code patch module" % profile.key)
-        return False
-    module = importlib.import_module(profile.code_patch_module)
-    gate = {}
-    if getattr(module, "LIFE_BUILD_ID", None) is not None:
-        gate["protect_hearts"] = bool(standalone and main_build == module.LIFE_BUILD_ID)
-    module.apply(gen, **gate)
-    return True
+        return None, False
+    module = load_module(profile.code_patch_module)
+    gate = getattr(module, "LIFE_BUILD_ID", None)
+    return profile.code_patch_module, bool(standalone and gate is not None and main_build == gate)
 
 
 # ---- the C view of the profile ----

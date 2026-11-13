@@ -87,10 +87,27 @@ def sites_of(module, main_base):
         return None
     out = []
     for site in table:
-        if len(site) < 2 or not isinstance(site[0], int) or not isinstance(site[1], int):
+        if len(site) < 2 or not isinstance(site[0], int):
             return None
-        out.append((site[0], site[1]))
+        words = game_profile.site_words(site[1])
+        if not words or not all(isinstance(w, int) for w in words):
+            return None
+        out.append((site[0], words))
     return out
+
+
+def image_words(base, pairs, flip=()):
+    """The words an image holds for these sites: each site's consecutive words, the ones in flip changed."""
+    out = {}
+    for k, (off, words) in enumerate(pairs):
+        for i, w in enumerate(words):
+            out[base + off + 4 * i] = w ^ 0xffffffff if flip == "all" or (k, i) in flip else w
+    return out
+
+
+def install(module, lifter, img, profile):
+    """The module installed as the lift installs it (nx2/game_profile.py install_module), for the profile's build."""
+    return game_profile.install_module(module, lifter, img, profile, build_id=profile.build_id)
 
 
 def check_patch_modules(profile):
@@ -104,15 +121,15 @@ def check_patch_modules(profile):
         if not check(pairs, "%s: %s has no readable site table, so nothing about it could be checked"
                             % (profile.key, name)):
             continue
-        if not check(all(0 <= w <= 0xffffffff for _, w in pairs),
+        if not check(all(0 <= w <= 0xffffffff for _, words in pairs for w in words),
                      "%s: %s has a site whose expected value is not a 32-bit instruction word" % (profile.key, name)):
             continue
 
         # (1a) the image holds every word the module expects: every site goes in
-        good = FakeImage(profile.main_base, {profile.main_base + off: word for off, word in pairs})
+        good = FakeImage(profile.main_base, image_words(profile.main_base, pairs))
         lifter = FakeLifter()
         with contextlib.redirect_stdout(io.StringIO()):
-            n = module.install(lifter, good, profile)
+            n = install(module, lifter, good, profile)
         if not check(n == len(pairs) and len(lifter.after) > 0,
                      "%s: %s installed %d of %d sites on an image that holds every expected word"
                      % (profile.key, name, n, len(pairs))):
@@ -123,12 +140,11 @@ def check_patch_modules(profile):
             continue
 
         # (1b) every word differs: nothing is patched, and each skipped site is said out loud
-        flipped = FakeImage(profile.main_base,
-                            {profile.main_base + off: word ^ 0xffffffff for off, word in pairs})
+        flipped = FakeImage(profile.main_base, image_words(profile.main_base, pairs, flip="all"))
         lifter = FakeLifter()
         said = io.StringIO()
         with contextlib.redirect_stdout(said):
-            n = module.install(lifter, flipped, profile)
+            n = install(module, lifter, flipped, profile)
         check(n == 0 and not lifter.after,
               "%s: %s patched %d sites on an image where every word differs: a profile aimed at the wrong build "
               "would corrupt the game" % (profile.key, name, n))
@@ -138,20 +154,28 @@ def check_patch_modules(profile):
 
         # (1c) one word differs: that site alone is left out, the rest still go in
         if len(pairs) > 1:
-            words = {profile.main_base + off: word for off, word in pairs}
+            words = image_words(profile.main_base, pairs, flip={(0, 0)})
             first = profile.main_base + pairs[0][0]
-            words[first] ^= 0xffffffff
             lifter = FakeLifter()
             with contextlib.redirect_stdout(io.StringIO()):
-                n = module.install(lifter, FakeImage(profile.main_base, words), profile)
+                n = install(module, lifter, FakeImage(profile.main_base, words), profile)
             check(n == len(pairs) - 1 and first not in lifter.after,
                   "%s: %s did not leave out the one site whose word differs (installed %d of %d)"
                   % (profile.key, name, n, len(pairs)))
+        # (1e) a site that needs several consecutive words: its last word alone differs, and it is still left out
+        multi = [k for k, (_, words) in enumerate(pairs) if len(words) > 1]
+        for k in multi:
+            words = image_words(profile.main_base, pairs, flip={(k, len(pairs[k][1]) - 1)})
+            lifter = FakeLifter()
+            with contextlib.redirect_stdout(io.StringIO()):
+                n = install(module, lifter, FakeImage(profile.main_base, words), profile)
+            check(n == len(pairs) - 1 and profile.main_base + pairs[k][0] not in lifter.after,
+                  "%s: %s patched a site whose last needed word differs" % (profile.key, name))
 
         # (1d) an address that is not in the image at all is left out, not raised through
         lifter = FakeLifter()
         with contextlib.redirect_stdout(io.StringIO()):
-            n = module.install(lifter, FakeImage(profile.main_base, {}), profile)
+            n = install(module, lifter, FakeImage(profile.main_base, {}), profile)
         check(n == 0 and not lifter.after,
               "%s: %s patched %d sites on an image that holds no instruction at any of them"
               % (profile.key, name, n))
@@ -178,20 +202,25 @@ def check_lift_names_no_game():
     check("game_profile" in text, "nx2/lift.py does not mention game_profile: it is not going through the seam")
     check(re.search(r"game_profile\.install_patches\(", text),
           "nx2/lift.py does not call game_profile.install_patches()")
-    check(re.search(r"game_profile\.apply_code_patches\(", text),
-          "nx2/lift.py does not call game_profile.apply_code_patches()")
+    check(re.search(r"game_profile\.code_patches\(", text),
+          "nx2/lift.py does not ask game_profile.code_patches() which module edits the lifted C")
 
     # every module any profile names, plus anything that looks like a game module, must not be imported here
     named = {m for p in game_profile.GAMES.values() for m in p.patch_modules}
     named |= {p.code_patch_module for p in game_profile.GAMES.values() if p.code_patch_module}
     if not check(named, "no profile names a patch module, so this check would scan for nothing"):
         return
-    for module in sorted(named):
-        check(not re.search(r"^\s*(?:import|from)\s+%s\b" % re.escape(module), text, re.M),
-              "nx2/lift.py imports %s by name: the game's modules come from the profile" % module)
-    # and the general shape, for a game whose prefix no profile lists yet
-    stray = re.findall(r"^\s*import\s+([a-z0-9]+_(?:wide|camera|occlusion|patches))\b", text, re.M)
-    check(not stray, "nx2/lift.py imports game patch modules by name: %s" % ", ".join(stray))
+    # (nx2/chunks.py edits the lifted C for the lift: it takes the code patch module's name from the profile too)
+    chunks = (ROOT / "nx2" / "chunks.py").read_text(encoding="utf-8")
+    check("def edit_c(" in chunks and "patches=" in chunks,
+          "nx2/chunks.py edit_c does not take the code patch module from its caller")
+    for where, body in (("nx2/lift.py", text), ("nx2/chunks.py", chunks)):
+        for module in sorted(named):
+            check(not re.search(r"^\s*(?:import|from)\s+%s\b" % re.escape(module), body, re.M),
+                  "%s imports %s by name: the game's modules come from the profile" % (where, module))
+        # and the general shape, for a game whose prefix no profile lists yet
+        stray = re.findall(r"^\s*import\s+([a-z0-9]+_(?:wide|camera|occlusion|patches|fov|jitter))\b", body, re.M)
+        check(not stray, "%s imports game patch modules by name: %s" % (where, ", ".join(stray)))
 
 
 def check_header_matches():

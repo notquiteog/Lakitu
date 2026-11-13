@@ -78,10 +78,10 @@ message. OoT-specific code goes into new files where it can, so the shared files
         │  a64-kit lift/a64_lift.py + nx2/insn.py + nx2/lift_fixes.py + nx2/poll.py + nx2/chunks.py
         ▼
  one C function per guest function (work/sa/gen, ~1 GB, local), 64-bit guest window (nx2/rtgen.py)
-        │  clang 24 (emsdk) -O1, lld (nx2/build.py --standalone)
+        │  clang (llvm-mingw, emsdk or the system's) -O1, the hot functions -O2 with the play profile, lld (nx2/build.py --standalone)
         ▼
  hookshot.exe = lifted game + host/ (Horizon: threads, SVCs, memory, fs, hid, audio, vi, gs, NVN2)
- hookshot_vk.dll = the Vulkan back end (gpu/vk), loaded by host/rx_backend.c with RX_BACKEND=vulkan
+ hookshot_vk.dll = the Vulkan back end (gpu/vk), loaded by host/rx_backend.c unless RX_BACKEND names another renderer
 ```
 
 - **Standalone from the start.** MKW went emulator-hosted first (Eglantine with a recompiled CPU backend), then
@@ -95,8 +95,19 @@ message. OoT-specific code goes into new files where it can, so the shared files
 - **GPU.** `host/nvn_native.c` implements the NVN2 procs over guest memory in place: objects live where the game
   puts them, command buffers record an op stream (`gpu/render/rx_nvn.h`), queue submits hand it to the back end.
   `gpu/vk` replays it on Vulkan 1.3: pools imported as host memory, SM86 programs through Eden's recompiler to
-  SPIR-V, mesh/task programs with `VK_EXT_mesh_shader`. The WebGPU renderer (`gpu/render`) stays in the exe as the
-  fallback when Vulkan is missing, as in mkw-recomp.
+  SPIR-V, mesh/task programs with `VK_EXT_mesh_shader`. The WebGPU renderer (`gpu/render`) stays in the Windows exe as the
+  fallback when Vulkan is missing, as in mkw-recomp, when the build has wgpu-native (`WGPU_NATIVE`).
+
+### Graphics pipeline state
+
+The mesh compute fallback draws its generated records through a vertex shader without vertex buffers.
+Its graphics pipelines keep dynamic primitive topology and primitive restart, but do not require a
+dynamic vertex binding stride (#2494, tracked in #1001). Ordinary vertex-input pipelines still use
+dynamic stride; native mesh pipelines do not use these three input-assembly/vertex-input states.
+Binding the fallback's static-stride pipeline invalidates dynamic strides. The draw path drops both
+vertex-bind skip caches at that bind, so the next ordinary draw sets its strides again even if the
+buffers are unchanged. Resolved buffer references remain cached; buffer handles, offsets and sizes
+are not invalidated by pipeline binding. Runtime fallback programs do not use pipeline libraries.
 
 ## 4. The lessons from MKW, as rules here
 
@@ -112,14 +123,17 @@ second game.
    (`gpu/vk/vk_memory.cpp`, `RX_VK_CAPTURE_POOL_MB`). *Check:* the mirror sync log's live-sync count stays ~0.
 3. **Texture and sampler registrations are queued in order with the submits**, never applied out of band.
 4. **GPU timestamps drive dynamic resolution.** OoT is reported at 1080p-1440p docked, so it has a resolution
-   controller fed by timestamp reports: the fake GPU time (`host/nvn_native.c`, the 31.25 MHz tick clock) must be
+   controller fed by timestamp reports: the fake GPU time (the counter reports the replay writes, `gpu/vk/vk_replay.cpp`
+   `NOP_REPORT_COUNTER`: the 31.25 MHz tick clock since the frame's present, times `RX_VK_TS_SCALE`, 0.1 by default) must be
    scaled so the controller settles where the PC is, not at its floor. *Check:* the render size it picks over time.
-5. **Clears after draws, and draws that sample their own target, get passes of their own** (`vk_draw.cpp`).
+5. **Clears after draws, and draws that sample a target their pass already wrote (or write one an earlier draw of the
+   pass sampled), get passes of their own** (`vk_draw.cpp` `clear_after_draws`, `draw_hazards`). A draw that samples
+   a target it writes itself stays in the pass.
 6. **2D views of 3D textures need `VK_EXT_image_2d_view_of_3d`** (the RTX 4060 Ti has it).
 7. **The CPU saturates first.** Ryzen 5 7600X, 6 cores / 12 threads: the game's threads, the replay, captures and
    pipeline compiles share it, and extra helper threads have lowered fps before. Thread counts are measured, never
-   raised by default (`HOS_VCORES`, `RX_VK_CAPTURE_THREADS`, `HOS_THREAD_STATS=1`, the `HOS_SAMPLE` profiler with
-   `scripts/prof.py`).
+   raised by default (`HOS_VCORES`, `RX_VK_CAPTURE_THREADS`, `HOS_THREAD_TIMES=<seconds>`, the `HOS_SAMPLE` profiler
+   with `scripts/prof.py`).
 
 Also inherited, and game-specific in MKW: MKW's frame-pacer hooks at fixed guest addresses are gated on MKW's build
 id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by address coincidence. The game profile is
@@ -177,7 +191,7 @@ where that kind of value belongs now (section 8).
   edited.
 - One game run at a time on this PC (mkw-recomp's runs take ~10 GB): `run-vk.ps1` refuses while `mkw.exe` or
   another `hookshot.exe` runs, and while Rainbow Six Siege is open; no heavy builds while Siege is open either. Runs are
-  muted (`HOS_AUDIO=0`), at below-normal priority, and screenshot folders are deleted once looked at.
+  muted (`HOS_AUDIO=0`), at the priority `-Priority` gives (High by default), and screenshot folders are deleted once looked at.
 - The lifted C and every build are GPL (suyu's translator is GPL-2.0-or-later; Eden's code is GPL-3.0).
 
 ## 9. Status
@@ -261,6 +275,11 @@ dump, the runtime made game-neutral, the stage-1 tools checked on MKW's dump as 
 - A release build (`RX_RELEASE=1` at build time) precompiles before the game starts; test builds do not unless RX_VK_PRECOMPILE=1.
   hookshot_programs.bin (with hookshot_programs.idx, the list of its records), hookshot_pipelines.bin and mkw_vk_pipelines.bin go
   beside the executable.
+- A program the driver's compiler faulted on (guarded_graphics) is never asked of the driver again (gpu/vk/driver_faults.h). On AMD's Windows
+  driver the caught fault left the program's compile unfinished inside it, and every later build of that program waited there
+  forever: the pause-menu freeze of issue 996, seen in a full dump. On AMD one program's builds also go to the driver one at a
+  time (RX_VK_DRIVER_FAULTS=2: on every driver); other drivers keep building a program's variants side by side.
+  The faults are kept per driver version in hookshot_driver_faults.txt beside the executable.
 
 ## 11. Findings, 2026-11-06, day
 
@@ -282,3 +301,25 @@ dump, the runtime made game-neutral, the stage-1 tools checked on MKW's dump as 
 - The builder's first full build: 43 minutes at below-normal priority, 0 failures; the folder starts from a double click and reaches the title at 60 fps.
 - Render conditions here gate single lights and read reports earlier in the same stream, so they cannot be read at record time.
 
+
+## 12. Findings, 2026-11-11: what a frame waits for
+
+- `HOS_CHAIN` + `scripts/chain.py` walk each frame back from its present (RTX 3090, Ryzen 9 7900X, Linux, NVIDIA 620.70, Kokiri
+  Forest standing, 2560x1440, ~1250 draws, recording on: 17.8 ms a frame). The frame is one loop through two threads, nothing else:
+  - the presentation thread, from the main thread's message to its present: 12.5 ms (the replay of the frame's commands);
+  - the present call, to the event that releases the main thread: 2.7 ms, ~2.4 of them inside `vkQueuePresentKHR` (in the driver,
+    in `poll`);
+  - the main thread, from that event to its next message: 2.6 ms, ~2 of them the renderer's work on its own submits (the submit's
+    capture copies, `memory_collect_written`, its replay).
+  The game's job threads (ModuleSystemWorker, BaseProcExecutor) and the background threads are on the path under 0.1 ms a frame;
+  waits for a virtual core 0.27 ms (the presentation thread taking one back after its present); hand-offs ~10 us each. The main
+  thread waits ~4.5 ms a frame on the presentation thread. So the game's own CPU work is not what holds the frame here: the
+  replay, the present and the submits on the game's threads are. ("Gameplay is CPU-bound: the game's threads next", section 9,
+  is answered: the renderer's work on them.)
+- The present's wait is the GPU finishing the frame: with `RX_VK_PRESENT_THREAD=1` the presenter thread waits 1.75-1.92 ms a
+  present for the copy's fence and then 0.18-0.22 ms in `vkQueuePresentKHR`. The game's present call then returns in 0.07-0.10 ms
+  (median) instead of 2.0-2.1, and the frame (recording on, alternating runs) took 20.1 and 19.0 ms against 22.1 and 22.9. With the
+  present off the path, the main thread's job waits (lr 0x80070bfc) start to show on it. (`RX_VK_NO_WRITEBACK=1`, the 1280x720
+  output, a 240 Hz compositor and `RX_VK_IMMEDIATE=1` left the wait as it was.)
+- Measuring on this PC: two runs of the same build vary by 10% and more (other work on the machine); fps differences under that
+  need many alternating runs. `chain.py`'s stretches are steadier: they say which part moved.

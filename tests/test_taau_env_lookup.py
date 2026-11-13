@@ -9,7 +9,10 @@ import re
 import subprocess
 import tempfile
 
+RUN_ALL_ARGS = ["--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
+ENV_ON_H = str(ROOT / "gpu" / "vk" / "compat" / "hookshot_env.h")
 
 
 def block(source, marker):
@@ -26,14 +29,10 @@ PREFIX = r'''
 #define _CRT_SECURE_NO_WARNINGS
 // (the game profile's key prefixes, as the real file reads them: game/game_profile.h)
 #include "game_profile.h"
-#include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 static const char *configured_keys, *no_f16;
 static int key_reads;
@@ -43,6 +42,9 @@ static const char* fixture_getenv(const char* name) {
     return nullptr;
 }
 #define getenv fixture_getenv
+// (env_on, the switches' rule (hookshot_env.h, included first), over the fixture's environment)
+static bool fixture_env_on(const char* name) { const char* v = fixture_getenv(name); return v && !env_value_off(v); }
+#define env_on fixture_env_on
 namespace Shader { namespace Backend { namespace SPIRV { static bool mma_software = true; } } }
 using VkCommandBuffer = int;
 using VkImageView = int;
@@ -53,83 +55,13 @@ struct Info { std::vector<Desc> texture_descriptors, image_descriptors; };
 struct Stage { Info info; };
 struct NvnState {};
 struct Program { uint64_t key; std::vector<Stage> stages; };
-struct Texture { int format=VK_FORMAT_B10G11R11_UFLOAT_PACK32; uint32_t width=1, height=1; int image=0; };
+struct Texture { int format=VK_FORMAT_B10G11R11_UFLOAT_PACK32; };
 static Texture texture;
 static struct { bool push_descriptor=false; } dev;
-// Upstream's fixture sets this to true/false; this fork's seam also compares it with nullptr, so
-// the spy answers both without pretending to be a real function pointer.
-struct PushDescriptorSpy {
-    bool on = true;
-    PushDescriptorSpy& operator=(bool v) { on = v; return *this; }
-    explicit operator bool() const { return on; }
-    friend bool operator!=(const PushDescriptorSpy& p, std::nullptr_t) { return p.on; }
-    friend bool operator==(const PushDescriptorSpy& p, std::nullptr_t) { return !p.on; }
-};
-static PushDescriptorSpy vkCmdPushDescriptorSetKHR;
+static bool vkCmdPushDescriptorSetKHR=true;
 struct ImageInfo { VkImageView imageView; };
-struct SrcInfo { int image = 0; int format = 0; uint32_t width = 0, height = 0; };
-static struct DrawWork { std::vector<ImageInfo> imgs; std::vector<SrcInfo> srcs; } draw_work;
-static DrawWork& dw() { return draw_work; }
-
-// (hookshot) This fork's taau_stand_in is the backend seam, not upstream's four-line gate: it
-// resolves the dispatch into an upscale::Request, asks which backend takes it, and runs that one.
-// The seam's own headers are plain data and Vulkan-free, so they are included rather than faked --
-// a hand-written Verdict or Request would be a second definition to keep in step, and the test
-// would pass while the real contract moved. Each backend reports itself unavailable here, so the
-// stand-in path runs, which is the path this test is about.
-#include "upscale_contract.h"
-#include "upscale_seam.h"
-using namespace mkwvk;
-constexpr int VK_NULL_HANDLE = 0;
-using VkImage = int;
-constexpr int VK_IMAGE_ASPECT_COLOR_BIT = 1, VK_FILTER_NEAREST = 0, VK_FORMAT_UNDEFINED = 0;
-constexpr int VK_IMAGE_LAYOUT_GENERAL = 1;
-struct VkImageSubLayers { uint32_t aspectMask, mipLevel, baseArrayLayer, layerCount; };
-struct VkOffset3D { int32_t x, y, z; };
-struct VkImageBlit { VkImageSubLayers srcSubresource; VkOffset3D srcOffsets[2];
-                     VkImageSubLayers dstSubresource; VkOffset3D dstOffsets[2]; };
-static void vkCmdBlitImage(VkCommandBuffer, VkImage, int, VkImage, int, uint32_t, const VkImageBlit*, int) {}
-static struct { int image = 0, view = 0, format = 0; uint32_t width = 0, height = 0; } scene_depth;
-static struct { float m[16]; bool have = false; } scene_vp;
-static void logf(const char*, ...) {}
-static int scene_upscaler() { return 0; }
-static bool upscale_trace_key(uint64_t) { return false; }
-static void upscale_bindings(const NvnState&, const Stage&, std::vector<upscale::Binding>&) {}
-static bool scene_history_stale(uint32_t, uint32_t) { return false; }
-static void scene_jitter_display_width(uint32_t) {}
-static bool scene_jitter(float* x, float* y) { if (x) *x = 0.0f; if (y) *y = 0.0f; return false; }
-// In the renderer these two are weak symbols the host may or may not define, and the seam tests the
-// address before calling; a plain function here would make that test always true.
-static float (*hos_oot_camera)(float*, float*) = nullptr;
-static int (*hos_oot_view_projection)(float*) = nullptr;
-struct FakeMatrix { float m[16]; };
-namespace mkwvk {
-namespace camera_motion {
-using Matrix = FakeMatrix;
-static VkImageView record(VkCommandBuffer, VkImageView, int, uint32_t, uint32_t, const Matrix&) { return 0; }
-static VkImage motion_image() { return 0; }
-static int motion_format() { return 0; }
-}
-namespace fsr3 {
-struct Inputs { VkImageView color=0, depth=0, motion=0; uint32_t render_width=0, render_height=0,
-                upscale_width=0, upscale_height=0; float motion_scale[2]{}, jitter[2]{};
-                float near_plane=0.0f, fov_y=0.0f; bool reset=false; };
-static bool supported() { return false; }
-static bool upscale(VkCommandBuffer, const Inputs&) { return false; }
-static VkImage output_image() { return 0; }
-static int fsr_stage() { return 0; }
-static void note_frame() {}
-}
-namespace dlss {
-struct Inputs { VkImageView color=0, depth=0, motion=0; VkImage color_image=0, depth_image=0, motion_image=0;
-                int color_format=0, depth_format=0, motion_format=0;
-                uint32_t render_width=0, render_height=0, upscale_width=0, upscale_height=0;
-                float motion_scale[2]{}, jitter[2]{}; float near_plane=0.0f, fov_y=0.0f; bool reset=false; };
-static bool supported() { return false; }
-static bool upscale(VkCommandBuffer, const Inputs&) { return false; }
-static VkImage output_image() { return 0; }
-}
-}   // (vk_draw.cpp's dw is a TLS_OBJECT: the calling thread's, by a call)
+static struct DrawWork { std::vector<ImageInfo> imgs; } draw_work;
+static DrawWork& dw() { return draw_work; }   // (vk_draw.cpp's dw is a TLS_OBJECT: the calling thread's, by a call)
 static unsigned handle_value=5;
 static bool resolve_image=true, upscale_result=true;
 static int upscale_calls, view_calls, handle_calls;
@@ -226,15 +158,14 @@ def main():
         source, exe = folder / 'fixture.cpp', folder / 'fixture.exe'
         source.write_text(cpp, encoding='utf-8')
         if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
-            command = [args.cxx, '/nologo', '/std:c++17', '/EHsc', '/W4', '/WX',
-                       '/I' + str(ROOT / 'gpu' / 'vk'), '/I' + str(ROOT / 'game'), str(source),
+            # (/FI, -include: env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h;
+            #  game/ holds the game profile's C view, which is where the default key prefixes come from)
+            command = [args.cxx, '/nologo', '/std:c++17', '/EHsc', '/W4', '/WX', '/FI' + ENV_ON_H,
+                       '/I' + str(ROOT / 'game'), str(source),
                        '/Fo' + str(folder / 'fixture.obj'), '/Fe' + str(exe), *args.cxx_arg]
         else:
-            # (this fork's taau_stand_in includes the seam's own headers, which live in gpu/vk; game/ holds the
-            #  game profile's C view, which is where the default key prefixes come from)
-            command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror',
-                       '-I' + str(ROOT / 'gpu' / 'vk'), '-I' + str(ROOT / 'game'),
-                       *args.cxx_arg, str(source), '-o', str(exe)]
+            command = [args.cxx, '-std=c++17', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror',
+                       '-I' + str(ROOT / 'game'), *args.cxx_arg, str(source), '-o', str(exe)]
         subprocess.run(command, cwd=folder, check=True)
         failed = False
         for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes'):

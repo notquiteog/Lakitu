@@ -20,4 +20,4 @@ SITES = tuple((off, LDRB_W8_X0, TEXT) for off in OFFSETS)
 
 def install(lifter, img, profile=None):
     """The sites into lifter.after; a site whose word differs (another game version) is left out"""
-    return game_profile.install_sites(lifter, img, profile or game_profile.active(), SITES, "occlusion off")
+    return game_profile.install_sites(lifter, img, profile or game_profile.OOT, SITES, "occlusion off")

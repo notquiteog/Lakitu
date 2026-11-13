@@ -38,23 +38,29 @@ PROGRAM = r'''
 #include <cstdio>
 static int failures;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL: %%s\n", #c); ++failures; } } while (0)
-struct Options { int upscale = 0; };
+struct Options { int upscale = 0; int dlss = 0; };
 static Options opts;
 %s
 
 %s
 
 int main() {
-    // the three filter values pass through untouched
+    // the three filter values pass through untouched, and none of them is a scene upscaler
     for (int v = 0; v <= 2; v++) { opts.upscale = v; CHECK(window_filter() == v); CHECK(scene_upscaler() == 0); }
-    // the two scene upscalers are not filter modes, and must not reach the filter's shader as one
-    opts.upscale = 3; CHECK(window_filter() == 0); CHECK(scene_upscaler() == 1);
-    opts.upscale = 4; CHECK(window_filter() == 0); CHECK(scene_upscaler() == 2);
-    // a value from an older or newer ini than this build is not a filter mode either
+    // an old options file's 3 and 4 (FSR 3.1 and DLSS were on the filter's row) are not filter modes
+    opts.upscale = 3; CHECK(window_filter() == 0); CHECK(scene_upscaler() == 0);
+    opts.upscale = 4; CHECK(window_filter() == 0);
     opts.upscale = 99; CHECK(window_filter() == 0);
-    opts.upscale = -1; CHECK(window_filter() == 0); CHECK(scene_upscaler() == 0);
+    opts.upscale = -1; CHECK(window_filter() == 0);
+    // AMD's scene upscalers come from the Upscaler row (upscaler_rows.h FSR3 = 3, FSR4 = 4); DLSS's values are not AMD's
+    opts.upscale = 0;
+    for (int v = 0; v <= 2; v++) { opts.dlss = v; CHECK(scene_upscaler() == 0); }
+    opts.dlss = 3; CHECK(scene_upscaler() == 3);
+    opts.dlss = 4; CHECK(scene_upscaler() == 4);
+    opts.dlss = 5; CHECK(scene_upscaler() == 0);
+    opts.dlss = -1; CHECK(scene_upscaler() == 0);
     if (failures) return 1;
-    std::printf("PASS: the Upscaling row's filter half and scene half stay apart\n");
+    std::printf("PASS: the window filter and the scene upscaler stay apart\n");
     return 0;
 }
 '''
@@ -78,11 +84,14 @@ def main():
                        check=True)
         subprocess.run([str(exe)], check=True)
 
-    # the row itself: all five values on offer, and the clamp for a build that cannot do DLSS
-    if '"Upscaling", &opts.upscale, 0, 4, 1, tx_upscale' not in menu:
-        raise SystemExit("the Upscaling row no longer offers 0..4")
-    if "dlss::built_with_sdk()" not in menu or "r.hi = 3" not in menu:
-        raise SystemExit("menu_init no longer clamps the row where the build has no NGX SDK")
+    # the rows themselves: the filter's three values, and the Upscaler's five (game's own, DLSS, DLAA, FSR 3.1, FSR 4)
+    if '"Window scaling filter", &opts.upscale, 0, 2, 1, tx_filter' not in menu:
+        raise SystemExit("the Window scaling filter row no longer offers 0..2")
+    if '"Upscaler", &opts.dlss, 0, ur::kUpscalers - 1, 1, tx_upscaler' not in menu:
+        raise SystemExit("the Upscaler row no longer offers every upscaler")
+    # and an options file from the fork's old Upscaling row (3 FSR 3.1, 4 DLSS) moves over to the Upscaler
+    if "old_upscaling == 3" not in menu:
+        raise SystemExit("load: a scene upscaler saved on the old Upscaling row is no longer moved to the Upscaler")
 
     # nothing reads the raw value any more, or the filter gets a mode it does not have
     raw = []
@@ -93,7 +102,7 @@ def main():
     if raw:
         raise SystemExit("these read opts.upscale raw instead of window_filter()/scene_upscaler():\n"
                          + "\n".join(raw))
-    print("PASS: the row offers five values, clamps without an SDK, and no consumer reads it raw")
+    print("PASS: the rows offer their values, an old file's upscaler moves over, and no consumer reads it raw")
 
 
 if __name__ == "__main__":

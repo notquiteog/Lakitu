@@ -1,4 +1,245 @@
 ---------------------------------------------------------------------------------------------------
+Version: 2.0.18
+Date: 10. 11. 2026
+  Bugfixes:
+    - Update: The default repository outside the Windows-only block.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.17
+Date: 10. 11. 2026
+  Bugfixes:
+    - Vk: FSR 3.1 and FSR 4 take the scene's real camera, depth and colour encoding (#1386's inputs).
+    - Vk: FSR 3.1 frame interpolation makes 2x sets only.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.16
+Date: 10. 11. 2026
+  Features:
+    - Raise the Motion sensitivity X limit to 600%.
+    - Linux: The OoT debug tools on Linux (cheats, teleport, flight, free view).
+    - Vk: FXAA in the gameplay TAAU stand-in (edges on cards without the network).
+  Bugfixes:
+    - Windows: Load the Vulkan loader and SDL from known folders only.
+    - Update: Check the latest release's tag on Windows too.
+    - Env: Hookshot_env.txt sets only the game's own switches.
+    - Fs: Keep guest paths in their mounts; do not work through links.
+    - Saves: Refuse links in a save being imported.
+    - Vk: Check the shaders seed, program cache, pipeline notes and state list as read.
+    - Builder: Check setup list names; load the setup's libraries from System32.
+    - Nvn: Keep host pointers in host-side tables; bounds-check guest ranges.
+    - Builder: Stop when the working exefs cannot be cleared.
+    - Vk: A timed-out batch of write-backs keeps its staging buffers; the sweep's budget test cannot wrap.
+    - Write out the queued log before a fatal replay exit.
+    - Input: Move the stick dead zone to option 11.
+    - Builder: Do not resolve the update staging directory itself.
+    - Linux: Reject symlinked update staging folders.
+    - Runtime: Report Windows display startup failures.
+    - Builder: Keep Linux update extraction from writing through symlinks.
+    - End the game when the GPU device is lost.
+    - Ignore half-float NaNs when locating flashes.
+    - Vk: Send the held batch before waiting for a recording.
+    - Sdl: Keep the mouse captured when the pointer leaves the window.
+    - Builder: Explain unavailable selected game input.
+  Optimizations:
+    - Vk: The retirement sweep's texture write-backs in batches, one submission and one wait each.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.15
+Date: 10. 11. 2026
+  Features:
+    - Vk: The open backend runs the khr route where upstream's NVIDIA routes cannot.
+    - Vk: The open backend's khr kernels, OpenDLSS-NR on VK_KHR_cooperative_matrix alone.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.14
+Date: 10. 11. 2026
+  Bugfixes:
+    - Vk: AMD's FSR runtime is asked at the start, guarded, never from the Insert menu.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.13
+Date: 09. 11. 2026
+  Features:
+    - Vk: Open neural rendering, the DLSS 5 NR network run by OpenDLSS-NR.
+---------------------------------------------------------------------------------------------------
+Version: 2.0.12
+Date: 09. 11. 2026
+  Features:
+    - Vk: Choose the frame generation method in the Insert menu.
+    - Vk: DLSS 5 neural rendering through NGX directly, beside Streamline.
+    - Vk: Say why DLSS 5 neural rendering is refused, and the RTX 20-40 route.
+    - Vk: AMD FSR 4 upscaling and frame generation through AMD's runtime.
+    - Monitor's shape for screens narrower than 16:9 (4:3, 16:10, 5:4).
+    - Audio: Audio output in the Insert menu: Auto, Stereo or 5.1.
+    - Add a Quit option to the gameplay menu.
+    - Vk: Time a capture's GPU wait for its late pages apart in the log.
+    - Vk: DLSS 5 neural rendering, with the model's own settings in the menu.
+    - The upscaler and frame generation follow the menu while you play.
+    - The two lock sites say why they had to take it.
+    - The parallel lock says which site took it, and the answer is two sites.
+    - The upscalers and frame generation are the native settings, not new rows.
+    - Vk: Frame generation Auto: a frame for each of the display's refreshes.
+    - FSR 3 frame interpolation, and a jitter for the upscalers to undo.
+    - The two backends have rows in the Insert menu.
+    - Frame generation asks for its own extensions and the whole input set.
+    - Link NGX properly, frame generation at the seam, AMD's interpolation sources.
+    - DLSS at the seam, and a stage switch for the FSR cost.
+    - A timed span per FSR pass, so the cost has a number per pass.
+    - Count FSR evaluations, because nine passes a call is cheap or ruinous.
+    - Compose the scene's view projection, and transpose it for the shader.
+    - The hunt found the projection, so widen it to find the view.
+    - DLSS Super Resolution through NGX, behind a build-time SDK gate.
+    - RX_VK_VP_HUNT, to find the view projection from a value only it holds.
+    - The vsync event follows the display, and 0 turns it off.
+    - HOS_VSYNC_HZ, the hardcoded 60 that actually paces the game.
+    - HOS_DISPLAY_VRR, which is what actually holds the frame rate at 60.
+    - HOS_FPS_FORCE, because raising the limiter alone does not hold.
+    - Give FSR the assembled depth and camera motion.
+    - Derive camera motion from the scene's depth, and keep that depth.
+    - Publish Ocarina's camera, and make a backend reachable without the stand-in.
+    - Record FSR 3.1's nine dispatches.
+    - Create FSR 3.1's pipelines and internal images.
+    - Census the render target sets, to settle whether a G-buffer exists.
+    - Compile AMD's FSR 3.1 upscaler passes from the FidelityFX SDK.
+    - Route the game's upscale dispatch through one backend seam.
+    - Name each network binding's role in the upscaler input contract.
+  Bugfixes:
+    - Release: The fork's releases follow upstream's v2.0.x line.
+    - Release: The setup, the Builder and the game update from the repository they were built in.
+    - Vk: DLSS frame generation sets NGX's parameters through its C functions.
+    - Vk: Frame generation Auto: the snap distance is not named near (windows.h defines it empty).
+    - Linux: The AppImage's parts list names the repository it is built in.
+    - Release: The Windows release installs the renderer CI built, with DLSS, NR and FSR 4.
+    - Lift: Edit_c in chunks.py, so its tests import without the lift's tools.
+    - Narrow screens: window at the picture's shape, save picture's middle band, comments.
+    - Vulkan: Bind only bytes accessed by buffer-image copies.
+    - Lift: Clear an earlier lift's hot pieces before the patches; count every made and raw output-size place.
+    - Lift: Group page marks after the patches; a missing output-size edit stops the lift.
+    - Build: The twelve MSVC runtime symbols NGX asks of an llvm-mingw link.
+    - Build: The feature announcement swallowed the whole Vulkan build.
+    - Vk: Tag the uplift colour pair as whole resources, as the shipping integration does.
+    - Build: NGX asks for Microsoft's C++ runtime, which llvm-mingw has not.
+    - Builder: Stop when generated source cleanup fails.
+    - Build: A Windows build linked the ARM64 NGX library, not the x64 one.
+    - A Windows build could ask for DLSS and then fail to link.
+    - Audio: A finished wave buffer reaches the game at the renderer update, not mid-pass.
+    - Audio: 5.1 surround when the default output has it (#1124).
+    - Widescreen: The save picture shows the middle 16:9 on ultrawide (#952).
+    - Preserve NUP member names during implicit reads.
+    - Vk: No mirror is made inside a parallel replay's segment (an earlier segment read it unfilled).
+    - Vk: A draw that waits for its pipeline runs the build at once if it is still queued.
+    - Vulkan: Clean up failed mesh argument initialization.
+    - Builder: The window icon is copied writable too.
+    - Vk: Keep the last sRGB UNORM surface format, so drivers that list only sRGB keep theirs.
+    - Vk: Linux/Wayland: take an sRGB surface format for the swapchain.
+    - Vulkan: Release modules from rejected cache records.
+    - Vulkan: Preserve guest mip levels in partial clears.
+    - Builder: Copies from a read-only install stay writable.
+    - Contain pipeline cache save allocation failures.
+    - The history reset the document specifies, which nothing implemented.
+    - The conventionalcommits preset has to match the changelog writer.
+    - The release's commit-analyzer preset is a package, and it was not declared.
+    - A fork releases its own work, not upstream's.
+    - The shader check compared glslang's version, and ran where glslang is not.
+    - The DLSS contract test links again.
+    - The renderer would not load, and the build now says so.
+    - Scan for the view projection once a target set, not once a draw.
+    - Clear the SPD counter between the pyramid passes (did not fix the cost).
+    - The view projection scan ran per draw, which stuttered hard.
+    - HOS_FPS_FORCE must not touch the nominal rate: it is slow motion on screen.
+    - The host camera symbols must be weak, or the renderer does not load at all.
+    - Snapshot the projection's fields, and name what caps the frame rate.
+    - Publish the camera from the inlined projection copies too.
+    - The game's network takes one texture, so it is not a temporal upscaler.
+    - Read the upscaler contract in descriptor order, not from draw_sampled.
+  Optimizations:
+    - Stream sampled profiles instead of loading every line.
+    - Lift: One page mark per straight-line group of stores through a base register.
+    - Fpx: Keep the hardware result for FMUL/FMLA S when the flags are already set.
+    - Lift: The interrupt poll before each backward goto, calling a64_poll_cur() with no argument, so a loop's guest registers stay in host registers.
+---------------------------------------------------------------------------------------------------
+Version: 2.9.0
+Date: 09. 11. 2026
+  Features:
+    - Vk: Choose the frame generation method in the Insert menu.
+---------------------------------------------------------------------------------------------------
+Version: 2.8.0
+Date: 09. 11. 2026
+  Features:
+    - Vk: DLSS 5 neural rendering through NGX directly, beside Streamline.
+  Bugfixes:
+    - Vk: DLSS frame generation sets NGX's parameters through its C functions.
+---------------------------------------------------------------------------------------------------
+Version: 2.7.0
+Date: 09. 11. 2026
+  Features:
+    - Vk: Say why DLSS 5 neural rendering is refused, and the RTX 20-40 route.
+    - Vk: AMD FSR 4 upscaling and frame generation through AMD's runtime.
+    - Microphone input on SDL2 too (the Linux AppImage's).
+    - Microphone input for the ocarina's input streams.
+  Bugfixes:
+    - Release: The Windows release installs the renderer CI built, with DLSS, NR and FSR 4.
+    - Lift: Edit_c in chunks.py, so its tests import without the lift's tools.
+    - Lift: Clear an earlier lift's hot pieces before the patches; count every made and raw output-size place.
+    - Lift: Group page marks after the patches; a missing output-size edit stops the lift.
+    - Builder: Stop when generated source cleanup fails.
+    - Microphone names past 60 bytes, unplugs that keep sending (#937, third review).
+    - Audio: A finished wave buffer reaches the game at the renderer update, not mid-pass.
+    - Audio: 5.1 surround when the default output has it (#1124).
+    - Widescreen: The save picture shows the middle 16:9 on ultrawide (#952).
+    - Preserve NUP member names during implicit reads.
+    - Vk: No mirror is made inside a parallel replay's segment (an earlier segment read it unfilled).
+    - Vk: A draw that waits for its pipeline runs the build at once if it is still queued.
+    - Vk: Keep the last sRGB UNORM surface format, so drivers that list only sRGB keep theirs.
+    - Vk: Linux/Wayland: take an sRGB surface format for the swapchain.
+    - Vulkan: Release modules from rejected cache records.
+    - Vulkan: Preserve guest mip levels in partial clears.
+    - The microphone retry path (#937, second review).
+    - Of two microphones with one name, the one chosen opens.
+    - Contain pipeline cache save allocation failures.
+    - The microphone review's points (#937).
+  Optimizations:
+    - Stream sampled profiles instead of loading every line.
+    - Lift: One page mark per straight-line group of stores through a base register.
+    - Fpx: Keep the hardware result for FMUL/FMLA S when the flags are already set.
+---------------------------------------------------------------------------------------------------
+Version: 2.6.4
+Date: 09. 11. 2026
+  Bugfixes:
+    - Build: The twelve MSVC runtime symbols NGX asks of an llvm-mingw link.
+---------------------------------------------------------------------------------------------------
+Version: 2.6.3
+Date: 09. 11. 2026
+  Bugfixes:
+    - Build: The feature announcement swallowed the whole Vulkan build.
+    - Vk: Tag the uplift colour pair as whole resources, as the shipping integration does.
+---------------------------------------------------------------------------------------------------
+Version: 2.6.2
+Date: 09. 11. 2026
+  Bugfixes:
+    - Build: NGX asks for Microsoft's C++ runtime, which llvm-mingw has not.
+---------------------------------------------------------------------------------------------------
+Version: 2.6.1
+Date: 09. 11. 2026
+  Bugfixes:
+    - Build: A Windows build linked the ARM64 NGX library, not the x64 one.
+---------------------------------------------------------------------------------------------------
+Version: 2.6.0
+Date: 09. 11. 2026
+  Features:
+    - Vk: DLSS 5 neural rendering, with the model's own settings in the menu.
+    - Add a 1920x1080 docked output mode.
+---------------------------------------------------------------------------------------------------
+Version: 2.5.0
+Date: 09. 11. 2026
+  Features:
+    - The upscaler and frame generation follow the menu while you play.
+---------------------------------------------------------------------------------------------------
+Version: 2.4.1
+Date: 09. 11. 2026
+  Bugfixes:
+    - A Windows build could ask for DLSS and then fail to link.
+---------------------------------------------------------------------------------------------------
+Version: 2.4.0
+Date: 09. 11. 2026
+  Features:
+    - The two lock sites say why they had to take it.
+---------------------------------------------------------------------------------------------------
 Version: 2.3.1
 Date: 09. 11. 2026
   Bugfixes:

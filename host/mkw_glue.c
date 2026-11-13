@@ -2,6 +2,9 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -15,21 +18,50 @@
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
    APIs given guest buffers (ReadFile into a game buffer) fail on reserved pages without raising an exception. A
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
+/* (hookshot) a commit refused at Windows' commit limit (1455: RAM and page file full) is tried again for up to 5 s: the renderer's
+   textures give commit back below a reserve (vk_texture.cpp's commit rule: every VRAM block is charged to the process's commit).
+   Before, the commit failed and the game's next write to those pages crashed it: a 16 GB PC at 33.9 GB of commit, an area loading
+   (a 960 KB commit, then a write into it from "ARes Loading 1"). 1: committed after waiting; 0: not */
+static int commit_wait(void *p, SIZE_T size) {
+    static volatile LONG waits, recovered;
+    for (int i = 0; i < 100; i++) {   /* (100 x 50 ms) */
+        Sleep(50);
+        if (VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE)) {
+            const LONG n = InterlockedIncrement(&recovered);
+            if (n <= 8 || (n & 255) == 0)
+                hos_log("mem: commit of %#llx bytes at the commit limit made after %d ms (%ld so far)", (unsigned long long)size,
+                        (i + 1) * 50, (long)n);
+            return 1;
+        }
+        if (GetLastError() != ERROR_COMMITMENT_LIMIT) return 0;
+    }
+    if (InterlockedIncrement(&waits) <= 8) hos_log("mem: commit of %#llx bytes still refused after 5 s at the commit limit", (unsigned long long)size);
+    return 0;
+}
+/* (a commit that failed: the line, and at the commit limit Windows' out-of-memory notice, said once, on its own thread) */
+static void commit_refused(uint64_t lo, uint64_t size, DWORD err) {
+    hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)size, (unsigned long long)lo, err);
+    if (err == ERROR_COMMITMENT_LIMIT) {   /* (1455: RAM and page file full; the game crashes soon after) */
+        static volatile LONG said;
+        if (InterlockedExchange(&said, 1) == 0) {
+            hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
+            extern DWORD WINAPI hos_out_of_memory_box(LPVOID);
+            CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
+        }
+    }
+}
+
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
+    if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
+        hos_log("mem: commit of %#llx bytes at %#llx: outside the guest window", (unsigned long long)size, (unsigned long long)addr);
+        return;
+    }
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
     if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
         const DWORD err = GetLastError();
-        hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
-                (unsigned long long)lo, err);
-        if (err == ERROR_COMMITMENT_LIMIT) {   /* (1455: RAM and page file full; the game crashes soon after. Said once, on its own thread) */
-            static volatile LONG said;
-            if (InterlockedExchange(&said, 1) == 0) {
-                hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
-                extern DWORD WINAPI hos_out_of_memory_box(LPVOID);
-                CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
-            }
-        }
+        if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) return;
+        commit_refused(lo, hi - lo, err);
     }
 }
 
@@ -56,8 +88,12 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     static volatile LONG touched;
     if (InterlockedIncrement(&touched) <= 16)
         hos_log("mem: %#llx committed on first touch (nothing handed it out)", (unsigned long long)guest);
-    return VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
-                                                                                      : EXCEPTION_CONTINUE_SEARCH;
+    if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+    /* (hookshot: at the commit limit the touch waits for the renderer to give commit back, as hos_commit does) */
+    const DWORD err = GetLastError();
+    if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(guest & ~0xFFFFULL), 0x10000)) return EXCEPTION_CONTINUE_EXECUTION;
+    commit_refused(guest & ~0xFFFFULL, 0x10000, err);
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
@@ -575,6 +611,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             }
             CloseHandle(snap);
             t0 = hos_now_ns();
+            fprintf(out, "# t0_ns %lld\n", (long long)t0);   /* (the clock of HOS_CHAIN's records: scripts/chain.py) */
             hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
         }
         Sleep(2);
@@ -653,10 +690,17 @@ void hos_gpu_queue_submit(int channel_fd, const uint64_t *entries, uint32_t n, i
 /* The loop-header interrupt polls (nx2/poll.py): the virtual cores (HOS_VCORES) ask a thread holding a core a
    waiter should have to give it up there, so guest code with no nn::os call or SVC in it (a long job) is preempted
    as Horizon would preempt it. */
-void a64_poll(Ctx *c) {
-    c->poll = 0;
+/* (nx2/rtgen.py) the loop-header poll: the lifted code has cleared c->poll and calls this with no argument, so that the
+   compiler keeps guest registers in host registers across the loop header (a call handed the context could change any
+   of it). The thread's context is the running one's (hos_ctx: a fiber's while it runs one), which is where the kick
+   (hos_thread.c) set the flag; nothing here reads it */
+void a64_poll_cur(void) {
     void hos_vcore_checkpoint(void);
     hos_vcore_checkpoint();
+}
+void a64_poll(Ctx *c) {   /* (the old form, A64_POLL_CTX builds) */
+    c->poll = 0;
+    a64_poll_cur();
 }
 
 /* CNTPCT_EL0 at the Switch 2's 31.25 MHz (rt/a64_rt.c's default counts the Switch 1's 19.2 MHz). The SDK checks
@@ -681,7 +725,7 @@ int hos_ab(void) { return 0; }                    /* (hos_prof.c: A/B measuremen
 /* (with the renderer's mem: lines) HOS_MEM_MAP=1: how much of the guest window is committed, and its resident part */
 void hos_memory_map_log(void) {
     static int on = -1;
-    if (on < 0) on = getenv("HOS_MEM_MAP") != NULL;
+    if (on < 0) on = env_on("HOS_MEM_MAP");
     if (!on) return;
     uint64_t committed = 0, regions = 0;
     for (uint64_t a = 0; a < HOS_GUEST_SPACE;) {

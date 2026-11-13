@@ -211,6 +211,201 @@ def stack_stores(text):
     return SP_STORE.sub(r"recomp_\1_sp(c,\2c->x[31]", text)
 
 
+# Page marks per group (A2). In a straight-line run of a function's C the marked stores through the same base register
+# plus a constant keep their data stores but share one A64_MARK(base + lo, hi - lo) for their byte span [lo, hi) (when it
+# is at most 4 KB), placed after the group's last store and before the first later line that writes the base register or
+# ends the run. The pages marked are the same: every store of the group lies in [base+lo, base+hi), at most two pages,
+# which the stores at lo and ending at hi mark themselves. Each data store is still followed, in program order and before
+# any guest synchronisation, by a release store of a mark of its page, so a collection that clears the mark sees the data
+# (rt/a64.h A64_MARK).
+# It runs on the finished C files, last (nx2/lift.py: after nx2/oot_patches.py and every other edit of the lifted text,
+# which match the lift's exact text), so it is not part of emit_function, and the kit's own write() leaves it out: a
+# lift without nx2 keeps a mark per store unless it calls group_marks itself. A64_MARK_EACH=1 at lift time: a mark per
+# store. Running it again changes nothing (its own marks are recognised, and are not run ends).
+# A run ends at anything not shown to be straight-line code without synchronisation: a label, goto, return, a line
+# whose braces do not balance (a multi-line block opens or closes: a mark never moves into or out of one), STLR / LDAR
+# in suyu's spelling (a plain recomp_storeN(c,c->x[N],...) / recomp_loadN(c,c->x[N])), the register file as a whole,
+# a local register (A64_LOCAL_REGS), and every call-like token but MG_PLAIN's: calls (f_*, TAILCALL, hos_* from the
+# patches), polls, atomics, barriers, exclusives, SVCs, traps and any helper this list does not know.
+MG_STORE = re.compile(r"recomp_(store8|store16|store32|store64|stp32|stp64)\(c,")
+MG_SIZE = {"store8": 1, "store16": 2, "store32": 4, "store64": 8, "stp32": 8, "stp64": 16}
+# address forms (the text right after "recomp_X(c,")
+MG_ADDR = [
+    (re.compile(r"c->x\[(\d+)\] \+ (-?\d+),"), "x"),          # c->x[N] + IMM,
+    (re.compile(r"\(c->x\[(\d+)\]\+(\d+)ULL\),"), "x"),        # (c->x[N]+IMMULL),
+    (re.compile(r"\(_b\+_o\)\+(\d+),"), "bo+"),                # (_b+_o)+IMM,
+    (re.compile(r"\(_b\+_o\),"), "bo"),                        # (_b+_o),
+    (re.compile(r"_b,"), "b"),                                 # _b,
+    (re.compile(r"_a\+(\d+),"), "a+"),                         # _a+IMM,
+    (re.compile(r"_a,"), "a"),                                 # _a,
+]
+MG_BDEF = re.compile(r"uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+);")
+MG_ADEF = re.compile(r"uint64_t _a=c->x\[(\d+)\];")
+# (call-like tokens that are plain: keywords, guest loads and stores without ordering (the stores are what is grouped),
+# and helpers that only compute or move values between locals, registers and vector registers)
+MG_PLAIN = re.compile(r"(?:if|for|while|sizeof|memcpy|memset|UINT64_C|INT64_C|fabsf|fabs|__builtin_add_overflow|"
+                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp)?|"
+                      r"recomp_(?:fixed_to_fp|fp_to_fixed|fp_to_int|fp_estimate|umulh|smulh|aes_sbox)|"
+                      r"a64_(?:vset64|vset128|vset_lo|vst16|fcmp32|fcmp64|vfcmp)|a64_v?fpx_\w+)\Z")
+MG_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_mg_plain = {}
+# (the other run ends: a label, goto, return, STLR and LDAR, the register file as a whole)
+MG_END = re.compile(r"^\s*L_[0-9a-f]+:|\bgoto\b|\breturn\b|recomp_(?:store|stp)\d+\(c,c->x\[\d+\],|"
+                    r"recomp_load\d+\(c,c->x\[\d+\]\)|c->x(?!\[)")
+MG_LOCAL = re.compile(r"\bx\d+_ = c->x\[")   # (localize_regs's locals: such a function is left as it is)
+MG_BRACE = re.compile(r"[{}]")
+# a line whose stores may not all run, or run more than once: its stores keep their own marks
+MG_NOT_STRAIGHT = re.compile(r"\bif\b|\?|\bfor\b|\bwhile\b|\bswitch\b|\bcase\b")
+MG_NOT_STRAIGHT_WORDS = ("if", "?", "for", "while", "switch", "case")
+MG_MARK = "    A64_MARK((c->x[%d] + (uint64_t)(int64_t)(%d)), %d);"
+MG_OWN_MARK = re.compile(r"    A64_MARK\(\(c->x\[\d+\] \+ \(uint64_t\)\(int64_t\)\(-?\d+\)\), \d+\);\Z")
+MG_HEAD = re.compile(r"\nvoid f_[0-9a-f]+\(")   # (a definition or declaration: its line begins after the newline)
+
+
+def mg_balanced(line):
+    """the line's braces close what it opens, in order (a block on one line, or none)"""
+    if "{" not in line and "}" not in line:
+        return True
+    d = 0
+    for b in MG_BRACE.findall(line):
+        d += 1 if b == "{" else -1
+        if d < 0:
+            return False
+    return d == 0
+
+
+def mg_ends_run(line):
+    """the line ends a straight-line run (each test only on a line that has its text: this runs on most lines of the lift)"""
+    if ("{" in line or "}" in line) and not mg_balanced(line):
+        return True
+    if "(" in line:
+        for t in MG_CALL.findall(line):
+            p = _mg_plain.get(t)
+            if p is None:
+                p = _mg_plain[t] = MG_PLAIN.match(t) is not None
+            if not p:
+                return True
+    if "goto" in line or "return" in line or "L_" in line or "(c,c->x[" in line or line.count("c->x") != line.count("c->x["):
+        return MG_END.search(line) is not None
+    return False
+
+
+def mg_parse_store(line, m):
+    """(base register, offset, size) of the marked store at match m, or None"""
+    rest = line[m.end():]
+    size = MG_SIZE[m.group(1)]
+    for rx, kind in MG_ADDR:
+        a = rx.match(rest)
+        if not a:
+            continue
+        if kind == "x":
+            return int(a.group(1)), int(a.group(2)), size
+        d = None   # (the nearest definition before the store)
+        for d in (MG_BDEF if kind in ("bo", "bo+", "b") else MG_ADEF).finditer(line, 0, m.start()):
+            pass
+        if d is None:
+            return None
+        if kind in ("bo", "bo+", "b"):
+            off = 0 if kind == "b" else int(d.group(2)) + (int(a.group(1)) if kind == "bo+" else 0)
+            return int(d.group(1)), off, size
+        return int(d.group(1)), (int(a.group(1)) if kind == "a+" else 0), size
+    return None
+
+
+def mark_groups_lines(lines, st):
+    """the lines of a function (or of any C text) with the page marks of each group shared"""
+    inserts = {}    # line index -> mark lines to put before it
+    unmark = {}     # line index -> set of match start offsets to turn into _sp
+    groups = {}     # base register -> [(line index, match start, off, size)]
+
+    def flush(reg, at):
+        g = groups.pop(reg, None)
+        if not g:
+            return
+        lo = min(o for _, _, o, _ in g)
+        hi = max(o + n for _, _, o, n in g)
+        st["stores"] += len(g)
+        if len(g) < 2 or hi - lo > 4096:
+            return
+        for li, ms, _, _ in g:
+            unmark.setdefault(li, set()).add(ms)
+        inserts.setdefault(at, []).append(MG_MARK % (reg, lo, hi - lo))
+        st["groups"] += 1
+        st["grouped_stores"] += len(g)
+
+    for i, line in enumerate(lines):
+        if not groups and "recomp_st" not in line:
+            continue   # (nothing to end or to add to)
+        if line.startswith("    A64_MARK((") and MG_OWN_MARK.match(line):
+            continue
+        if mg_ends_run(line):
+            for r in list(groups):
+                flush(r, i)
+            continue
+        writes = {int(a or b) for a, b in REG_WRITE.findall(line)} if (
+            "=" in line or "&c->x" in line or "++" in line or "--" in line) else ()
+        stores = list(MG_STORE.finditer(line)) if "recomp_st" in line else ()
+        if stores and not writes and not (any(w in line for w in MG_NOT_STRAIGHT_WORDS) and MG_NOT_STRAIGHT.search(line)):
+            for m in stores:
+                p = mg_parse_store(line, m)
+                if p is None or p[0] == 31:
+                    continue   # (an address this pass does not follow, or SP: the store keeps what it has)
+                groups.setdefault(p[0], []).append((i, m.start(), p[1], p[2]))
+            continue
+        for r in writes:   # (the base changes here: its group's mark goes before this line)
+            if r in groups:
+                flush(r, i)
+    for r in list(groups):
+        flush(r, len(lines))
+    if not unmark:
+        return lines
+    out = []
+    for i, line in enumerate(lines):
+        out.extend(inserts.get(i, []))
+        if i in unmark:
+            for ms in sorted(unmark[i], reverse=True):
+                m = MG_STORE.match(line, ms)
+                line = line[:m.start()] + "recomp_%s_sp(c," % m.group(1) + line[m.end():]
+        out.append(line)
+    out.extend(inserts.get(len(lines), []))
+    return out
+
+
+def mark_groups(text, stats=None):
+    """text (a C file of lifted functions, or one function) with the page marks of each group shared. stats: counts of
+    the stores looked at, the groups and their stores"""
+    st = stats if stats is not None else Counter()
+    for k in ("stores", "groups", "grouped_stores"):
+        st[k] = st.get(k, 0)
+    starts = [0] + [m.start() + 1 for m in MG_HEAD.finditer(text)]
+    starts.append(len(text))
+    out = []
+    for a, b in zip(starts, starts[1:]):
+        part = text[a:b]
+        if part.count("recomp_st") < 2 or len(MG_STORE.findall(part)) < 2 or (
+                "_ = c->x[" in part and MG_LOCAL.search(part)):   # (no group possible: most functions)
+            out.append(part)
+            continue
+        out.append("\n".join(mark_groups_lines(part.split("\n"), st)))
+    return "".join(out)
+
+
+def group_marks(paths, stats=None):
+    """mark_groups over C files, in place (nx2/lift.py: the lift's last step). A64_MARK_EACH=1: none. The files changed"""
+    if os.environ.get("A64_MARK_EACH"):
+        return 0
+    changed = 0
+    for path in paths:
+        with open(path, encoding="utf-8", newline="") as f:
+            text = f.read()
+        new = mark_groups(text, stats)
+        if new != text:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            changed += 1
+    return changed
+
+
 # Dead flags. Each flag-setting instruction stores all of N, Z, C and V in the context, where the compiler must keep
 # them: a callee or the caller could read them. The guest's ABI says otherwise (calls clobber NZCV, and nothing reads
 # flags across a return), so emit_function computes per function which flags are live after each instruction and
@@ -259,7 +454,8 @@ SYNC_CALL, SYNC_BACK, SYNC_RET, SYNC_ALL, SYNC_RELOAD = "\x01C%d\x01", "\x01B%d\
 SYNC_TAIL = "\x01T%d\x01"   # (control leaving after the instruction: what it wrote too)
 SYNC_MARK = re.compile("\x01([CBRALT])(\\d+)\x01")
 REG_REF = re.compile(r"c->x\[(\d+)\]")
-REG_WRITE = re.compile(r"(?:&c->x\[(\d+)\])|(?:c->x\[(\d+)\]\s*(?:[-+*/%&|^]|<<|>>)?=(?!=))")
+# (a write of a guest register: its address taken (LDP's outputs), ++ / --, = and the compound assignments)
+REG_WRITE = re.compile(r"(?:(?:&|\+\+\s*|--\s*)c->x\[(\d+)\])|(?:c->x\[(\d+)\]\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--))")
 SCRATCH = 0xFE00   # x9-x15: dead at calls and returns
 _reg_writes = {}
 
@@ -486,6 +682,231 @@ def vectorize_fpx(text):
                         % (m.group(3), m.group(1), m.group(2)), text)
 
 
+# (hookshot) Fast float regions (A64_FASTFP at lift time: on unless "0"; "hot" the A64_HOT_FUNCS list only; "check"
+# both copies every time, compared: see ff_region).
+# Each float op on the exact path carries its own tests (~25 instructions around one SSE op). A straight run of
+# instructions with no label, store, call, branch or system access inside, holding at least A64_FASTFP_MIN (8) single-
+# precision adds, subtracts, multiplies, divides or square roots, is emitted twice: a fast copy whose ops are plain SSE,
+# with MXCSR's flags cleared before it and read once after, and the exact copy. A clean fast run is the Arm result: with
+# no invalid operation (no NaN made), no denormal operand and no underflow (FTZ on under FPCR.FZ: a tiny result is
+# flushed and flagged), IEEE single precision round-to-nearest is the same on both, except for a NaN result or a
+# product, quotient or multiply-add of exactly 2^-126, which raise the invalid flag on purpose (a64_ff_guard_; the ops
+# are asm with Arm's operand order all the same). Divide-by-zero and overflow give the same infinities; they and inexact
+# are or-ed into FPSR. On an invalid, denormal or underflow flag the registers the run names are put back and the exact
+# copy runs. Measured
+# 2026-11-11 on OoT's f_820e1d60 in game (both run per call, compared): 0 mismatches in 150,000 calls, 1.79x faster.
+# HOS_NO_FASTFP (run time, any value): the exact copies only, for comparisons.
+FF_CALL = re.compile(r"\b((?:recomp|a64|A64|RECOMP)_\w+)\s*\(")
+FF_PURE = {"recomp_load8", "recomp_load16", "recomp_load32", "recomp_load64", "recomp_ldp32", "recomp_ldp64",
+           "a64_vset64", "a64_vset128", "a64_vset_lo", "a64_vst16", "a64_fcmp32", "a64_fcmp64", "a64_vfcmp",
+           "recomp_fixed_to_fp", "recomp_fp_to_int", "recomp_fp_to_fixed", "recomp_umulh", "recomp_smulh",
+           "recomp_fp_estimate", "recomp_aes_sbox", "RECOMP_LIKELY", "RECOMP_UNLIKELY", "RECOMP_FPX_OPEN",
+           "RECOMP_FPX_FZ", "a64_fcmp32k", "a64_fcmp64k"}
+FF_BAD = ("c->fpcr", "c->fpsr", "c->excl", "c->pc", "c->halted", "c->poll", "c->tpidr", "\x01", "goto ", "return",
+          "switch", "A64_PTR", "A64_MARK")
+# (the exact blocks' own uses, safe in a region: FPCR read in a test (it doesn't change inside one: no MSR there), and
+# FPSR's cumulative bits or-ed in (put back with the registers when the region runs again exactly). An MSR, or an MRS of
+# FPSR, which would see a value the fast copy has not finished, still ends the run.)
+FF_FP_OK = re.compile(r"c->fpcr\s*&|c->fpsr\s*\|=")
+# ((hookshot) fma32_fma32: FMADD/FMSUB/FNMADD/FNMSUB and FMLA/FMLS S lanes, an FMA3 op where the build has one; see
+# a64_ff_fma32_fma32 in FASTFP_HEADER)
+FF_CONV = re.compile(r"\ba64_vfpx_(add32|sub32|mul32)\(|"
+                     r"\ba64_fpx_(add32_add32|sub32_sub32|mul32_fma32|fma32_fma32|div32_div32|sqrt32_sqrt32)\(")
+VREG_REF = re.compile(r"c->vreg\[(\d+)\]")
+
+
+def fastfp_mode():
+    """the mode: empty when A64_FASTFP is 0 (off), else its value, "1" by default (every function), hot or check"""
+    v = os.environ.get("A64_FASTFP", "1")
+    return "" if v == "0" else v
+
+
+def ff_min():
+    v = os.environ.get("A64_FASTFP_MIN", "")
+    return int(v) if v.isdigit() else 8
+
+
+def ff_eligible(text):
+    """an instruction's C text may sit inside a fast float region: no store, control flow or system state; only pure calls"""
+    if any(b in FF_FP_OK.sub("", text) for b in FF_BAD):
+        return False
+    return all(n in FF_PURE or n.startswith(("a64_fpx_", "a64_vfpx_")) for n in FF_CALL.findall(text))
+
+
+def ff_region(items):
+    """a run's C text ([(pc, text)], every text ff_eligible): the fast and exact copies, or the exact text alone when the
+    run has too few float ops to pay for its check. (text, number of ops made fast)"""
+    exact = "\n".join(t for _, t in items)
+    n = len(FF_CONV.findall(exact))
+    if n < ff_min():
+        return exact, 0
+    fast = FF_CONV.sub(lambda m: "a64_ff_v%s(" % m.group(1) if m.group(1) else "a64_ff_%s(" % m.group(2), exact)
+    xs = sorted({int(r) for r in REG_REF.findall(exact)})
+    vs = sorted({int(r) for r in VREG_REF.findall(exact)})
+    fl = sorted(set(FLAG_REF.findall(exact)))
+    save = ("".join("const uint64_t _ffx%d = c->x[%d]; " % (r, r) for r in xs) +
+            "".join("const uint64_t _ffv%d0 = c->vreg[%d][0], _ffv%d1 = c->vreg[%d][1]; " % (r, r, r, r) for r in vs) +
+            "".join("const uint8_t _fff%s = c->%s; " % (f, f) for f in fl) + "const uint64_t _ffsr = c->fpsr; ")
+    restore = ("".join("c->x[%d] = _ffx%d; " % (r, r) for r in xs) +
+               "".join("c->vreg[%d][0] = _ffv%d0; c->vreg[%d][1] = _ffv%d1; " % (r, r, r, r) for r in vs) +
+               "".join("c->%s = _fff%s; " % (f, f) for f in fl) + "c->fpsr = _ffsr; ")
+    label = "L_ff_%08x" % items[0][0]
+    if fastfp_mode() == "check":
+        # (A64_FASTFP=check: both copies every time, the exact one's result kept, the registers the run names compared;
+        # a64_ff_check counts and prints the first mismatches with the run's guest address)
+        keep = ("".join("const uint64_t _ffox%d = c->x[%d]; " % (r, r) for r in xs) +
+                "".join("const uint64_t _ffov%d0 = c->vreg[%d][0], _ffov%d1 = c->vreg[%d][1]; " % (r, r, r, r) for r in vs) +
+                "".join("const uint8_t _ffof%s = c->%s; " % (f, f) for f in fl))
+        same = " && ".join(["1"] + ["_ffox%d == c->x[%d]" % (r, r) for r in xs] +
+                           ["_ffov%d0 == c->vreg[%d][0] && _ffov%d1 == c->vreg[%d][1]" % (r, r, r, r) for r in vs] +
+                           ["_ffof%s == c->%s" % (f, f) for f in fl])
+        return ("{ if (A64_FF_ON(c)) { %sconst unsigned _ffm = a64_ff_begin(c);\n%s\n"
+                "const int _ffok = a64_ff_end(c, _ffm);\n%s%s\n%s\na64_ff_check(0x%xu, _ffok, %s); } else {\n%s\n} }"
+                % (save, fast, keep, restore, exact, items[0][0], same, exact)), n
+    return ("{ if (A64_FF_ON(c)) { %sconst unsigned _ffm = a64_ff_begin(c);\n%s\n"
+            "if (RECOMP_LIKELY(a64_ff_end(c, _ffm))) goto %s;\n%s}\n%s\n%s:; }"
+            % (save, fast, label, restore, exact, label)), n
+
+
+FASTFP_HEADER = r"""
+/* ---- (hookshot) fast float regions (A64_FASTFP, ff_region in a64_lift.py) ---- */
+#if RECOMP_FPX_HOST == 2 && defined(__x86_64__) && !defined(__EMSCRIPTEN__)
+#include <stdlib.h>
+#include <stdio.h>
+static int a64_ff_enabled_(void) { static int v = -1; if (v < 0) v = !getenv("HOS_NO_FASTFP"); return v; }
+#define A64_FF_ON(c) (RECOMP_FPX_OPEN(c) && a64_ff_enabled_())
+/* MXCSR: exceptions masked, round to nearest, DAZ off, FTZ as FPCR.FZ, flags cleared; the old value returned */
+static inline __attribute__((always_inline)) unsigned a64_ff_begin(const Ctx *c) {
+    unsigned m, n;
+    __asm__ volatile("stmxcsr %0" : "=m"(m));
+    n = (m & ~0xE07Fu) | 0x1F80u | (RECOMP_FPX_FZ(c) ? 0x8000u : 0u);
+    __asm__ volatile("ldmxcsr %0" : : "m"(n));
+    return m;
+}
+/* 0: an invalid, denormal or underflow flag (the exact copy runs); else inexact, overflow, divide-by-zero to FPSR */
+static inline __attribute__((always_inline)) int a64_ff_end(Ctx *c, unsigned m) {
+    unsigned f;
+    __asm__ volatile("stmxcsr %0" : "=m"(f));
+    __asm__ volatile("ldmxcsr %0" : : "m"(m));
+    if (f & 0x13u) return 0;
+    c->fpsr |= (f & 0x20u ? 0x10u : 0u) | (f & 0x08u ? 0x04u : 0u) | (f & 0x04u ? 0x02u : 0u);
+    return 1;
+}
+/* (asm volatile: kept inside the MXCSR window and in Arm's operand order, see ff_region) */
+#ifdef __AVX__
+#define A64_FF_OP(ins, d, a, b) __asm__ volatile("v" ins " %2, %1, %0" : "=x"(d) : "x"(a), "x"(b))
+#define A64_FF_SQRT(d, a) __asm__ volatile("vsqrtss %1, %1, %0" : "=x"(d) : "x"(a))
+#define A64_FF_SPOIL "vcomiss %0, %0"
+#else
+#define A64_FF_OP(ins, d, a, b) do { (d) = (a); __asm__ volatile(ins " %1, %0" : "+x"(d) : "x"(b)); } while (0)
+#define A64_FF_SQRT(d, a) __asm__ volatile("sqrtss %1, %0" : "=x"(d) : "x"(a))
+#define A64_FF_SPOIL "comiss %0, %0"
+#endif
+/* The invalid flag raised on purpose (a signalling compare of a NaN), sending the run to its exact copy, for two results
+   whose value x86 gets right but not Arm's flags, or under FZ not Arm's value (found by tests/test_fastfp_fma.py):
+   - a NaN: x86 raises no denormal flag for a subnormal next to a NaN operand, where Arm under FZ flushes it and sets
+     IDC; and a multiply-add's 0 * inf + a quiet NaN gives that NaN with no flag (Arm: the default NaN, IOC);
+   - exactly 2^-126, the smallest normal, from a multiply, divide or multiply-add: x86 detects tininess after rounding,
+     Arm before, so a result rounded up to 2^-126 sets UFC on Arm, and is a zero under FZ. (A sum this small is exact.)
+   The tests are integer compares on the bits: a float compare would raise the denormal flag on a subnormal result. */
+static inline __attribute__((always_inline)) void a64_ff_spoil_(void) {
+    __asm__ volatile(A64_FF_SPOIL : : "x"(_mm_castsi128_ps(_mm_cvtsi32_si128(0x7fc00000))) : "cc");
+}
+static inline __attribute__((always_inline)) void a64_ff_guard_(uint64_t v, int tiny) {
+    const uint32_t m = (uint32_t)v & 0x7fffffffu;
+    if (__builtin_expect(m > 0x7f800000u || (tiny && m == 0x00800000u), 0)) a64_ff_spoil_();
+}
+static inline __attribute__((always_inline)) void a64_ff_vguard_(__m128 r, int k, int tiny) {   /* (the k lanes kept) */
+    const __m128i m = _mm_and_si128(_mm_castps_si128(r), _mm_set1_epi32(0x7fffffff));
+    __m128i bad = _mm_cmpgt_epi32(m, _mm_set1_epi32(0x7f800000));
+    if (tiny) bad = _mm_or_si128(bad, _mm_cmpeq_epi32(m, _mm_set1_epi32(0x00800000)));
+    if (__builtin_expect(_mm_movemask_ps(_mm_castsi128_ps(bad)) & (k == 4 ? 15 : 3), 0)) a64_ff_spoil_();
+}
+/* (2 lanes: the upper two are loaded as zeros, so they raise no flag of their own) */
+static inline __attribute__((always_inline)) __m128 a64_ff_vld(const uint64_t *s, int k) {
+    return k == 4 ? _mm_loadu_ps((const float *)s) : _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)s));
+}
+static inline __attribute__((always_inline)) void a64_ff_vst(uint64_t *d, __m128 r, int k) {
+    if (k == 4) _mm_storeu_ps((float *)d, r); else _mm_storeu_si128((__m128i *)d, _mm_move_epi64(_mm_castps_si128(r)));
+}
+#define A64_FF_V(name, ins, tiny) \
+static inline __attribute__((always_inline)) void a64_ff_v##name(Ctx *c, uint64_t *d, const uint64_t *n, const uint64_t *m, int k) { \
+    __m128 r; (void)c; A64_FF_OP(ins, r, a64_ff_vld(n, k), a64_ff_vld(m, k)); \
+    a64_ff_vguard_(r, k, tiny); a64_ff_vst(d, r, k); }
+A64_FF_V(add32, "addps", 0)
+A64_FF_V(sub32, "subps", 0)
+A64_FF_V(mul32, "mulps", 1)
+static inline __attribute__((always_inline)) __m128 a64_ff_ss(uint64_t a) { return _mm_castsi128_ps(_mm_cvtsi32_si128((int)(uint32_t)a)); }
+static inline __attribute__((always_inline)) uint64_t a64_ff_bits(__m128 r) { return (uint32_t)_mm_cvtsi128_si32(_mm_castps_si128(r)); }
+#define A64_FF_S(name, ins, tiny) \
+static inline __attribute__((always_inline)) uint64_t a64_ff_##name(Ctx *c, uint64_t a, uint64_t b) { \
+    __m128 r; (void)c; A64_FF_OP(ins, r, a64_ff_ss(a), a64_ff_ss(b)); a64_ff_guard_(a64_ff_bits(r), tiny); return a64_ff_bits(r); }
+A64_FF_S(add32_add32, "addss", 0)
+A64_FF_S(sub32_sub32, "subss", 0)
+/* (A subnormal over a zero also takes the exact copy: x86 raises no denormal flag beside divide-by-zero and gives an
+   infinity, where Arm under FZ flushes the subnormal first, 0 / 0: the default NaN and IOC.) */
+static inline __attribute__((always_inline)) uint64_t a64_ff_div32_div32(Ctx *c, uint64_t a, uint64_t b) {
+    __m128 r;
+    (void)c;
+    if (__builtin_expect(((uint32_t)b << 1) == 0 && ((uint32_t)a << 1) - 1u < 0x00ffffffu, 0)) a64_ff_spoil_();
+    A64_FF_OP("divss", r, a64_ff_ss(a), a64_ff_ss(b));
+    a64_ff_guard_(a64_ff_bits(r), 1);
+    return a64_ff_bits(r);
+}
+A64_FF_S(mul32_, "mulss", 1)
+static inline __attribute__((always_inline)) uint64_t a64_ff_mul32_fma32(Ctx *c, uint64_t a, uint64_t b, uint64_t z) { (void)z; return a64_ff_mul32_(c, a, b); }
+static inline __attribute__((always_inline)) uint64_t a64_ff_sqrt32_sqrt32(Ctx *c, uint64_t a) { __m128 r; (void)c; A64_FF_SQRT(r, a64_ff_ss(a)); return a64_ff_bits(r); }
+/* (hookshot) FMADD/FMSUB/FNMADD/FNMSUB and FMLA/FMLS S lanes: a64_fpx_fma32_fma32(c, a, b, z) is a*b + z, the lifted
+   code having already flipped the signs the op negates. FMA3's vfmadd231ss rounds once, as Arm does, and takes its
+   NaN in Arm's order (the addend, then a, then b). Two cases differ, and both raise the invalid flag here (a64_ff_guard_),
+   which sends the run to its exact copy:
+   - 0 * inf + a quiet NaN: x86 returns that NaN with no flag, Arm the default NaN with IOC (so: any NaN result);
+   - a result rounded up to the smallest normal, 2^-126: x86 detects tininess after rounding and raises no underflow,
+     Arm detects it before, sets UFC, and under FZ returns a zero.
+   Without FMA3 (x86-64-v2), the exact helper. */
+#ifdef __FMA__
+static inline __attribute__((always_inline)) uint64_t a64_ff_fma32_fma32(Ctx *c, uint64_t a, uint64_t b, uint64_t z) {
+    __m128 r = a64_ff_ss(z);
+    (void)c;
+    __asm__ volatile("vfmadd231ss %2, %1, %0" : "+x"(r) : "x"(a64_ff_ss(a)), "x"(a64_ff_ss(b)));
+    a64_ff_guard_(a64_ff_bits(r), 1);
+    return a64_ff_bits(r);
+}
+#else
+#define a64_ff_fma32_fma32 a64_fpx_fma32_fma32
+#endif
+/* (A64_FASTFP=check) a run's result: counts per file, and the first mismatches of a clean fast run (which must not
+   happen) with the run's guest address, on stderr (the game's log) */
+static volatile long long a64_ff_n_[3];   /* runs, clean, mismatched when clean */
+static __attribute__((noinline, cold)) void a64_ff_check_print_(unsigned pc, long long bad) {
+    if (bad < 16) fprintf(stderr, "fastfp check: MISMATCH in the run at %#x (%s)\n", pc, __BASE_FILE__);
+}
+static inline void a64_ff_check(unsigned pc, int clean, int same) {
+    const long long n = __atomic_add_fetch(&a64_ff_n_[0], 1, __ATOMIC_RELAXED);
+    if (clean) __atomic_add_fetch(&a64_ff_n_[1], 1, __ATOMIC_RELAXED);
+    if (clean && !same) a64_ff_check_print_(pc, __atomic_fetch_add(&a64_ff_n_[2], 1, __ATOMIC_RELAXED));
+    if (!(n & ((1LL << 22) - 1)))
+        fprintf(stderr, "fastfp check: %s: %lld runs, %lld clean, %lld mismatched when clean\n", __BASE_FILE__, n, a64_ff_n_[1], a64_ff_n_[2]);
+}
+#else
+/* (no x86 MXCSR here: the fast copies are never run, and name the exact helpers) */
+#define A64_FF_ON(c) 0
+#define a64_ff_begin(c) 0u
+#define a64_ff_end(c, m) 1
+#define a64_ff_vadd32 a64_vfpx_add32
+#define a64_ff_vsub32 a64_vfpx_sub32
+#define a64_ff_vmul32 a64_vfpx_mul32
+#define a64_ff_add32_add32 a64_fpx_add32_add32
+#define a64_ff_sub32_sub32 a64_fpx_sub32_sub32
+#define a64_ff_mul32_fma32 a64_fpx_mul32_fma32
+#define a64_ff_fma32_fma32 a64_fpx_fma32_fma32
+#define a64_ff_div32_div32 a64_fpx_div32_div32
+#define a64_ff_sqrt32_sqrt32 a64_fpx_sqrt32_sqrt32
+#define a64_ff_check(pc, clean, same) ((void)0)
+#endif
+"""
+
+
 # A64_LOCAL_FLAGS: the fast scalar FCMP as a code (0: the exact block; else 4 | lt | eq << 1), appended to a64_fpx.h
 FCMPK_HEADER = r"""
 static inline __attribute__((always_inline)) uint32_t a64_fcmp32k(Ctx *c, const void *pa, const void *pb) {
@@ -602,34 +1023,85 @@ static inline __attribute__((always_inline)) void a64_vfpx_mul32(Ctx *c, uint64_
 
 
 # Results past the fast path's range once their flags are already raised (TOTK's threads: FPSR = 0x9f, every cumulative
-# flag set; FPCR.FZ = 1). Overflow (OFC raised): an infinite result of finite operands is the native one, the
-# round-to-nearest ±inf (~1M multiplies a second at the castle went through the exact body for it). Flush-to-zero (UFC
-# raised): a result below the normal range is the native one flushed to a zero of its sign. Sums are exact there (a
-# tiny sum of normal numbers is a subnormal exactly), products flush when the exact product is tiny, which the native
-# result shows unless it rounded up to the smallest normal (then the exact body decides). No subnormal operand (those
-# flush first).
+# flag set; FPCR.FZ = 1). FADD/FSUB S (a64_fpx_fz_add32 / a64_fpx_fz_sub32, OFC or UFC raised): an infinite result of
+# finite operands is the native one, the round-to-nearest ±inf (~1M multiplies a second at the castle went through the
+# exact body for it); under FZ with UFC raised a result below the normal range is the native one flushed to a zero of its
+# sign. Sums are exact there (a tiny sum of normal numbers is a subnormal exactly). No subnormal operand (those flush
+# first). FMUL/FNMUL/FMLA-family S: a64_fpx_sticky32 below.
 FPX_FZ_HEADER = r"""
-#define A64_FPX_FZ_OPEN(c) (RECOMP_FPX_OPEN(c) && ((c)->fpsr & 0xCu))
-static inline __attribute__((always_inline)) int a64_fpx_fz_result(const Ctx *c, uint64_t a, uint64_t b, uint64_t t, int mul, uint64_t *v) {
+static inline __attribute__((always_inline)) int a64_fpx_fz_result(const Ctx *c, uint64_t a, uint64_t b, uint64_t t, uint64_t *v) {
     const uint32_t m = (uint32_t)t & 0x7fffffffu;
     if (m == 0x7f800000u) return (c->fpsr & 4u) && RECOMP_FPX_FIN32(a) && RECOMP_FPX_FIN32(b) ? (*v = t, 1) : 0;
     if (!RECOMP_FPX_FZ(c) || !(c->fpsr & 8u) || m > 0x7f800000u || RECOMP_FPX_SUBN32(a) || RECOMP_FPX_SUBN32(b)) return 0;
-    if (m >= 0x00800000u) return (mul && m == 0x00800000u) ? 0 : (*v = t, 1);
+    if (m >= 0x00800000u) return (*v = t, 1);
     *v = t & 0x80000000u;
     return 1;
 }
 #if RECOMP_FPX_HOST
 static inline __attribute__((always_inline)) int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b)), 0, v); }
+    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b)), v); }
 static inline __attribute__((always_inline)) int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b)), 0, v); }
-static inline __attribute__((always_inline)) int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) * recomp_fpx_f(b)), 1, v); }
+    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b)), v); }
 #else
 static inline int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
 static inline int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
-static inline int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
 #endif
+/* FMUL/FNMUL/FMLA-family S past the fast path (the "sticky" rescue of the outlined wrappers a64_fpx_mul32_fma32 and
+   a64_fpx_fma32_fma32, inside their RECOMP_FPX_OPEN gate): one hardware multiply or fused multiply-add, kept when every
+   FPSR bit the Arm op could raise is already set and the value is the Arm one.
+   FZ: a subnormal operand is flushed to a zero of its sign (IDC). NaN: never. Infinite: exact with an infinite operand,
+   else an overflow (OFC). A zero product or an exact cancellation (a*b == -z in binary64, where the product is exact):
+   exact. Otherwise a result at most the smallest normal may be tiny (UFC): FZ clear, the IEEE gradual-underflow result is
+   Arm's; FZ set, below the smallest normal the exact value is tiny and Arm returns a zero of its sign, and exactly the
+   smallest normal is ambiguous (falls back). Rejected before computing: a NaN operand, a subnormal operand under FZ with
+   IDC clear, and FMUL of finite operands with neither OFC nor UFC set and nothing flushed (past the fast path, which keeps
+   a large product and a finite product of a zero, such a product is tiny or infinite). Without a hardware FMA
+   (RECOMP_FPX_FMA64; binary32 fmaf is the same instruction class) only the multiply is rescued. Returning 0 is always
+   sound: the wrapper then takes the exact body. */
+#ifndef A64_FPX_STICKY_PROBE
+#define A64_FPX_STICKY_PROBE() ((void)0) /* (tests/test_fpx_sticky.py counts the rescues the wrappers keep here) */
+#endif
+static inline __attribute__((always_inline)) int a64_fpx_sticky32(const Ctx *c, uint64_t a, uint64_t b, uint64_t z, int mul, uint64_t *v) {
+#if RECOMP_FPX_HOST
+    const uint64_t s = c->fpsr;
+    uint32_t x = (uint32_t)a, y = (uint32_t)b, w = (uint32_t)z, t;
+#if !RECOMP_FPX_FMA64
+    if (!mul) return 0;
+#endif
+    if ((x & 0x7fffffffu) > 0x7f800000u || (y & 0x7fffffffu) > 0x7f800000u || (w & 0x7fffffffu) > 0x7f800000u) return 0;
+    if (RECOMP_FPX_FZ(c) && (RECOMP_FPX_SUBN32(x) || RECOMP_FPX_SUBN32(y) || (!mul && RECOMP_FPX_SUBN32(w)))) {
+        if (!(s & 0x80u)) return 0;
+        if (RECOMP_FPX_SUBN32(x)) x &= 0x80000000u;
+        if (RECOMP_FPX_SUBN32(y)) y &= 0x80000000u;
+        if (RECOMP_FPX_SUBN32(w)) w &= 0x80000000u;
+    } else if (mul && !(s & 0xCu) && RECOMP_FPX_FIN32(x) && RECOMP_FPX_FIN32(y)) {
+        return 0;
+    }
+    /* (FMUL: w is the zero of the product's sign, so x*y + w is x*y) */
+#if RECOMP_FPX_FMA64
+    t = (uint32_t)recomp_fpx_fb(mul ? recomp_fpx_f(x) * recomp_fpx_f(y)
+                                    : __builtin_fmaf(recomp_fpx_f(x), recomp_fpx_f(y), recomp_fpx_f(w)));
+#else
+    t = (uint32_t)recomp_fpx_fb(recomp_fpx_f(x) * recomp_fpx_f(y));
+#endif
+    const uint32_t m = t & 0x7fffffffu;
+    if (m > 0x7f800000u) return 0;
+    if (m == 0x7f800000u) {
+        if (RECOMP_FPX_FIN32(x) && RECOMP_FPX_FIN32(y) && RECOMP_FPX_FIN32(w) && !(s & 4u)) return 0;
+    } else if (m <= 0x00800000u && !RECOMP_FPX_ZERO32(x) && !RECOMP_FPX_ZERO32(y)) {
+        if (!(s & 8u)) {   /* UFC clear: only an exact cancellation (+0, no bit) is kept */
+            if (mul || m != 0 || (double)recomp_fpx_f(x) * (double)recomp_fpx_f(y) != -(double)recomp_fpx_f(w)) return 0;
+        } else if (RECOMP_FPX_FZ(c)) {
+            if (m == 0x00800000u) return 0;
+            t &= 0x80000000u;
+        }
+    }
+    *v = t;
+    return 1;
+#else
+    (void)c; (void)a; (void)b; (void)z; (void)mul; (void)v; return 0;
+#endif
+}
 """
 
 
@@ -638,6 +1110,11 @@ static inline int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_
 # copy: a call makes the caller store and reload the guest registers it keeps in host registers around every float
 # op; inlining the fast path everywhere made the exe 40% bigger and slower (RX_FPX_INLINE, build.py).
 HOT_FPX = re.compile(r"\ba64_fpx_(?!hot_|fz_)(\w+)\(c,")
+
+
+def hot_text(text):
+    """a hot function's text: its FPX helper calls go through the copies with the fast path inline"""
+    return HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
 
 
 def hot_functions():
@@ -672,14 +1149,17 @@ def fpx_header(used):
            FPX_FZ_HEADER]
     for fast, exact, nf, ne in sorted(used):
         params = ", ".join("uint64_t a%d" % i for i in range(ne))
-        fz = ""
-        if fast in ("add32", "sub32", "mul32"):
-            fz = "if (A64_FPX_FZ_OPEN(c) && a64_fpx_fz_%s(c, a0, a1, &v)) return v; " % fast
+        # past the fast path, still inside its gate (tested once): the rescues above, else the exact body
+        rescue = ""
+        if (fast, exact) in (("mul32", "fma32"), ("fma32", "fma32")):
+            rescue = "if (a64_fpx_sticky32(c, a0, a1, a2, %d, &v)) { A64_FPX_STICKY_PROBE(); return v; } " % (fast == "mul32")
+        elif fast in ("add32", "sub32"):
+            rescue = "if ((c->fpsr & 0xCu) && a64_fpx_fz_%s(c, a0, a1, &v)) return v; " % fast
         out.append("A64_FPX_FN uint64_t a64_fpx_%s_%s(Ctx *c, %s) { uint64_t v; "
-                   "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; "
-                   "%sreturn recomp_fpe_%s(c, %s); }" % (fast, exact, params, fast,
-                                                          ", ".join("a%d" % i for i in range(nf)), fz, exact,
-                                                          ", ".join("a%d" % i for i in range(ne))))
+                   "if (RECOMP_FPX_OPEN(c)) { if (RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; %s} "
+                   "return recomp_fpe_%s(c, %s); }" % (fast, exact, params, fast,
+                                                       ", ".join("a%d" % i for i in range(nf)), rescue, exact,
+                                                       ", ".join("a%d" % i for i in range(ne))))
         # (the hot functions' copy, see HOT_FPX: the fast path inline, everything else through the helper)
         out.append("static inline __attribute__((always_inline)) uint64_t a64_fpx_hot_%s_%s(Ctx *c, %s) { uint64_t v; "
                    "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; "
@@ -696,6 +1176,12 @@ def fpx_header(used):
         if ("mul32", "fma32", 2, 3) in used:
             out.append(VFPX_MUL_HEADER)
     return "\n".join(out) + "\n"
+
+
+def op_text(text, fpx):
+    """one instruction's emitted C as lifted code has it: FPX guards outlined (their shapes added to fpx, which
+    fpx_header turns into a64_fpx.h), NEON FP vectorized, stores widened, flags packed"""
+    return stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
 
 
 class Lifter:
@@ -1366,14 +1852,35 @@ class Lifter:
         frame = not os.environ.get("A64_MARK_FRAME")
         local = local_regs() and e not in self.no_local
         dirty = self.dirty_regs(body, pcs, texts) if local else None
+        # (fast float regions, ff_region: the run of joinable instructions so far, [(pc, text)])
+        ff_only = getattr(self, "ff_only", None)
+        ff = bool(fastfp_mode()) and (ff_only is None or self.fname(e) in ff_only)
+        run = []
+
+        def flush():
+            if run:
+                text, n = ff_region(run)
+                out.append(text)
+                if n:
+                    self.stats["ff_regions"] = self.stats.get("ff_regions", 0) + 1
+                    self.stats["ff_ops"] = self.stats.get("ff_ops", 0) + n
+                del run[:]
         for i, pc in enumerate(pcs):
             self.cur_i = i
             (k, w) = body[pc]
             kind = k[0]
+            joins = False
+            if ff and kind == "op" and pc not in self.after and not (pc in labels or (pc == e and e in labels)):
+                t, f = texts[(w, pc) if pc_relative(w) else w]
+                if not f & (a64emit.UNHANDLED | a64emit.TERMINATOR):
+                    joins = ff_eligible(drop_flag_stores(t, dead[pc]) if pc in dead else t)
+            if not joins:
+                flush()
             if pc in labels or (pc == e and e in labels):
                 out.append("L_%08x:;" % pc)
             if self.comments:
-                out.append("/* %08x: %08x */" % (pc, w))
+                (run.append((pc, "/* %08x: %08x */" % (pc, w))) if joins else
+                 out.append("/* %08x: %08x */" % (pc, w)))
             nxt = pc + 4
             falls = True
             if kind == "op":
@@ -1390,7 +1897,10 @@ class Lifter:
                     if pc in dead:
                         text = drop_flag_stores(text, dead[pc])
                         self.stats["dead_flag_stores"] += bin(dead[pc]).count("1")
-                    out.append(text.rstrip("\n"))
+                    if joins:
+                        run.append((pc, text.rstrip("\n")))
+                    else:
+                        out.append(text.rstrip("\n"))
                     if pc in self.after:
                         out.append(self.after[pc])
                         self.stats["after_patches"] = self.stats.get("after_patches", 0) + 1
@@ -1464,7 +1974,9 @@ class Lifter:
             elif kind == "ic":
                 out.append("/* ic ivau: no self-modifying code */")
             if falls and (i + 1 == len(pcs) or pcs[i + 1] != nxt):
+                flush()
                 out.append(self.transfer(pc, nxt, labels, body))
+        flush()
         out.append("}")
         text = "\n".join(out)
         if frame:
@@ -1482,12 +1994,14 @@ class Lifter:
         order = list(keys)
         tx, fl = a64emit.translate([keys[x] for x in order])
         fpx = set()
-        texts = dict(zip(order, zip((stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(t, fpx))))) for t in tx), fl)))
+        texts = dict(zip(order, zip((op_text(t, fpx) for t in tx), fl)))
         del tx, fl, keys, order
         with open(os.path.join(out_dir, "a64_fpx.h"), "w", newline="\n") as f:
             f.write(fpx_header(fpx))
             if local_flags():
                 f.write(FCMPK_HEADER)
+            if fastfp_mode():
+                f.write(FASTFP_HEADER)
 
         chunk, size, n, decls, files = [], 0, 0, set(), []
 
@@ -1507,6 +2021,7 @@ class Lifter:
             chunk, size, n, decls = [], 0, n + 1, set()
 
         hot = hot_functions()
+        self.ff_only = hot if fastfp_mode() == "hot" else None   # (A64_FASTFP=hot: the hot functions' regions only)
         # A64_HOT_CHUNK=1 (with A64_HOT_FUNCS): the hot functions in a file of their own, code_hot.c, so that the
         # compiler sees the hot callees' bodies where the hot callers are and can inline them (build.py compiles it
         # with RX_HOT_CFLAGS)
@@ -1516,7 +2031,7 @@ class Lifter:
         for e in sorted(self.funcs):
             text, refs = self.emit_function(e, texts)
             if hot and self.fname(e) in hot:
-                text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
+                text = hot_text(text)
                 nhot += 1
                 if hot_chunk is not None:
                     hot_chunk.append(text)
@@ -1540,6 +2055,9 @@ class Lifter:
             files.append(path)
         elif os.path.exists(os.path.join(out_dir, "code_hot.c")):
             os.remove(os.path.join(out_dir, "code_hot.c"))   # (a lift without the hot file: no stale copy linked twice)
+        if fastfp_mode():
+            print("fast float regions (A64_FASTFP=%s): %d, %d float ops in them" % (
+                fastfp_mode(), self.stats.get("ff_regions", 0), self.stats.get("ff_ops", 0)))
         if hot:
             print("hot functions (A64_HOT_FUNCS): %d of %d listed found%s" % (nhot, len(hot),
                                                                          ", in code_hot.c" if hot_chunk else ""))
@@ -1582,3 +2100,6 @@ class Lifter:
         if self.stats["split_entries"]:
             print("split: %d extra entries in long functions; largest function now %d instructions" % (
                 self.stats["split_entries"], max(len(b) for b, _ in self.funcs.values())))
+        if self.stats["stores"]:   # (group_marks, when the lift ran it before this report)
+            print("page marks: %d groups share one mark for %d of %d stores through a base register" % (
+                self.stats["groups"], self.stats["grouped_stores"], self.stats["stores"]))

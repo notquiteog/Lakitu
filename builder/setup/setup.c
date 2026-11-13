@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "portable_home.h"
 
 #define WM_STATUS (WM_APP + 1)
 #define WM_DONE (WM_APP + 2)
@@ -34,12 +35,54 @@ static wchar_t g_status[512];
 static volatile LONG g_percent = -1;
 static DWORD g_http_status;   /* (the last answer: 0 when the server was not reached) */
 static wchar_t g_cmdline[2048];
+static HbHome g_home;
+static int g_home_ok;
+/* (RecompLauncher) --cli <make_game.py's options>: no window, the builder's lines on this process's stdout and stderr, its exit code
+   as ours; --play <game folder>: the game itself, waited for. Neither is used by the builder's own start, which is unchanged. */
+static int g_headless;
+static DWORD g_exit;
+
+static void say_error(const wchar_t *msg) {
+    char u[2048];
+    const int n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, u, (int)sizeof u - 8, NULL, NULL);
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD wrote;
+    if (n > 0 && h && h != INVALID_HANDLE_VALUE) WriteFile(h, "error ", 6, &wrote, NULL), WriteFile(h, u, n - 1, &wrote, NULL), WriteFile(h, "\n", 1, &wrote, NULL);
+}
 
 typedef struct {
     char sha[65];
     unsigned long long size;
     char dest[260], from[260], to[260], url[1024];
 } Part;
+/* the next non-empty line of a text, cut in place (its \r or \n made 0); *next moves past it. NULL at the end
+   (strtok's work without its hidden state) */
+static char *next_line(char **next) {
+    char *p = *next;
+    while (*p == '\r' || *p == '\n') p++;
+    if (!*p) return *next = p, (char *)NULL;
+    char *line = p;
+    while (*p && *p != '\r' && *p != '\n') p++;
+    if (*p) *p++ = 0;
+    *next = p;
+    return line;
+}
+/* a name from the setup list (a tag, or with path set a relative path with / or \ between its parts): letters, digits
+   and . _ + - only, no ".." part, no drive, no root */
+static int list_name_ok(const char *s, int path) {
+    if (!*s || *s == '/' || *s == '\\') return 0;
+    for (const char *q = s; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || strchr("._+-", *q) ||
+              (path && (*q == '/' || *q == '\\'))))
+            return 0;
+    for (const char *q = s; *q;) {   /* (each part: not "." or "..") */
+        const size_t n = path ? strcspn(q, "/\\") : strlen(q);
+        if ((n == 1 && q[0] == '.') || (n == 2 && q[0] == '.' && q[1] == '.') || !n) return 0;
+        q += n;
+        if (*q) q++;
+    }
+    return 1;
+}
 
 static void status(const wchar_t *fmt, ...) {
     va_list ap;
@@ -55,9 +98,21 @@ static void fail(const wchar_t *fmt, ...) {
     va_start(ap, fmt);
     vswprintf(msg, 1024, fmt, ap);
     va_end(ap);
+    if (g_headless) say_error(msg), ExitProcess(1);
     MessageBoxW(g_win, msg, L"Hookshot Builder setup", MB_OK | MB_ICONERROR);
     PostMessageW(g_win, WM_DONE, 1, 0);
     ExitThread(1);
+}
+
+/* A portable root can be longer than AppData. Stop before a truncated derived path reaches a file operation. */
+static int home_path(wchar_t *out, const wchar_t *format, ...) {
+    va_list args;
+    va_start(args, format);
+    const int n = vswprintf(out, MAX_PATH, format, args);
+    va_end(args);
+    if (g_home.portable && (n < 0 || n >= MAX_PATH))
+        fail(L"A path in this portable installation is too long for the Windows setup. Use a shorter Builder home.");
+    return n;
 }
 
 /* ---- HTTPS GET into a sink, following redirects (GitHub's release links go to its download host) ---- */
@@ -155,16 +210,56 @@ static int file_sha256(const wchar_t *path, char out[65]) {
     return ok;
 }
 
-static int run_wait(wchar_t *cmd, const wchar_t *dir) {
+typedef struct {
+    DWORD code, start_error, status_error, capture_error;
+    char error[512];
+} RunResult;
+
+static RunResult run_wait(wchar_t *cmd, const wchar_t *dir) {
+    RunResult result = {0};
+    HANDLE rd = NULL, wr = NULL, null = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
     si.dwFlags = STARTF_USESHOWWINDOW, si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) return -1;
+    if (CreatePipe(&rd, &wr, &sa, 0)) {
+        if (SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0))
+            null = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+        if (null != INVALID_HANDLE_VALUE) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = si.hStdOutput = null;   /* (setup has no console: supply valid inherited handles) */
+            si.hStdError = wr;
+        } else {
+            result.capture_error = GetLastError();
+            CloseHandle(rd), CloseHandle(wr);
+            rd = wr = NULL;
+        }
+    } else result.capture_error = GetLastError();
+    /* Capturing a diagnostic is optional: if pipe setup fails, keep the original child-process route. */
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, wr != NULL, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) {
+        result.start_error = GetLastError();
+        if (rd) CloseHandle(rd);
+        if (wr) CloseHandle(wr);
+        if (null != INVALID_HANDLE_VALUE) CloseHandle(null);
+        return result;
+    }
+    if (wr) CloseHandle(wr);   /* (otherwise EOF never arrives on the parent's reader) */
+    if (null != INVALID_HANDLE_VALUE) CloseHandle(null);
+    if (rd) {
+        char buf[512];
+        DWORD n;
+        size_t kept = 0;
+        while (ReadFile(rd, buf, sizeof buf, &n, NULL) && n) {
+            size_t copy = n < sizeof result.error - 1 - kept ? n : sizeof result.error - 1 - kept;
+            memcpy(result.error + kept, buf, copy);
+            kept += copy;   /* (keep draining after this buffer fills, so a noisy child cannot block) */
+        }
+        CloseHandle(rd);
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
+    if (!GetExitCodeProcess(pi.hProcess, &result.code)) result.status_error = GetLastError();
     CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
-    return (int)code;
+    return result;
 }
 
 static void mkdirs(const wchar_t *path) {
@@ -176,16 +271,61 @@ static void mkdirs(const wchar_t *path) {
     CreateDirectoryW(p, NULL);
 }
 
+/* --portable is an initial setup option, before the app/CLI arguments. Keep the remainder byte-for-byte. */
+static int portable_prefix(wchar_t *command) {
+    const wchar_t *p = command, *end = NULL;
+    while (*p == L' ' || *p == L'\t') p++;
+    if (!wcsncmp(p, L"--portable", 10) && (!p[10] || p[10] == L' ' || p[10] == L'\t')) end = p + 10;
+    else if (!wcsncmp(p, L"\"--portable\"", 12) && (!p[12] || p[12] == L' ' || p[12] == L'\t')) end = p + 12;
+    if (!end) return 0;
+    while (*end == L' ' || *end == L'\t') end++;
+    wmemmove(command, end, wcslen(end) + 1);
+    return 1;
+}
+
+static int init_home(int portable) {
+    wchar_t self[MAX_PATH], requested[MAX_PATH] = L"", standard[MAX_PATH] = L"", profile[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (!n || n >= MAX_PATH || GetEnvironmentVariableW(L"HOOKSHOT_SETUP_BASE", requested, MAX_PATH) >= MAX_PATH) return 0;
+    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, profile) == S_OK)
+        hb_home_join(standard, MAX_PATH, profile, L"HookshotBuilder");   /* an explicit/portable home needs no AppData */
+    const wchar_t *name = wcsrchr(self, L'\\');
+    name = name ? name + 1 : self;
+    const int game = !_wcsicmp(name, L"hookshot.exe");
+    if (portable) {
+        if (*requested) {
+            if (!hb_home_full(g_home.root, requested)) return 0;
+        } else {
+            wchar_t parent[MAX_PATH];
+            if (!hb_home_full(parent, self) || !hb_home_parent(parent)) return 0;
+            HbHome existing;
+            if (!hb_home_discover(&existing, NULL, self, parent, game)) return 0;
+            if (existing.portable) wcscpy(g_home.root, existing.root);
+            else if (!hb_home_join(g_home.root, MAX_PATH, parent, L"HookshotBuilder")) return 0;
+        }
+        if (hb_home_volume(g_home.root)) return 0;
+        mkdirs(g_home.root);
+        if (!hb_home_mark(g_home.root)) return 0;
+        g_home.portable = 1;
+    } else if (!hb_home_discover(&g_home, requested, self, standard, game)) return 0;
+    wchar_t inherited[3] = L"";
+    if (GetEnvironmentVariableW(L"HOOKSHOT_BUILDER_PORTABLE", inherited, 3) == 1 &&
+        inherited[0] == L'1' && !g_home.portable) return 0;
+    /* Only this setup and the children it starts: no user/system environment or registry change. */
+    return SetEnvironmentVariableW(L"HOOKSHOT_SETUP_BASE", g_home.root) &&
+           SetEnvironmentVariableW(L"HOOKSHOT_BUILDER_PORTABLE", g_home.portable ? L"1" : NULL);
+}
+
 /* a folder and everything in it (a version folder, a half-unpacked one) */
 static void rmtree(const wchar_t *dir) {
     wchar_t pat[MAX_PATH], p[MAX_PATH];
     WIN32_FIND_DATAW fd;
-    swprintf(pat, MAX_PATH, L"%ls\\*", dir);
+    home_path(pat, L"%ls\\*", dir);
     HANDLE h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            swprintf(p, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+            home_path(p, L"%ls\\%ls", dir, fd.cFileName);
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) rmtree(p);
             else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(p);   /* (a link: never what it points to) */
             else SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL), DeleteFileW(p);
@@ -240,14 +380,65 @@ static int part_folder(const Part *p, wchar_t *rel, int n) {
 /* (players asked for less in %LOCALAPPDATA%: the downloaded zips are not kept beside the unpacked version any more. So that an update
    still downloads only what changed, a part whose checksum the installed version lists in its parts.txt (and whose folder it has)
    is moved over from it instead of downloaded: that version is deleted after the install anyway) */
+/* Portable updates keep the old installation usable until publication; copied parts belong only to staging. */
+static int copy_part_tree(const wchar_t *from, const wchar_t *to) {
+    const DWORD attributes = GetFileAttributesW(from);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return 0;
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) return CopyFileW(from, to, TRUE) != 0;
+    if (!CreateDirectoryW(to, NULL)) return 0;
+    wchar_t pattern[MAX_PATH];
+    if (!hb_home_join(pattern, MAX_PATH, from, L"*")) return 0;
+    WIN32_FIND_DATAW entry;
+    HANDLE find = FindFirstFileW(pattern, &entry);
+    if (find == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    int ok = 1;
+    do {
+        if (!wcscmp(entry.cFileName, L".") || !wcscmp(entry.cFileName, L"..")) continue;
+        wchar_t source[MAX_PATH], target[MAX_PATH];
+        if (!hb_home_join(source, MAX_PATH, from, entry.cFileName) ||
+            !hb_home_join(target, MAX_PATH, to, entry.cFileName) || !copy_part_tree(source, target)) { ok = 0; break; }
+    } while (FindNextFileW(find, &entry));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = 0;
+    FindClose(find);
+    return ok;
+}
+
+/* A folder tar.exe has just written can stay open a few seconds in an antivirus scan or the search indexer: MoveFileW then fails
+   with access denied or a sharing violation. Those are tried again for up to 20 s, any other error is returned at once.
+   On failure GetLastError is the last try's. */
+static BOOL move_retry(const wchar_t *from, const wchar_t *to) {
+    for (int tries = 1;; tries++) {
+        if (MoveFileW(from, to)) return TRUE;
+        const DWORD error = GetLastError();
+        if ((error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) || tries == 80) return FALSE;
+        Sleep(250);
+    }
+}
+
+static int publish_install(const wchar_t *staged, const wchar_t *final, int portable) {
+    if (!portable || GetFileAttributesW(final) == INVALID_FILE_ATTRIBUTES) return move_retry(staged, final) != 0;
+    wchar_t backup[MAX_PATH];
+    const int n = home_path(backup, L"%ls.rollback-%lu-%llu", final, GetCurrentProcessId(), GetTickCount64());
+    if (n < 0 || n >= MAX_PATH || !MoveFileW(final, backup)) return 0;
+    if (!move_retry(staged, final)) {
+        const DWORD error = GetLastError();
+        /* If restoration is prevented externally, the complete old installation remains in .rollback-* for recovery. */
+        MoveFileW(backup, final);
+        SetLastError(error);
+        return 0;
+    }
+    rmtree(backup);
+    return 1;
+}
+
 static int reuse_part(const wchar_t *versions, const char *tag, const Part *p, const wchar_t *install) {
     wchar_t rel[MAX_PATH], cur[MAX_PATH], list[MAX_PATH], from[MAX_PATH], to[MAX_PATH], parent[MAX_PATH];
     char was[128];
     if (!part_folder(p, rel, MAX_PATH)) return 0;
-    swprintf(cur, MAX_PATH, L"%ls\\current.txt", versions);
+    home_path(cur, L"%ls\\current.txt", versions);
     read_small(cur, was, sizeof was);
     if (!was[0] || !strcmp(was, tag)) return 0;
-    swprintf(list, MAX_PATH, L"%ls\\%hs\\parts.txt", versions, was);
+    home_path(list, L"%ls\\%hs\\parts.txt", versions, was);
     HANDLE f = CreateFileW(list, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return 0;
     char buf[8192];
@@ -256,19 +447,22 @@ static int reuse_part(const wchar_t *versions, const char *tag, const Part *p, c
     CloseHandle(f);
     buf[got] = 0;
     if (!strstr(buf, p->sha)) return 0;
-    swprintf(from, MAX_PATH, L"%ls\\%hs\\%ls", versions, was, rel);
-    swprintf(to, MAX_PATH, L"%ls\\%ls", install, rel);
+    home_path(from, L"%ls\\%hs\\%ls", versions, was, rel);
+    home_path(to, L"%ls\\%ls", install, rel);
     if (GetFileAttributesW(from) == INVALID_FILE_ATTRIBUTES) return 0;
     wcscpy(parent, to);
     wchar_t *slash = wcsrchr(parent, L'\\');
     if (slash) *slash = 0, mkdirs(parent);
-    return MoveFileW(from, to) != 0;
+    if (!g_home.portable) return MoveFileW(from, to) != 0;
+    if (copy_part_tree(from, to)) return 1;
+    rmtree(to);   /* only this attempt's derived part destination, never the source */
+    return 0;
 }
 
 /* The checksums of the parts this version holds in folders of their own (reuse_part reads them at the next update) */
 static void write_parts(const wchar_t *install, const Part *parts, int nparts) {
     wchar_t list[MAX_PATH], rel[MAX_PATH];
-    swprintf(list, MAX_PATH, L"%ls\\parts.txt", install);
+    home_path(list, L"%ls\\parts.txt", install);
     HANDLE f = CreateFileW(list, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
     for (int i = 0; i < nparts; i++) {
@@ -286,8 +480,8 @@ static void write_parts(const wchar_t *install, const Part *parts, int nparts) {
 static void prune(const wchar_t *versions, const wchar_t *downloads, const char *tag, const Part *parts, int nparts) {
     wchar_t cur[MAX_PATH], prev[MAX_PATH], pat[MAX_PATH], p[MAX_PATH];
     char was[128], before[128];
-    swprintf(cur, MAX_PATH, L"%ls\\current.txt", versions);
-    swprintf(prev, MAX_PATH, L"%ls\\previous.txt", versions);
+    home_path(cur, L"%ls\\current.txt", versions);
+    home_path(prev, L"%ls\\previous.txt", versions);
     read_small(cur, was, sizeof was);
     if (strcmp(was, tag)) {
         if (was[0]) write_small(prev, was);
@@ -295,7 +489,7 @@ static void prune(const wchar_t *versions, const wchar_t *downloads, const char 
     }
     read_small(prev, before, sizeof before);
     WIN32_FIND_DATAW fd;
-    swprintf(pat, MAX_PATH, L"%ls\\*", versions);
+    home_path(pat, L"%ls\\*", versions);
     HANDLE h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
@@ -306,15 +500,15 @@ static void prune(const wchar_t *versions, const wchar_t *downloads, const char 
                (the builder that started this, closing; a build it left) cannot be renamed: it stays, and goes at a later run) */
             (void)before;
             if (!strcmp(name, tag)) continue;
-            swprintf(p, MAX_PATH, L"%ls\\%ls", versions, fd.cFileName);
+            home_path(p, L"%ls\\%ls", versions, fd.cFileName);
             wchar_t gone[MAX_PATH];
-            swprintf(gone, MAX_PATH, L"%ls.gone", p);
+            home_path(gone, L"%ls.gone", p);
             if (wcslen(fd.cFileName) > 5 && !wcscmp(fd.cFileName + wcslen(fd.cFileName) - 5, L".gone")) rmtree(p);
             else if (MoveFileW(p, gone)) rmtree(gone);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    swprintf(pat, MAX_PATH, L"%ls\\*.zip", downloads);
+    home_path(pat, L"%ls\\*.zip", downloads);
     h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
@@ -323,7 +517,7 @@ static void prune(const wchar_t *versions, const wchar_t *downloads, const char 
             int keep = 0;
             for (int i = 0; i < nparts; i++)
                 if (!strncmp(name, parts[i].sha, 64)) keep = 1;
-            if (!keep) swprintf(p, MAX_PATH, L"%ls\\%ls", downloads, fd.cFileName), DeleteFileW(p);
+            if (!keep) home_path(p, L"%ls\\%ls", downloads, fd.cFileName), DeleteFileW(p);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -426,14 +620,68 @@ static void wanted_tag(char *out, size_t n) {
 /* (an update to a named release reads THAT release's list: the latest/download link can answer with the release before it for a
    while after a publish, and the setup then installed the old version again and started it with --fetched, which builds without
    checking: players pressed Update and stayed on v2.0.3, 2026-11-08) */
+/* (hookshot) the repository the setup installs from, owner/name: given by CI (.github/workflows/windows-builder.yml) from the
+   repository it builds in, so a fork's setup installs the fork's release */
+#ifndef HOOKSHOT_REPOSITORY
+#define HOOKSHOT_REPOSITORY "NotRexed/Hookshot"
+#endif
+#define HOOKSHOT_WIDEN2(s) L##s
+#define HOOKSHOT_WIDEN(s) HOOKSHOT_WIDEN2(s)
+/* (a nightly's version, git describe --long's v2.1.0-rc.1-3-g1a2b3c4: its files are on the rolling nightly release) */
+static int nightly_tag(const char *s) {
+    size_t n = strlen(s), h;
+    if (n > 6 && !strcmp(s + n - 6, "-dirty")) n -= 6;
+    for (h = n; h && strchr("0123456789abcdef", s[h - 1]); h--) {}
+    if (h == n || h < 3 || s[h - 1] != 'g' || s[h - 2] != '-') return 0;
+    size_t d = h - 2;
+    while (d && s[d - 1] >= '0' && s[d - 1] <= '9') d--;
+    return d < h - 2 && d > 0 && s[d - 1] == '-';
+}
+
+/* (HOOKSHOT_SETUP_RELEASE, set when a release candidate's or the nightly's setup is built: started with no --tag, it installs
+   the release it came from (v2.1.0-rc.1, or nightly: the newest nightly), not the latest release) */
+#ifndef HOOKSHOT_SETUP_RELEASE
+#define HOOKSHOT_SETUP_RELEASE ""
+#endif
+
+/* The shipping Builder is a directory-based, self-contained WPF app: an EXE alone cannot start it.
+   Keep this startup contract in step with the publish format; this is not an integrity check of every assembly. */
+static int builder_ready(const wchar_t *exe) {
+    static const wchar_t *const required[] = {
+        L"HookshotBuilder.dll", L"HookshotBuilder.deps.json", L"HookshotBuilder.runtimeconfig.json",
+        L"hostfxr.dll", L"hostpolicy.dll", L"coreclr.dll", L"System.Private.CoreLib.dll",
+        L"WindowsBase.dll", L"PresentationCore.dll", L"PresentationFramework.dll",
+        L"PresentationNative_cor3.dll", L"wpfgfx_cor3.dll"
+    };
+    wchar_t path[MAX_PATH];
+    const size_t n = wcslen(exe);
+    if (n >= MAX_PATH) return 0;
+    wcscpy(path, exe);
+    wchar_t *name = wcsrchr(path, L'\\');
+    if (!name) return 0;
+    const size_t prefix = (size_t)(++name - path);
+    for (size_t i = 0; i <= sizeof required / sizeof *required; i++) {
+        if (i) {
+            if (prefix + wcslen(required[i - 1]) >= MAX_PATH) return 0;
+            wcscpy(name, required[i - 1]);
+        }
+        WIN32_FILE_ATTRIBUTE_DATA info;
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info) ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (!info.nFileSizeHigh && !info.nFileSizeLow)) return 0;
+    }
+    return 1;
+}
+
 static const char *manifest_url(void) {
     static char u[1024];
     const char *e = getenv("HOOKSHOT_SETUP_LIST");
     char tag[128];
     wanted_tag(tag, sizeof tag);
+    if (!tag[0] && HOOKSHOT_SETUP_RELEASE[0] && strlen(HOOKSHOT_SETUP_RELEASE) < sizeof tag) strcpy(tag, HOOKSHOT_SETUP_RELEASE);
     if (e && *e) snprintf(u, sizeof u, "%s", e);
-    else if (tag[0]) snprintf(u, sizeof u, "https://github.com/NotRexed/Hookshot/releases/download/%s/hookshot-setup.txt", tag);
-    else snprintf(u, sizeof u, "%s", "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-setup.txt");
+    else if (tag[0])
+        snprintf(u, sizeof u, "https://github.com/" HOOKSHOT_REPOSITORY "/releases/download/%s/hookshot-setup.txt", nightly_tag(tag) ? "nightly" : tag);
+    else snprintf(u, sizeof u, "%s", "https://github.com/" HOOKSHOT_REPOSITORY "/releases/latest/download/hookshot-setup.txt");
     return u;
 }
 
@@ -449,13 +697,9 @@ static DWORD WINAPI work(LPVOID unused) {
         Sleep(2000);
     }
     wchar_t base[MAX_PATH], downloads[MAX_PATH];
-    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base) != S_OK) fail(L"No local application data folder.");
-    wcscat(base, L"\\HookshotBuilder");
-    {   /* (HOOKSHOT_SETUP_BASE=<folder>: install there instead, for testing installs and updates without touching the real one) */
-        const wchar_t *tb = _wgetenv(L"HOOKSHOT_SETUP_BASE");
-        if (tb && *tb) wcsncpy(base, tb, MAX_PATH - 1), base[MAX_PATH - 1] = 0;
-    }
-    swprintf(downloads, MAX_PATH, L"%ls\\downloads", base);
+    if (!g_home_ok || (g_home.portable && hb_home_marked(g_home.root) != 1)) fail(L"The Builder home is unavailable or its portable marker is invalid.");
+    wcscpy(base, g_home.root);
+    home_path(downloads, L"%ls\\downloads", base);
     mkdirs(downloads);
 
     status(L"Looking for the latest Hookshot Builder...");
@@ -490,7 +734,7 @@ static DWORD WINAPI work(LPVOID unused) {
     if (!ok)
         fail(g_http_status == 404
                  ? L"The latest Hookshot release has no setup files yet. Download HookshotBuilder.zip from the releases page for now: "
-                   L"https://github.com/NotRexed/Hookshot/releases/latest"
+                   L"https://github.com/" HOOKSHOT_WIDEN(HOOKSHOT_REPOSITORY) L"/releases/latest"
              : g_http_status ? L"GitHub's download servers are failing right now (an error 500 or above, tried 8 times over 3 minutes). "
                                L"This is on GitHub's side: try again in a few minutes, or later today."
                              : L"Could not reach GitHub to get the Hookshot Builder. Check your internet connection and try again.");
@@ -498,7 +742,7 @@ static DWORD WINAPI work(LPVOID unused) {
     char tag[128] = "", run[260] = "";
     Part parts[MAX_PARTS];
     int nparts = 0;
-    for (char *line = strtok(man.p, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+    for (char *next = man.p, *line; (line = next_line(&next)) != NULL;) {
         if (!strncmp(line, "tag ", 4)) sscanf(line + 4, "%127s", tag);
         else if (!strncmp(line, "run ", 4)) sscanf(line + 4, "%259s", run);
         else if (!strncmp(line, "part ", 5) && nparts < MAX_PARTS) {
@@ -507,6 +751,16 @@ static DWORD WINAPI work(LPVOID unused) {
         }
     }
     if (!tag[0] || !run[0] || !nparts) fail(L"The release's setup list could not be read. Try again later.");
+    {   /* (the list's names become paths under the install folder, a folder this removes and remakes: they stay inside it) */
+        int bad = !list_name_ok(tag, 0) || !list_name_ok(run, 1);
+        for (int i = 0; i < nparts && !bad; i++) {
+            const Part *p = &parts[i];
+            bad = strlen(p->sha) != 64 || strspn(p->sha, "0123456789abcdef") != 64 || _strnicmp(p->url, "https://", 8) ||
+                  (strcmp(p->dest, ".") && !list_name_ok(p->dest, 1)) || (strcmp(p->from, "-") && !list_name_ok(p->from, 0)) ||
+                  (strcmp(p->to, "-") && !list_name_ok(p->to, 0));
+        }
+        if (bad) fail(L"The release's setup list has a name this setup does not accept. Try again later.");
+    }
     {
         char want[128];
         wanted_tag(want, sizeof want);
@@ -520,24 +774,24 @@ static DWORD WINAPI work(LPVOID unused) {
 
     wchar_t install[MAX_PATH], marker[MAX_PATH], wtag[128], wrun[260], exe[MAX_PATH], versions[MAX_PATH], final_dir[MAX_PATH];
     w(tag, wtag, 128), w(run, wrun, 260);
-    swprintf(versions, MAX_PATH, L"%ls\\versions", base);
-    swprintf(final_dir, MAX_PATH, L"%ls\\%ls", versions, wtag);
-    swprintf(install, MAX_PATH, L"%ls\\%ls", versions, wtag);
-    swprintf(marker, MAX_PATH, L"%ls\\installed.txt", install);
-    swprintf(exe, MAX_PATH, L"%ls\\%ls", install, wrun);
+    home_path(versions, L"%ls\\versions", base);
+    home_path(final_dir, L"%ls\\%ls", versions, wtag);
+    home_path(install, L"%ls\\%ls", versions, wtag);
+    home_path(marker, L"%ls\\installed.txt", install);
+    home_path(exe, L"%ls\\%ls", install, wrun);
     for (wchar_t *q = exe; *q; q++) if (*q == L'/') *q = L'\\';
 
-    if (repair || GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) {
+    if (repair || GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES || !builder_ready(exe)) {
         /* (unpacked into <tag>.part and renamed once complete: a setup stopped half way never leaves a version that looks installed) */
-        swprintf(install, MAX_PATH, L"%ls\\%ls.part", versions, wtag);
+        home_path(install, L"%ls\\%ls.part", versions, wtag);
         rmtree(install);
-        rmtree(final_dir);
+        if (!g_home.portable) rmtree(final_dir);
         mkdirs(install);
         for (int i = 0; i < nparts; i++) {
             Part *p = &parts[i];
             wchar_t zip[MAX_PATH], wsha[65];
             w(p->sha, wsha, 65);
-            swprintf(zip, MAX_PATH, L"%ls\\%ls.zip", downloads, wsha);
+            home_path(zip, L"%ls\\%ls.zip", downloads, wsha);
             if (reuse_part(versions, tag, p, install)) {   /* (unchanged since the installed version: its folder moved over) */
                 status(L"Part %d of %d unchanged: kept from the installed version", i + 1, nparts);
                 continue;
@@ -545,7 +799,7 @@ static DWORD WINAPI work(LPVOID unused) {
             char have[65] = "";
             if (!(GetFileAttributesW(zip) != INVALID_FILE_ATTRIBUTES && file_sha256(zip, have) && !strcmp(have, p->sha))) {
                 wchar_t part[MAX_PATH];
-                swprintf(part, MAX_PATH, L"%ls.part", zip);
+                home_path(part, L"%ls.part", zip);
                 int got = 0;
                 for (int attempt = 0; attempt < TRIES && !got; attempt++) {   /* (a server error or a dropped connection: again) */
                     if (attempt) {
@@ -583,41 +837,74 @@ static DWORD WINAPI work(LPVOID unused) {
                       L"few minutes and it carries on from here."
                     : L"Downloading part %d of %d failed. Check your connection and free space, then try again.", i + 1, nparts);
                 if (strcmp(have, p->sha)) DeleteFileW(part), fail(L"Part %d of %d did not download correctly (its checksum differs). Try again.", i + 1, nparts);
-                DeleteFileW(zip);
-                MoveFileW(part, zip);
+                /* (the checked file or nothing: an old <sha>.zip that could not be removed is never unpacked instead) */
+                if (!MoveFileExW(part, zip, MOVEFILE_REPLACE_EXISTING)) {
+                    const DWORD e = GetLastError();
+                    DeleteFileW(part);
+                    fail(L"Could not place part %d of %d in %ls (Windows error %lu).", i + 1, nparts, downloads, e);
+                }
             }
             status(L"Unpacking part %d of %d...", i + 1, nparts);
             wchar_t dest[MAX_PATH], wdest[260], tarcmd[2 * MAX_PATH + 64], sys[MAX_PATH];
             w(p->dest, wdest, 260);
             if (!strcmp(p->dest, ".")) wcscpy(dest, install);
-            else swprintf(dest, MAX_PATH, L"%ls\\%ls", install, wdest);
+            else home_path(dest, L"%ls\\%ls", install, wdest);
             for (wchar_t *q = dest; *q; q++) if (*q == L'/') *q = L'\\';
             mkdirs(dest);
             GetSystemDirectoryW(sys, MAX_PATH);
             swprintf(tarcmd, 2 * MAX_PATH + 64, L"\"%ls\\tar.exe\" -xf \"%ls\" -C \"%ls\"", sys, zip, dest);
-            if (run_wait(tarcmd, dest) != 0) fail(L"Unpacking part %d of %d failed (Windows' tar.exe). Is there enough free space on C:?", i + 1, nparts);
+            RunResult tar = run_wait(tarcmd, dest);
+            if (tar.start_error == ERROR_FILE_NOT_FOUND)
+                fail(L"Windows' tar.exe was not found (Windows error 2).\n"
+                     L"Open Command Prompt as administrator and run:\n"
+                     L"DISM /Online /Cleanup-Image /RestoreHealth\n"
+                     L"After DISM succeeds, run:\nsfc /scannow\n"
+                     L"Then restart Windows and run setup again.\n"
+                     L"Archive: %ls\nDestination: %ls", zip, dest);
+            if (tar.start_error) fail(L"Could not start Windows' tar.exe (Windows error %lu).\nArchive: %ls\nDestination: %ls", tar.start_error, zip, dest);
+            if (tar.status_error) fail(L"Could not read Windows' tar.exe exit status (Windows error %lu).\nArchive: %ls\nDestination: %ls", tar.status_error, zip, dest);
+            if (tar.code) {
+                wchar_t detail[512] = L"";
+                if (tar.capture_error) swprintf(detail, 512, L"Could not capture stderr (Windows error %lu).", tar.capture_error);
+                /* Best-effort UTF-8: tar may use an ANSI/OEM code page, or the byte cap may split a sequence. */
+                else MultiByteToWideChar(CP_UTF8, 0, tar.error, -1, detail, 512);
+                wchar_t heading[1024] = L"";
+                swprintf(heading, 1024, L"Unpacking part %d of %d failed: Windows' tar.exe exited with code %lu.\nArchive: %ls\nDestination: %ls\n%ls:\n",
+                         i + 1, nparts, tar.code, zip, dest,
+                         tar.capture_error ? L"Stderr unavailable" : L"Tar stderr excerpt (up to 511 bytes captured)");
+                heading[1023] = 0;
+                /* Keep both paths; the displayed excerpt uses only the space left in fail()'s 1024-wide message. */
+                fail(L"%ls%.*ls", heading, (int)(1023 - wcslen(heading)), detail);
+            }
             if (strcmp(p->from, "-") && strcmp(p->to, "-")) {   /* (llvm-mingw-<version>-ucrt-x86_64 -> llvm-mingw) */
                 wchar_t from[MAX_PATH], to[MAX_PATH], wf[260], wt[260];
                 w(p->from, wf, 260), w(p->to, wt, 260);
-                swprintf(from, MAX_PATH, L"%ls\\%ls", dest, wf);
-                swprintf(to, MAX_PATH, L"%ls\\%ls", dest, wt);
-                if (GetFileAttributesW(to) == INVALID_FILE_ATTRIBUTES && !MoveFileW(from, to))
-                    fail(L"Could not set up part %d of %d (renaming %ls).", i + 1, nparts, wf);
+                home_path(from, L"%ls\\%ls", dest, wf);
+                home_path(to, L"%ls\\%ls", dest, wt);
+                if (GetFileAttributesW(to) == INVALID_FILE_ATTRIBUTES && !move_retry(from, to)) {
+                    const DWORD e = GetLastError();
+                    if (e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION)
+                        fail(L"Could not set up part %d of %d (renaming %ls, Windows error %lu). Another program is holding the files just unpacked, "
+                             L"often an antivirus scan: run the setup again, and if it happens again allow the folder %ls in it.",
+                             i + 1, nparts, wf, e, g_home.root);
+                    fail(L"Could not set up part %d of %d (renaming %ls, Windows error %lu).", i + 1, nparts, wf, e);
+                }
             }
         }
         wchar_t staged_exe[MAX_PATH];
-        swprintf(staged_exe, MAX_PATH, L"%ls\\%ls", install, wrun);
+        home_path(staged_exe, L"%ls\\%ls", install, wrun);
         for (wchar_t *q = staged_exe; *q; q++) if (*q == L'/') *q = L'\\';
-        if (GetFileAttributesW(staged_exe) == INVALID_FILE_ATTRIBUTES)
-            fail(L"The builder is missing after unpacking (%ls). Your antivirus may have removed it: allow the folder %ls and run the setup again.", staged_exe, base);
-        if (!MoveFileW(install, final_dir)) fail(L"Could not finish installing into %ls.", final_dir);
+        if (!builder_ready(staged_exe))
+            fail(L"The Builder or its self-contained .NET runtime is incomplete after unpacking (%ls). Your antivirus may have quarantined files from %ls. Check its quarantine/history, then run the setup again. No complete installation was published.", staged_exe, install);
+        if (!publish_install(install, final_dir, g_home.portable))
+            fail(L"Could not finish installing into %ls (Windows error %lu). A preserved repair backup, if restoration was blocked, is beside it as .rollback-*.", final_dir, GetLastError());
         wcscpy(install, final_dir);
         write_small(marker, tag);
         write_parts(install, parts, nparts);
     }
     {   /* (a version an older setup installed has no parts.txt: written now, so the next update can move its folders over) */
         wchar_t have_list[MAX_PATH];
-        swprintf(have_list, MAX_PATH, L"%ls\\parts.txt", final_dir);
+        home_path(have_list, L"%ls\\parts.txt", final_dir);
         if (GetFileAttributesW(have_list) == INVALID_FILE_ATTRIBUTES) write_parts(final_dir, parts, nparts);
     }
     prune(versions, downloads, tag, parts, nparts);
@@ -631,7 +918,18 @@ static DWORD WINAPI work(LPVOID unused) {
     swprintf(cmd, 4096, L"\"%ls\" %ls", exe, g_cmdline);
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) fail(L"Could not start %ls.", exe);
+    BOOL inherit = FALSE;
+    if (g_headless) {   /* (the builder writes to the same pipes we were given) */
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE), si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE), si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (si.hStdOutput && si.hStdOutput != INVALID_HANDLE_VALUE && si.hStdError && si.hStdError != INVALID_HANDLE_VALUE) {
+            if (!si.hStdInput || si.hStdInput == INVALID_HANDLE_VALUE) si.hStdInput = NULL;
+            SetHandleInformation(si.hStdOutput, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            SetHandleInformation(si.hStdError, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            si.dwFlags = STARTF_USESTDHANDLES, inherit = TRUE;
+        }
+    }
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, inherit, 0, NULL, dir, &si, &pi)) fail(L"Could not start %ls.", exe);
+    if (g_headless) WaitForSingleObject(pi.hProcess, INFINITE), GetExitCodeProcess(pi.hProcess, &g_exit);
     CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
     PostMessageW(g_win, WM_DONE, 0, 0);
     return 0;
@@ -657,16 +955,17 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
    window, download or network of its own. With no builder installed yet, the setup runs as usual and then opens the launcher. */
 static int launch_installed(const wchar_t *args) {
     wchar_t base[MAX_PATH], cur[MAX_PATH], exe[MAX_PATH], dir[MAX_PATH], cmd[4096];
-    if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base) != S_OK) return 0;
+    if (!g_home_ok) return 0;
+    wcscpy(base, g_home.root);
     char tag[128] = "";
-    swprintf(cur, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\current.txt", base);
+    home_path(cur, L"%ls\\versions\\current.txt", base);
     read_small(cur, tag, sizeof tag);
-    if (!tag[0]) return 0;
+    if (!tag[0] || tag[0] == '.' || !list_name_ok(tag, 0)) return 0;
     wchar_t wtag[128];
     MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
-    swprintf(dir, MAX_PATH, L"%ls\\HookshotBuilder\\versions\\%ls\\HookshotBuilder", base, wtag);
-    swprintf(exe, MAX_PATH, L"%ls\\HookshotBuilder.exe", dir);
-    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return 0;
+    home_path(dir, L"%ls\\versions\\%ls\\HookshotBuilder", base, wtag);
+    home_path(exe, L"%ls\\HookshotBuilder.exe", dir);
+    if (!builder_ready(exe)) return 0;
     swprintf(cmd, 4096, L"\"%ls\" %ls", exe, args);
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
@@ -675,9 +974,44 @@ static int launch_installed(const wchar_t *args) {
     return 1;
 }
 
+/* (RecompLauncher's Play) --play <game folder>: bin\hookshot.exe there, started like the game folder's launcher starts it but without
+   its update question, and waited for, so the launcher knows when the session ends. */
+static int play_folder(const wchar_t *args) {
+    wchar_t folder[MAX_PATH], cmd[MAX_PATH + 32];
+    while (*args == L' ') args++;
+    const int quoted = *args == L'"';
+    size_t k = 0;
+    for (args += quoted; *args && !(quoted ? *args == L'"' : *args == L' ') && k + 1 < MAX_PATH; ) folder[k++] = *args++;
+    folder[k] = 0;
+    swprintf(cmd, MAX_PATH + 32, L"\"%ls\\bin\\hookshot.exe\"", folder);
+    _wputenv_s(L"HOOKSHOT_NO_UPDATE_CHECK", L"1");
+    STARTUPINFOW si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    DWORD code = 1;
+    if (!k || !CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, folder, &si, &pi)) {
+        g_headless = 1;
+        say_error(L"No built game to start. Build it first (the game folder needs bin\\hookshot.exe).");
+        return 1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE), GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+    return (int)code;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     (void)prev;
+    /* (libraries loaded from here on come from System32 only, never from the folder the setup was downloaded to) */
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     wcsncpy(g_cmdline, cmdline ? cmdline : L"", 2047);
+    g_cmdline[2047] = 0;
+    const int portable = portable_prefix(g_cmdline);
+    {
+        const wchar_t *c = g_cmdline;
+        while (*c == L' ') c++;
+        if (!wcsncmp(c, L"--play", 6) && (c[6] == L' ' || !c[6])) return play_folder(c + 6);
+        if (!wcsncmp(c, L"--cli", 5) && (c[5] == L' ' || !c[5])) g_headless = 1, show = SW_HIDE;
+    }
+    g_home_ok = init_home(portable);
     {
         wchar_t self[MAX_PATH];
         GetModuleFileNameW(NULL, self, MAX_PATH);
@@ -690,7 +1024,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             if (launch_installed(g_cmdline)) return 0;
             /* (no builder installed on this PC: the game itself, at once; nothing is downloaded to show a Play button) */
             wchar_t game[MAX_PATH], cmd[MAX_PATH + 4];
-            swprintf(game, MAX_PATH, L"%ls\\bin\\hookshot.exe", self);
+            home_path(game, L"%ls\\bin\\hookshot.exe", self);
             swprintf(cmd, MAX_PATH + 4, L"\"%ls\"", game);
             STARTUPINFOW si = {sizeof si};
             PROCESS_INFORMATION pi;
@@ -703,6 +1037,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return 1;
         }
         if (wcsstr(g_cmdline, L"--launch") && launch_installed(g_cmdline)) return 0;
+    }
+    if (!g_home_ok) {
+        const wchar_t *why = L"The Builder home is unavailable or its portable marker is invalid. For a new portable install, put this setup in a writable folder and start it with --portable.";
+        if (g_headless) say_error(why);
+        else MessageBoxW(NULL, why, L"Hookshot Builder setup", MB_OK | MB_ICONERROR);
+        return 1;
     }
     INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&icc);
@@ -724,5 +1064,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     CloseHandle(CreateThread(NULL, 0, work, NULL, 0, NULL));
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) TranslateMessage(&m), DispatchMessageW(&m);
-    return 0;
+    return (int)g_exit;
 }

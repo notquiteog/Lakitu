@@ -13,6 +13,11 @@ import subprocess
 import sys
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc"]
+
 ROOT = Path(__file__).resolve().parents[1]
 FLOAT = "_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquadFilterParameterIfEE"
 LEGACY = "_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadFilterParameterE"
@@ -45,8 +50,19 @@ static void release_wb(Voice *voice, uint64_t buffer) { (void)voice; (void)buffe
 """]
     actual.extend(helper.block(source, marker) for marker in (
         "static void put_handle(", "static int get_handle(", "static int voice_index(", "static Voice *voice_of("))
+    if "static uint64_t split_bq_epoch;" in source:
+        actual.append("static uint64_t split_bq_epoch;")
+    if "} AuxRing;" in source:
+        actual.append(next(line for line in source.splitlines() if line.startswith("#define MAX_EFFECTS")))
+        aux_start = source.rfind("typedef struct {", 0, source.index("} AuxRing;"))
+        actual.append(source[aux_start:source.index("static void aux_ring_reset(")])
+        actual.extend(helper.block(source, marker) for marker in (
+            "static void aux_ring_reset(", "static void aux_reset("))
     actual.extend([queue, helper.block(source, "static void apply("), helper.block(source, "static void submit("),
                    helper.block(source, "static void commit("), helper.block(runtime, "A64_WEAK void a64_unimplemented(")])
+    for marker in ("static void read_float_biquad(", "static void biquad_frame("):
+        if marker in source:
+            actual.append(helper.block(source, marker))
     actual.append(helper.block(source, "HLE(" + LEGACY + ")"))
     try:
         actual.append(helper.block(source, "HLE(" + FLOAT + ")"))
@@ -54,14 +70,14 @@ static void release_wb(Voice *voice, uint64_t buffer) { (void)voice; (void)buffe
         # An authored import dispatch for the absent HLE, using the real runtime fallback (not a replacement DSP/setter).
         actual.append('HLE(' + FLOAT + ') { static int seen; a64_unimplemented(c, "' + FLOAT + '", &seen); }')
     render = helper.block(source, "static void render_voice(")
-    loop = helper.block(render, "for (int f = 0; f < 2; f++)")
+    loop = helper.block(render, "for (int f = 0; f < 2; f++)", unique=False)   # (the first: the filter pass, as the old cutter took)
     actual.append("static void filter_samples(Voice *v, float out[MAX_CH][FRAME]) {\n" + loop + "\n}")
     flags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0
     with tempfile.TemporaryDirectory(prefix="audio-voice-biquad-") as temporary:
         folder = Path(temporary)
         (folder / "actual_audio_biquad.inc").write_text("\n\n".join(actual), encoding="utf-8")
         executable = folder / "fixture.exe"
-        command = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-I" + str(folder),
+        command = [args.cc, "-std=c11", "-include", ENV_ON_H, "-O2", "-Wall", "-Wextra", "-Werror", "-I" + str(folder),
                    str(ROOT / "tests/audio_voice_biquad_test.c"), "-lm", "-o", str(executable)]
         for command in (command, [str(executable)]):
             result = subprocess.run(command, creationflags=flags, capture_output=True, text=True,

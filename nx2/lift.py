@@ -1,5 +1,5 @@
 """The lift driver: image (we are rtld) -> function discovery -> C, on the vendored a64-kit plus the Switch 2
-additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables).
+additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables, suyu_rt_fixes: FPX1's binary32 FMA).
 
 Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-func N] [--layout eden|a64] [--aslr 0]
   --layout eden (default): Eglantine's addresses, rtld included, from 0x80000000 + --aslr (image.py; an emulator
@@ -18,6 +18,7 @@ Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-fu
 """
 import argparse
 import collections
+import glob
 import json
 import os
 import struct
@@ -31,6 +32,7 @@ import kit
 import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
+import suyu_rt_fixes
 import chunks
 import game_profile
 import standalone
@@ -45,6 +47,7 @@ import a64_rtgen
 
 insn.install()
 lift_fixes.install()
+suyu_rt_fixes.install()
 
 
 def module_of(img, pc):
@@ -114,6 +117,8 @@ def coverage(L, img, out_dir):
     return total
 
 
+
+
 def main():
     kit.wait_for_quiet('the lift')
     p = argparse.ArgumentParser()
@@ -136,6 +141,12 @@ def main():
     print("game profile: %s (%s)%s" % (profile.key, profile.game, "" if profile.main_base is not None else
                                        ", no main base: its patches are off"))
     t0 = time.time()
+    last = [t0]
+
+    def took(what):   # (each step's seconds, and the time since the start: where a lift's minutes go)
+        now = time.time()
+        print("lift: %s in %.1fs (%.0fs)" % (what, now - last[0], now - t0), flush=True)
+        last[0] = now
     hle = ()
     if a.standalone:
         hle, stubbed = standalone.hle_set(nso.load_exefs(a.exefs))
@@ -163,15 +174,18 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
+    main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
     if a.standalone:
         # (hookshot) The game profile's patches: C after a few of the game's instructions, at addresses that are one
         # build of one game's. Which modules those are comes from nx2/game_profile.py and not from imports here,
         # because this driver is the same for every game the recompiler is pointed at; the profile's order matters
-        # (Ocarina's camera publish appends to the site its widescreen patch writes first).
-        game_profile.install_patches(L, img, profile)
+        # (for Ocarina: widescreen, the gameplay lens, the upscalers' camera jitter, Occlusion Off).
+        game_profile.install_patches(L, img, profile, build_id=main_build)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
+    last[0] = time.time()
     total = coverage(L, img, img_dir)
+    took("coverage")
     jt = L.stats
     print("jump tables %d (bounded %d, bounded by function %d, ADR table %d), BR without a table %d, PLT stubs %d" % (
         len(L.jt), jt["jt_bounded"], jt["jt_unbounded"], jt["jt_adr_table"], len(L.jt_missing), len(L.plt)))
@@ -186,19 +200,29 @@ def main():
             poll.install()
         gen = os.path.join(out_dir, "gen")
         files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
-                             counters=[] if a.no_polls else [poll.stats])
-        game_profile.apply_code_patches(
-            gen, profile, standalone=a.standalone,
-            main_build=next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), ""))
-        a64_rtgen.write(gen)
-        if a.standalone:
-            start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)
-            print("standalone: hos_image.c (thread hooks %#x, %#x), %d import stubs" % (
-                start, exit_, standalone.gen_stubs(gen, meta)))
-            nvn = standalone.nvn_exports(nso.load_exefs(a.exefs))
-            standalone.write_nvn_exports(gen, nvn)
-            print("standalone: nvn2_exports.c (%d sdk NVN functions routed to host/nvn2.c)" % len(nvn))
+                             counters=[] if a.no_polls else [poll.stats], took=took)
+        # (the game's edits of the lifted C: which module, and whether the image is the one build its gated edits are
+        # for, come from the game profile; nx2/game_profile.py code_patches)
+        patches, supported = game_profile.code_patches(profile, main_build=main_build, standalone=a.standalone)
+        def tables():   # (the runtime tables and the standalone files: they read the image, not the lifted C)
+            lines = []
+            a64_rtgen.write(gen)
+            if a.standalone:
+                start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)
+                lines.append("standalone: hos_image.c (thread hooks %#x, %#x), %d import stubs" % (
+                    start, exit_, standalone.gen_stubs(gen, meta)))
+                nvn = standalone.nvn_exports(nso.load_exefs(a.exefs))
+                standalone.write_nvn_exports(gen, nvn)
+                lines.append("standalone: nvn2_exports.c (%d sdk NVN functions routed to host/nvn2.c)" % len(nvn))
+            return lines
+        # (made in a process of their own while the C is edited: 4-8 s that waited for the edits. Where there is no fork, after them)
+        side = chunks.start_side(tables)
+        chunks.edit_c(gen, L.stats, supported, whole=not a.max_func, took=took, patches=patches)
+        print("\n".join(chunks.end_side(side, tables)), flush=True)
+        took("runtime tables and standalone files (beside the edits)" if side else "runtime tables and standalone files")
         L.report()
+        if L.stats["entry_gotos"]:   # (nx2/lift_fixes.py, 4)
+            print("functions with code below their entry, started at it by a goto: %d" % L.stats["entry_gotos"])
         print("interrupt polls: %d loop headers in %d functions" % (poll.stats["polls"], poll.stats["functions"]))
         print("wrote %d code files to %s (%.0fs)" % (len(files), gen, time.time() - t0))
     print("done (%.0fs)" % (time.time() - t0))

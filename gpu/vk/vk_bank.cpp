@@ -16,6 +16,9 @@
 
 #include "vk_internal.h"
 #include "vk_state.h"
+#ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
+#include "hookshot_env.h"
+#endif
 
 namespace mkwvk {
 // (hookshot) the seed's compute programs (vk_shader.cpp seed_program) have no bound program to read their layout from. Translated
@@ -41,6 +44,10 @@ std::atomic<uint64_t> samp_gen{1};  // (bumped when a sampler registration's con
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
+// (hookshot, RX_VK_SAMPLER_CACHE: the same for sampler ids, so what a sampler id resolves to can be cached and checked
+// without taking reg_mu, and descriptor reuse can tell that a sampler was registered anew)
+constexpr int kSampVersions = 1 << 12;
+std::unique_ptr<std::atomic<uint32_t>[]> samp_versions{new std::atomic<uint32_t>[kSampVersions]()};
 
 // NVN2 compute's c0: the workgroup counts at 0, then the uniform buffer table, the storage buffer table, texture
 // handles and image handles, as many slots of each as the control section says (+0xb1, +0xb2, +0xb3, +0xb6)
@@ -77,7 +84,7 @@ CsLayout cs_layout(const NvnState& s) {
         host->gpu_read(s.prog.sd[i].control + 0x56, &st, 2);
         if (magic != 0x98761234 || st != 5) continue;
         l = cs_layout_of(c);
-        static const bool log_cs = getenv("RX_VK_LOG_CS") != nullptr;   // (hookshot) the control bytes 0xb0..0xbf
+        static const bool log_cs = env_on("RX_VK_LOG_CS");   // (hookshot) the control bytes 0xb0..0xbf
         if (log_cs) {
             char hex[700];
             int k = 0;
@@ -121,9 +128,10 @@ const void* descriptor_ok(const void* p, size_t n) {
     if (!p) return nullptr;
     const uintptr_t q = (uintptr_t)p, base = (uintptr_t)host->guest_base();
     if (q >= base && q + n <= base + host->guest_size()) return p;
-    uint64_t avail = 0;
-    if (const uint8_t* h = host->gpu_ptr((uint64_t)q, &avail); h && avail >= n) return h;
-    // (the host's own copies: registrations made before the renderer started, kept by host/rx_backend.c)
+    // (the host's own copies: registrations made before the renderer started, kept by host/rx_backend.c. A registration's
+    // pointer is a host pointer, never a GPU address: asked as one (host->gpu_ptr), a heap address between 16 MB and 512 GB,
+    // as Windows gives them, named guest memory, and the registration was copied from there, all zero: the game's sampler
+    // 258 filtered nearest and texture slot 0x102 had no image, issue 1117's blocky halos)
     MEMORY_BASIC_INFORMATION mi{};
     if (VirtualQuery(p, &mi, sizeof mi) == sizeof mi && mi.State == MEM_COMMIT &&
         (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY)) && !(mi.Protect & PAGE_GUARD) &&
@@ -197,9 +205,16 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
     if (!same) samp_gen.fetch_add(1, std::memory_order_acq_rel);
+    samp_versions[id].fetch_add(1, std::memory_order_acq_rel);   // (hookshot: caches of what an id resolves to check this)
+}
+uint32_t sampler_slot_version(int id) {
+    return id >= 0 && id < kSampVersions ? samp_versions[id].load(std::memory_order_acquire) : 0;
 }
 uint64_t sampler_registrations_generation() {
     return samp_gen.load(std::memory_order_acquire);
+}
+void samplers_changed() {
+    samp_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);

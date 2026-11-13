@@ -1,0 +1,21 @@
+// (hookshot fork) Neural rendering's Resolution scale (gpu/vk/vk_nr_scale.cpp): the model worked on a smaller copy of the
+// frame; its detail -- its picture less that copy, both stretched back to the frame's size -- is added to the frame as it
+// was. Where the model changed nothing the frame comes out as it went in, at its own sharpness.
+// The header beside this file is made from it: python -I scripts/opennr_kernels.py (tests/test_opennr_kernels.py checks).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D frame;       // the frame, full size
+layout(set = 0, binding = 1) uniform sampler2D small_frame; // the frame as the model was given it
+layout(set = 0, binding = 2) uniform sampler2D small_model; // the model's picture of it
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D result;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(result);
+    if (p.x >= size.x || p.y >= size.y) return;
+    const vec2 uv = (vec2(p) + 0.5) / vec2(size);
+    const vec3 detail = textureLod(small_model, uv, 0.0).rgb - textureLod(small_frame, uv, 0.0).rgb;
+    imageStore(result, p, vec4(clamp(texelFetch(frame, p, 0).rgb + detail, 0.0, 1.0), 1.0));
+}

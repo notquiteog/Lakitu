@@ -1,6 +1,15 @@
-# The Vulkan back end (mkw_vk.dll)
+# The Vulkan back end (hookshot_vk.dll)
 
-`RX_BACKEND=vulkan` renders through `mkw_vk.dll` instead of the WebGPU renderer in the executable
+> This is the back end's development log from mkw-recomp, kept for its reasons and not updated since. Names and
+> defaults have moved: the DLL is `hookshot_vk.dll` (`hookshot_vk.so` on Linux) and the default renderer, with
+> `RX_BACKEND` only to pick another; the image and upload code of `vk_image.cpp` and `vk_upload.cpp` is in
+> `vk_texture.cpp`; a draw whose pipeline is not ready waits with `RX_VK_PIPE_SKIP=0` (there is no `RX_VK_PIPE_WAIT`);
+> `RX_VK_DUMP` takes a present number and writes PNGs; `RX_VK_FRAMEGEN` only turns frame generation off (the Insert
+> menu turns it on); the texture budget `RX_VK_VRAM_MB` defaults to 70% of what the driver allows (at most 6 GB),
+> `RX_VK_TEX_MAX_MB` to 1536 and `RX_VK_MIRROR_MB` to a share of the card; and `eden/` carries Hookshot's changes.
+> The current switches are in [docs/development.md](../../docs/development.md#switches-for-testing-and-debugging).
+
+The game renders through `hookshot_vk.dll` (`RX_BACKEND` unset or `vulkan`) instead of the WebGPU renderer in the executable
 (`gpu/render`). `host/rx_backend.c` owns the `rx_*` names the host calls. It loads the DLL, passes it the host
 functions (`vk_api.h` `MkwVkHost`) and routes the calls to the table the DLL returns (`MkwVkRenderer`). If the DLL
 or Vulkan is missing, the WebGPU renderer stays in place.
@@ -59,9 +68,8 @@ for TOTK: pools imported as host memory, a recorder thread, graphics pipeline li
 
 ## Status (Nov 2026): it renders
 
-The replay draws, dispatches, clears, copies and presents. A frame dumped with
-`RX_VK_DUMP=<file.ppm> RX_VK_DUMP_AT=<present>` is the game's map screen, right way up and in colour, with its
-textures crisp (compare `RX_VK_DUMP_TEX=<dir>`, which writes the decoded textures themselves).
+The replay draws, dispatches, clears, copies and presents. A frame dumped with `RX_VK_DUMP=<present>` is the game's
+map screen, right way up and in colour, with its textures crisp.
 
 What it took, in the order it blocked a picture:
 
@@ -78,8 +86,8 @@ What it took, in the order it blocked a picture:
   NVIDIA's gap), and MKW's map, terrain and character art are ASTC, so every one is decoded on upload. The first
   version hand-rolled the block-linear unswizzle and used totk-pc-recomp's decoder: the result had the right colours
   in the right places but every detail shredded into block-sized noise (text unreadable, a dither lattice over flat
-  areas). Dumping a decoded texture (`RX_VK_DUMP_TEX=<dir>`) showed the corruption was already there, before any
-  draw. The fix is to stop guessing: `gpu/vk/vk_upload.cpp` now calls suyu's own `Tegra::Texture::UnswizzleTexture`
+  areas). Dumping a decoded texture (a switch of the time, since removed) showed the corruption was already there, before
+  any draw. The fix is to stop guessing: `gpu/vk/vk_upload.cpp` now calls suyu's own `Tegra::Texture::UnswizzleTexture`
   and `Tegra::Texture::ASTC::DecompressSerial` (`gpu/third_party/suyu/video_core/textures/`), the exact pair the
   working WebGPU back end decodes with in rx_texture.cpp. Those two files are built into `mkw_vk.dll` now
   (nx2/build.py `vk_sources()`, with suyu's root on the include path). The dumped map texture is pixel-crisp

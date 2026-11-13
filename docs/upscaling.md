@@ -1,8 +1,73 @@
 # Upscaling and frame generation
 
-This is a plan, not a description of what the renderer does today. It names the integration point,
-the input contract, the licensing rules each vendor runtime imposes, and the order the work can land
-in. Nothing here is implemented yet; each section below is one pull request.
+Most of this file is the record of how the upscalers got here: the plan it started as, and the corrections the runs made
+to it. What the renderer does today is the section right below; where an older section disagrees with it, the older
+section is history and says so.
+
+## How it is wired now
+
+Since the merge of upstream 2.1 (and the commits after it up to its DLSS Frame Generation, NotRexed/Hookshot#2118), the
+upscalers and NVIDIA's frame generation are upstream's code, unchanged; what this fork keeps is beside them, not in place
+of them.
+
+**Upscalers: upstream's temporal chain** (`gpu/vk/vk_temporal.cpp`). One chain makes the scene's colour, depth, motion
+(the camera's and the actors') and jitter, and hands them to an engine: NVIDIA DLSS and DLAA (`vk_dlss.cpp`), AMD FSR 4
+and its native AA through AMD's runtime (`vk_fsr4.cpp`, a build with `HOOKSHOT_FSR=1`), and AMD FSR 3.1
+(`vk_fsr3.cpp`, an engine of the chain since upstream's #2305, with the characters' motion). `vk_fsr3_inputs.cpp`'s own
+frame is still made for what is not on the chain: FSR 3.1's frame interpolation, AMD FSR 4's frame generation and the
+open neural rendering network's motion. This fork's own FSR 4 upscale through `vk_ffx.cpp`, its
+`fsr4_wanted()` switch, `scene_frame_inputs()`, `vk_camera_motion.cpp` and the `RX_VK_MRT_CENSUS` / `RX_VK_VP_HUNT`
+diagnostics are gone: where an older section below names them, it is history.
+
+**NVIDIA DLSS Frame Generation: upstream's** (`vk_dlss.cpp`, `dlss_fg_inputs` / `dlss_fg_frames`), on the Frame
+generation by row's Auto, from the temporal chain's own depth, motion and camera, so it needs a temporal Upscaler (DLSS,
+DLAA or FSR). The fork's own `vk_dlssg.cpp` is gone. It differed from upstream's in ways that could only be settled in
+the game on an RTX 40/50, and upstream settled one of them against it: NGX's header says its motion vector scale
+normalizes to [-1, 1], and with 1 / render size DLSS-G saw no motion and cross-faded; with scale 1 (render pixels, as
+DLSS itself takes them) the made frames moved. What was written from the headers alone was wrong; what was captured in
+the game is what ships.
+
+**What the fork adds to frame generation** (`framegen_methods.h`, `vk_framegen.cpp`): two more values on upstream's
+Frame generation by row (`opts.framegen_by`, saved under upstream's key, upstream's 0 Auto and 1 Built-in as they are):
+
+- **2, AMD FSR 4** (`vk_ffx.cpp`, Windows): AMD's frame generation through AMD's runtime, given the presented picture,
+  the scene's depth and motion (`vk_fsr3_inputs.h Frame`: the depth reversed, the motion in render pixels) and the camera
+  in the world (`camera_vectors.h`). One made frame a set unless `RX_VK_FFX_FG_MAX` says more.
+- **3, AMD FSR 3.1** (`vk_fsr3fi.cpp`): upstream's frame interpolation, which upstream keeps behind `RX_VK_FSR_FG=1`;
+  the row's value is that switch made in the menu. Its interpolation has no phase (AMD's `ffx_frameinterpolation.h` fixes
+  t at 0.5), so it makes 2x sets only.
+
+Neither is Auto's: both are given the picture with the HUD in it (there is no copy from before the HUD), and upstream
+measured FSR 3.1's smearing it (its #1635). The order at a present is upstream's with one line added: DLSS-G
+(`dlss_fg_frames`, Auto), FSR 3.1's midpoint (`fsr3fi::frames_wanted`), FSR 4's set (`ffx_set_wanted`), then the
+renderer's own interpolation for anything not made. A set is never half-made by a vendor method
+(`framegen_methods::makes_set`), and an older options file's `frame_generation_method` is read once into the new row
+(`from_old`).
+
+**Neural rendering and frame generation.** DLSS 5 neural rendering (`nr::apply`, docs/neural-rendering.md) runs once for
+each of the game's frames, in the recording after the present's own and before frame generation's, so the made frames are
+made from the model's picture. It used to run in `present_image`, which the display thread calls for every frame shown:
+with frame generation on, the model then ran on each made frame too. It is left out while the picture is the game's own
+HDR10 (HDR at Native): the model's working copy is eight-bit SDR.
+
+**What was run in the game** (2026-11-11, the merged tree built whole, Kokiri Forest from a save, an RTX 5060 Ti on
+Linux with driver 615.71.09, driven through the control bridge, docs/control.md): the game's own upscale, NVIDIA DLSS
+(1536x864 to 2048x1152), DLAA, AMD FSR 3.1 and Off each drew the scene; NVIDIA DLSS Frame Generation made 600 of 600
+sets at 2x and 3x and 598 of 600 at 4x (NGX offers up to 5 made frames on this card), and a captured made frame is a
+single-edged picture with the HUD intact; Built-in let DLSS-G's feature go and made the sets itself; the row's AMD FSR
+3.1 made 600 of 600 midpoints with DLSS as the Upscaler, and with FSR 3.1 as the Upscaler once upstream had put it on
+the temporal chain (its #2305), where DLSS Frame Generation made 600 of 600 sets from FSR 3.1's inputs too; and the open
+neural rendering network ran before DLSS Frame Generation at 2x and 3x (599 and 600 of 600 sets) at its Resolution
+scale's 50%. Not run: anything Windows-only (AMD FSR 4's
+upscaler and frame generation, Streamline) and NVIDIA's neural rendering model, which has no Linux runtime; those
+files are compiled for Windows (clang, `--target=x86_64-w64-mingw32`, syntax only) and no more than that here. One
+thing to know from the runs: with V-Sync at Auto, DLSS Frame Generation presents FIFO, and on Wayland a window that
+is covered by another is then held to about one frame a second by the compositor until it is shown again.
+
+**The recorder.** Every backend here that hands the command buffer to someone else's code (NGX for neural rendering,
+`vk_ngx.cpp`; AMD's `ffxDispatch`, `vk_ffx.cpp`; Streamline, `vk_dlssnr.cpp`; OpenDLSS-NR's network, `vk_opennr.cpp`)
+includes `vk_work.h` and puts `rec::boundary(B_DIRECT)` right before the call and `note_work()` after it;
+`tests/test_recorder_sync.py` checks each one, with a control that removes the boundary.
 
 ## What exists today
 
@@ -12,7 +77,7 @@ in. Nothing here is implemented yet; each section below is one pull request.
 | `upscale` | `gpu/vk/vk_menu.h`, `framegen_scale` | A spatial filter on the finished window image: off, Catmull-Rom, Lanczos |
 | Frame generation | `gpu/vk/vk_framegen.cpp` | Image-space interpolation: quarter-size luma, 16x16 block matching within +-32 px, a 3x3 median, then a forward/backward blend per made frame |
 | The game's own upscaler | `taau_stand_in`, `gpu/vk/vk_draw.cpp` | OoT evaluates a neural TAAU network (program `fd029a317a9a4b94`, which the `oot` game profile names: the keys come from `nx2/game_profile.py` through `game/game_profile.h`, and a profile that names none leaves every program ordinary). Where the device has no hardware f16 matrix multiply (or with `RX_VK_NO_F16`), a compute stand-in replaces it, because the translated network loses the blue channel and casts the scene yellow; elsewhere the network itself runs. `RX_VK_TAAU_KEYS` overrides either way |
-| The per-network log | `gpu/vk/vk_draw.cpp`, `gpu/vk/upscale_contract.h` | Once per network key: its dispatch size, its sampled textures, what each one is in the input contract below, and whether a temporal upscaler could stand in |
+| The per-network log | `gpu/vk/vk_draw.cpp` | Once per network key: its dispatch size and its sampled textures |
 
 Two consequences follow from that table, and they decide the whole design.
 
@@ -99,6 +164,10 @@ ordered replay, never from live guest memory.
 
 ## The camera, read out of the game rather than guessed
 
+> **Superseded.** The hook this section describes is gone. It published sead's projection object (near 1.0, far 20000),
+> which is not the projection the scene is drawn with: that one, read from the camera's uniform buffer, has the near
+> plane at 0.1 and the far plane at 1000.5 (`p22 -1.0002, p23 -0.20002`). See "How it is wired now" above.
+
 FSR's `device_to_view_depth` and `tan_half_fov` want the near plane and the vertical field of view,
 and camera-derived motion wants the view-projection. Both are available: sead's perspective
 projection object carries them, and its matrix update is already a patch site (`nx2/oot_wide.py`,
@@ -162,6 +231,9 @@ data camera-derived motion needs.
 
 ## The input contract
 
+> **History.** `upscale_contract.h`, `upscale_format.h` and their test are gone: the inputs are made in one place now
+> (`vk_fsr3_inputs.cpp`), not classified out of the dispatch's bindings.
+
 A temporal upscaler needs the network's own inputs, and it must only run when they are all present and
 of the expected shape:
 
@@ -192,7 +264,9 @@ inputs it has guessed produces ghosting that looks like a renderer bug and is re
 
 ## The seam
 
-`gpu/vk/upscale_seam.h` is where a backend is chosen. The renderer resolves a recognized dispatch once into an
+> **History.** `upscale_seam.h` is gone with the contract; FSR takes the dispatch the way DLSS does (`fsr3_stand_in`).
+
+`gpu/vk/upscale_seam.h` was where a backend was chosen. The renderer resolves a recognized dispatch once into an
 `upscale::Request` — what the sampled bindings provide, the image the dispatch writes, and which binding the renderer
 is going to hand over as colour — and `choose()` says which backend takes it. A backend never re-derives the dispatch
 for itself.
@@ -374,10 +448,10 @@ looking at:
    the shader's idea of the flow extent equal the image it is given. Where the display size is not
    a multiple of 8 the shader's integer divide floors while we allocate the ceiling, so it addresses
    inside the image rather than past it, which is the safe direction.
-2. **A count above one repeats a frame.** FSR 3.1 interpolates the midpoint and only the midpoint --
-   no phase in its constants, and its own header writes `t = 0.5` outright -- so `RX_VK_FSR_FG=2`
-   copies the one made frame rather than making two. DLSS's `MultiFrameCount` is the only route to
-   more than one real made frame.
+2. **A count above one repeated a frame.** FSR 3.1 interpolates the midpoint and only the midpoint --
+   no phase in its constants, and its own header writes `t = 0.5` outright -- so a 3x set copied the
+   one made frame rather than making two, and showed one picture at two times. It makes 2x sets only
+   now (`framegen_methods::makes_set`), and `RX_VK_FSR_FG` is 0 (never) or 1 (over the row).
 3. **A reset frame reports failure** although the chain is recorded, so the caller's own
    interpolation takes it rather than a blend against a black previous source. The SDK returns OK
    there; this is a deliberate difference.
@@ -391,6 +465,9 @@ looking at:
    the SDK's leftovers. Each is commented where it is.
 
 ## The jitter, and why the renderer supplies it
+
+> **Superseded.** The viewport jitter below is gone. #841's jitter (`nx2/oot_jitter.py`) offsets the projection where the
+> game writes it, for every view of the picture's ratio, and costs nothing per draw; DLSS and both FSRs use it.
 
 Neither upscaler had one, and there is none to extract. `capture_view_projection` refuses any
 projection whose m02 is not exactly zero, and it finds one -- so the matrix the game hands its own
@@ -412,6 +489,9 @@ upscaler still on, which is the comparison worth having; the sign convention is 
 first if the image looks wrong, because a wrong sign there is soft or shimmering rather than broken.
 
 ## The settings a player actually sees
+
+> **History.** The rows are the Upscaler (the game's own, DLSS, DLAA, FSR 3.1, FSR 4: `upscaler_rows.h`), Frame
+> generation and the Frame generation method (`framegen_methods.h`) now; the Window scaling filter is a row of its own.
 
 None of this has a switch of its own in the menu. It is the two rows that were already there, which
 is the point: a player asking "what makes the picture bigger" should find one answer, not a filter
@@ -472,20 +552,48 @@ AMD card.
 
 ## FSR 3 and FSR 4 are two backends, not two versions
 
-FSR 4 is not source-available: it ships as prebuilt signed libraries inside AMD's SDK releases, so it cannot come out
-of `third_party/fidelityfx-sdk/`. It is reached by loading AMD's runtime (`amd_fidelityfx_loader_vk.dll` and
-`amd_fidelityfx_upscaler_vk.dll`, which the user supplies) and asking it for a provider. That makes FSR 4 a *second
-backend* behind the same seam, not an upgrade of the first:
+FSR 4 is not source-available: it ships as prebuilt libraries signed by AMD (`amd_fidelityfx_loader_vk.dll`,
+`amd_fidelityfx_upscaler_vk.dll`, `amd_fidelityfx_framegeneration_vk.dll`, MIT-licensed in FSR SDK 2.4), so it cannot
+come out of `third_party/fidelityfx-sdk/`. `gpu/vk/vk_ffx.h` is the second backend, behind the same seam:
 
-- **FSR 3.1, from the SDK sources here.** No runtime, no downloads, every vendor and both platforms. This is the one
-  that can be a default.
-- **FSR 4, through AMD's runtime.** AMD hardware, where the installed runtime exposes a provider; it must not
-  silently become FSR 3 or FSR 2, because then nobody can tell which ran.
+- **FSR 3.1, from the SDK sources here** (`vk_fsr3.cpp`). No runtime, every vendor and both platforms.
+- **FSR 4, through AMD's runtime** (`vk_ffx.cpp`). Windows only, because the runtime is Windows DLLs. It is compiled
+  against AMD's FSR API headers (`third_party/ffx-api/`, MIT) and loads the loader from beside the game at run time:
+  nothing is linked, and a PC without the DLLs runs exactly as before. The Windows release puts the DLLs there
+  (`windows-builder.yml` packages them as the `amd-fsr` part, `nx2/make_game.py place_prebuilt_runtime`).
 
-The API that reaches FSR 4 is the FSR 3.1 API, which AMD kept stable for exactly this, so integrating 3.1 properly is
-the path to 4 rather than a detour away from it.
+The runtime chooses the provider (`ffxQuery` `GET_VERSIONS` lists them, newest first, and the log prints the list): FSR 4
+on an RX 9000 and the cards SDK 2.4 added, its own FSR 3.1 elsewhere. That is AMD's choice and the log says which was
+made, so "FSR 4" in the menu on an NVIDIA card is honestly "what AMD's runtime runs on this card".
+
+Three things the integration depends on, each from AMD's own sources rather than guessed:
+
+- **Resource states.** Every image here lives in `VK_IMAGE_LAYOUT_GENERAL`, and AMD's Vulkan backend maps API states to
+  layouts (`backend/vk/ffx_vk.cpp getVKImageLayoutFromResourceState`): only `COMMON`, `GENERIC_READ` and
+  `UNORDERED_ACCESS` are `GENERAL` there. `COMPUTE_READ` -- the obvious choice for an input -- is
+  `SHADER_READ_ONLY_OPTIMAL`, and would have the runtime transition from a layout the image is not in. So inputs are
+  `GENERIC_READ` and outputs `UNORDERED_ACCESS`.
+- **The inputs are FSR 3.1's** (`vk_fsr3_inputs.h` `Frame`). Jitter and motion in render pixels with a scale of 1, the
+  depth reversed (`DEPTH_INVERTED`) with the scene's finite far plane (`DEPTH_INFINITE` only for an infinite projection:
+  it used to be set always, for a depth that was neither reversed nor infinite), the colour as FSR 3.1's passes take it
+  with automatic exposure, and the picture squared back by the same pass. The two backends are given the same picture.
+- **Frame generation is dispatched by hand.** AMD's frame generation is built around replacing the application's
+  swapchain with AMD's own, which paces the presents. Hookshot presents and paces its own made frames
+  (`vk_framegen.cpp`), so it configures the context with no swapchain and dispatches `PrepareV2` and the generation
+  itself, into its own images on its own command buffer -- the manual path AMD's documentation describes and
+  discourages. It sits after DLSS frame generation and before FSR 3.1's in the chain, so a refusal costs nothing.
+
+**Not measured.** There is no AMD GPU and no Windows on the machine this was written on. Both paths compile for Windows
+and their refusals are logged with the API's result code; the first run on an RX 9000 is the first real test.
+`RX_VK_FFX_LOG=1` routes AMD's own messages to the log, `RX_VK_FFX_DEBUG=1` turns on its debug checking (2 also draws
+frame generation's debug view), `RX_VK_FFX_FG=0` turns its frame generation off and `RX_VK_FFX_FG_MAX` caps the frames it
+is asked for.
 
 ## Frame generation, honestly
+
+> History. The DLSS frame generation backend this section describes (`gpu/vk/vk_dlssg.h`, `RX_VK_DLSSG`) was this fork's
+> own and is gone: NVIDIA DLSS Frame Generation is upstream's now (`vk_dlss.cpp`, the Frame generation by row's Auto,
+> `RX_VK_DLSS_FG`). "How it is wired now" at the top has what runs today.
 
 The existing interpolator shows made frames about one frame behind the game, and skips interpolation
 across hitches over 100 ms. Real motion and depth improve what it makes, but they do not change
@@ -524,8 +632,13 @@ refuses, or makes fewer frames than were asked for, the interpolation runs exact
 set is never shown half made. `RX_VK_DLSSG=<1-3>` asks for it and says how many frames to make;
 without it nothing is loaded and nothing is logged.
 
+> **Changed.** Its inputs are FSR 3.1's now (`vk_fsr3_inputs.h`), taken once a present: the reversed depth copy (so
+> `DepthInverted` is true of what it is given; before, it was set for the scene's own depth, which is not reversed), the
+> motion without the jitter, and the matrices and planes of the projection the scene is drawn with. The paragraph below
+> is how it was.
+
 The inputs it needs that colour interpolation does not -- the scene's depth, and the matrix its
-draws used -- are kept by the draw path and read back through `scene_frame_inputs()`, because frame
+draws used -- were kept by the draw path and read back through `scene_frame_inputs()`, because frame
 generation is recorded at present time where neither is otherwise in reach. The motion is the same
 camera-only reprojection the upscalers use, and asking for it twice in one frame is answered with
 the one already written: recording it again would reproject through the matrix the first recording
@@ -582,7 +695,6 @@ Two switches, both off by default, both neutral while off:
 | | |
 |---|---|
 | `RX_VK_DLSSG=<1-3>` | asks for DLSS frame generation and says how many frames to make between two of the game's. Without it nothing is loaded, nothing is looked at and nothing is logged; the renderer's own interpolation is unaffected either way |
-| `RX_VK_FSR_STAGE=<0-3>` | diagnostics, and wrong output on purpose above 0: how far down the upscale path a run goes. 1 stops before the backend, 2 records every barrier, clear and descriptor but none of the nine dispatches, 3 keeps the dispatches and drops the blit into the game's target. It exists because three hypotheses about a frame-rate cost were each disproved by a measurement that a stage switch would have given in one run |
 | `RX_VK_DLSS=1` | asks for the backend at run time. Without it nothing is loaded, nothing is looked at and nothing is logged |
 | `RX_VK_DLSS_SDK` | a **build-time** gate. Off, the NGX half of the backend is not compiled and `supported()` is false. On, the build needs an NGX SDK's `include/` on the include path |
 
@@ -600,8 +712,13 @@ The SDK ships three Linux feature libraries and only two of them have a job in t
   invented inputs would be a worse picture dressed up as a feature. It is not wired, and the reason
   is the game, not the plumbing.
 
-So "neural rendering" in this project means the super-resolution network and the frame-generation
-network, and on AMD it will mean FSR 4's upscaling network for the same reason.
+That paragraph is right about ray reconstruction and was wrong about everything it was then used to
+conclude. **"Neural rendering" is also the name of a different NVIDIA feature, and that one does run
+here**: DLSS 5 neural rendering (`kFeatureDLSS_NR`, NVIDIA's *3D-Guided Neural Rendering*) is an
+uplift pass over a finished image -- `kBufferTypeUpliftInputColor` in, `kBufferTypeUpliftOutputColor`
+out -- not a denoiser, and it needs no G-buffer. It is implemented and in the menu's Neural tab;
+[neural-rendering.md](neural-rendering.md) has it, including the three times this project refused it
+on the strength of the paragraph above.
 
 ### How NGX is actually reached on Linux
 

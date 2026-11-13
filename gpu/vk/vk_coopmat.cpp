@@ -18,6 +18,9 @@
 #include "vk_internal.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include <sirit/sirit.h>
+#ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
+#include "hookshot_env.h"
+#endif
 
 namespace mkwvk {
 namespace {
@@ -132,7 +135,12 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
     }
     vkBindBufferMemory(dev.device, buffer, memory, 0);
     uint32_t* words = nullptr;
-    vkMapMemory(dev.device, memory, 0, size, 0, (void**)&words);
+    if (vkMapMemory(dev.device, memory, 0, size, 0, (void**)&words) != VK_SUCCESS || !words) {
+        logf("vk: cooperative matrix test: the buffer could not be mapped");
+        vkDestroyBuffer(dev.device, buffer, nullptr);
+        vkFreeMemory(dev.device, memory, nullptr);
+        return false;
+    }
     std::memcpy(words, data.data(), size);
 
     VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -195,15 +203,19 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
         vkEndCommandBuffer(cmd);
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence{};
-        vkCreateFence(dev.device, &fci, nullptr, &fence);
+        if (vkCreateFence(dev.device, &fci, nullptr, &fence) != VK_SUCCESS) fence = VK_NULL_HANDLE;   // (no fence: not submitted, so all is freed below)
         VkCommandBufferSubmitInfo csi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
         csi.commandBuffer = cmd;
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &csi;
-        ok = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS &&
-             vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+        const bool submitted = fence && vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+        ok = submitted && vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
         if (ok) std::memcpy(data.data(), words, size);
         else logf("vk: cooperative matrix test: the dispatch did not complete");
+        if (submitted && !ok) {   // (it may still be running: what it uses is left alive rather than destroyed under it)
+            if (module) vkDestroyShaderModule(dev.device, module, nullptr);
+            return false;
+        }
         vkDestroyFence(dev.device, fence, nullptr);
         vkDestroyCommandPool(dev.device, cmd_pool, nullptr);
         vkDestroyDescriptorPool(dev.device, pool, nullptr);
@@ -340,15 +352,33 @@ void software_multiplies(const char* why) {
     dev.native_mma = true;
     logf("vk: matrix multiplies in software (%s)", why);
 }
+/// (hookshot, mma_layout.h global_table_loop) Intel's Mesa driver only for now (Mesa inlines DontInline; Windows not tried); env is
+/// RX_VK_GM_LOOP, 0 or 1 over the default. A table indexed by the loop's counter needs dynamic indexing of storage buffer arrays
+/// (tests/test_global_table_loop.py)
+bool table_loop_wanted(VkDriverId driver, bool dynamic_indexing, const char* env) {
+    return (env ? !env_value_off(env) : driver == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) && dynamic_indexing;
+}
 } // namespace
 
 void coopmat_init() {
     // (amd-fix) NaN guard on float colour outputs (mma_layout.h frag_nan_guard), on every card since v2.0.6 as NX2navi's patch 0027
-    // has it: the neon plants were reported on NVIDIA cards too, and one NaN texel spreads through bloom and blur
-    Shader::Backend::SPIRV::frag_nan_guard = !std::getenv("RX_VK_NO_NAN_GUARD");
+    // has it: the neon plants were reported on NVIDIA cards too, and one NaN texel spreads through bloom and blur. RX_VK_NAN_GUARD=0:
+    // off, with vk_shader.cpp's GuardFragmentOutputs (one switch for both guards; it replaces RX_VK_NO_NAN_GUARD)
+    {
+        const char* e = std::getenv("RX_VK_NAN_GUARD");
+        Shader::Backend::SPIRV::frag_nan_guard = !e || std::atoi(e) != 0;
+    }
     if (Shader::Backend::SPIRV::frag_nan_guard) logf("vk: colour outputs NaN-guarded");
-    Shader::Backend::SPIRV::position_invariant = dev.props.vendorID != 0x10DE && !std::getenv("RX_VK_NO_INVARIANT");
+    Shader::Backend::SPIRV::position_invariant = dev.props.vendorID != 0x10DE && !env_on("RX_VK_NO_INVARIANT");
     if (Shader::Backend::SPIRV::position_invariant) logf("vk: positions invariant (not an NVIDIA card)");
+    Shader::Backend::SPIRV::global_table_loop = table_loop_wanted(dev.driver_id, dev.features.shaderStorageBufferArrayDynamicIndexing,
+                                                                  std::getenv("RX_VK_GM_LOOP"));
+    if (Shader::Backend::SPIRV::global_table_loop) logf("vk: storage buffer tables searched in loops (RX_VK_GM_LOOP=0: written out)");
+    // (hookshot) the translation's vendor fixes (vk_vendor.h, dev.fixes): out-of-bounds texel fetches answer 0, NaN tests on bits
+    Shader::Backend::SPIRV::fetch_bounds = dev.fixes.fetch_bounds;
+    // (dev.features.robustBufferAccess: on exactly when robustBufferAccess2 is, vk_main.cpp create_device)
+    Shader::Backend::SPIRV::fetch_bounds_buffers = dev.fixes.fetch_bounds && !dev.features.robustBufferAccess;
+    Shader::Backend::SPIRV::nan_bits = dev.fixes.nan_bits;
     // (hookshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
     // (emit_spirv_warp.cpp, from Lichii): the lowering still gives HMMA_nx2 (dev.native_mma)
     if (const char* sw = std::getenv("RX_VK_MMA_SOFTWARE"); sw && std::atoi(sw)) {
@@ -362,7 +392,7 @@ void coopmat_init() {
         logf("vk: native matrix multiplies off (RX_VK_NATIVE_MMA=0)");
         return;
     }
-    if (!dev.coop_matrix || !vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR || std::getenv("RX_VK_MMA_NO_COOP")) {
+    if (!dev.coop_matrix || !vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR || env_on("RX_VK_MMA_NO_COOP")) {
         software_multiplies("no cooperative matrices");
         return;
     }

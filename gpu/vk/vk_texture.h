@@ -26,6 +26,7 @@ struct Texture {
     VkImageType type = VK_IMAGE_TYPE_2D;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageUsageFlags usage = 0;
+    VkImageCreateFlags create_flags = 0;   // (hookshot: as its image was made, for the compaction's copy of it)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
@@ -36,14 +37,17 @@ struct Texture {
     std::vector<uint8_t> tail_bound;            // (per layer, or [0] with SINGLE_MIPTAIL: its mip tail has memory)
     std::vector<VkDeviceMemory> sparse_chunks;  // (the device memory blocks are taken from, 64 MB at a time)
     VkDeviceSize chunk_used = 0;
+    struct SparseFree { VkDeviceMemory memory; VkDeviceSize offset, size; };
+    std::vector<SparseFree> sparse_free;        // (taken for binds that failed: given out again before the chunks)
     VkSparseImageMemoryRequirements sparse_req{};
     uint32_t sparse_type = 0;
     VkDeviceSize sparse_align = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
-    bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
+    bool bc = false;          // (and kept as BC3 or BC7: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc_resized = false;  // (hookshot-amd: its BC image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
+    uint8_t bc1 = 0;          // (hookshot: of a BC3 image, 0 not decided yet, 1 kept BC3 (alpha seen), 2 BC1: every block opaque)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)
@@ -53,6 +57,7 @@ struct Texture {
     // contents
     bool uploaded = false;    // from guest memory, as of upload_gen
     uint32_t upload_gen = 0;
+    uint64_t retry_frame = 0;   // (hookshot) an image whose upload failed: tried again from this frame (vk_texture.cpp)
     uint64_t map_sig = 0;     // (a texture in a virtual pool: its pages' mapping when last uploaded)
     std::vector<uint64_t> page_map;   // (and each 64 KB page's guest address then: what a remap changed)
     struct Run { uint64_t off, guest, n; };   // (and its storage as runs of contiguous guest memory)
@@ -66,6 +71,9 @@ struct Texture {
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
+    uint64_t written_back_for = 0; // (the last_written its texels went into guest memory for: drawn_writeback.h)
+    bool writeback_noted = false;  // (in the list of textures waiting for that)
+    uint64_t written_back_hash = 0; // (its memory's hash after that write-back: still its own texels there, or the CPU's since)
     uint64_t verify_hash = 0;      // (RX_VK_VERIFY_DIM: its guest memory's hash when last uploaded)
     uint32_t checked_epoch = 0;
     uint64_t upload_value = 0;   // (the submission its last upload was recorded in, and the parallel replay's segment
@@ -80,7 +88,16 @@ struct Texture {
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
+    uint64_t pool_key = 0;    // (a render target's image: its create info's key in the pool it goes to when the texture does)
     std::unordered_map<uint64_t, VkImageView> views;
+    uint64_t view_failed_frame = 0;   // (transient allocation failure: retry uncached views next frame, keep cached ones usable)
+    struct BlockAttachment {
+        VkImage image;
+        VmaAllocation allocation;
+        VkFormat format;
+        uint32_t level;
+    };
+    std::vector<BlockAttachment> block_attachments;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident
@@ -133,14 +150,30 @@ int texture_segment_end(int index);
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)
 uint64_t texture_destroy_generation();
+// (hookshot, RX_VK_FRAME_TRACE: time no other column has; totals in ns, the trace takes their differences)
+int64_t texture_readback_wait_ns();   // (a read-back's submit and wait for the GPU: the write-backs before an eviction)
+int64_t texture_frame_ns();           // (texture_frame as a whole: each present's eviction, compaction and sweeps)
 /// The texture an NVN texture's storage is (made and uploaded at first use, uploaded again when the CPU wrote its
 /// storage since). null for formats and targets that have no image (buffers, unknown formats).
 Texture* texture_get(const nvn_tex* t, bool for_sampling);
 /// A view of it: the view's levels and layers (all when v is null), as view_type, in the view's format
 /// (attachment: one level, one layer; storage: one level, every layer, in a storage-capable format)
 enum class ViewUse { Sample, Attachment, Storage };
+struct TextureAttachment {
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImage blocks = VK_NULL_HANDLE;   // A separate attachment holding the encoded blocks of a 3D BC mip
+};
+TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_view* v);
+void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage blocks, uint32_t level, uint32_t slice,
+                           bool to_attachment);
 VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkImageViewType view_type, ViewUse use,
                          VkFormat* format_out = nullptr, VkFormat force_format = VK_FORMAT_UNDEFINED);
+/// (hookshot) The format rules texture_get and texture_view follow (vk_texture.cpp), shared with the pipeline state list
+VkFormat image_format_of(VkFormat vf, bool astc_decoded);
+VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn, ViewUse use, VkFormat force_format);
+/// The format a draw renders in on this device, into a texture of NVN format tex_nvn through a view of NVN format view_nvn
+VkFormat attachment_format(int tex_nvn, int view_nvn);
 /// The view format an NVN texture and view sample / render in
 int view_nvn_format(const nvn_tex* t, const nvn_view* v);
 /// The level and layer a view starts at (the texture's levels)
@@ -149,7 +182,7 @@ unsigned view_level(const nvn_view* v);
 unsigned image_level(const Texture* tex, unsigned level);
 unsigned view_layer(const nvn_view* v);
 /// The GPU wrote it (in the submission being recorded)
-void texture_written(Texture* tex);
+void texture_written(Texture* tex, const char* why = "?");   // (why: who wrote it, for the parallel replay's order warning)
 /// The GPU writes [gpu, gpu + size) in the submission being recorded (a storage buffer, a buffer copy): textures over
 /// it are uploaded again from guest memory once that submission is done
 void texture_gpu_wrote(uint64_t gpu, uint64_t size);
@@ -161,6 +194,8 @@ void texture_rendered(Texture* tex);
 uint64_t texture_frame_no();
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
 VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage);
+/// Release an imported buffer's views immediately before its completed destruction (memory.cpp).
+void release_texel_buffer_views(VkBuffer buffer);
 /// The texture whose image was rendered for the window (present): t's own, or one rendered at its storage
 Texture* texture_for_present(const nvn_tex* t);
 /// Ages the cache by one present; images nothing used for a while go, after the work that last read them
@@ -183,10 +218,27 @@ uint64_t texture_bytes();
 /// A full memory barrier (all commands, all accesses): what separates dependent work for now
 /// (why: its label in RX_VK_PASS_TIMING's barrier lines)
 void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
+/// (hookshot) RX_VK_GAME_ORDER: the game's own barriers order back-to-back passes and dispatches (on NVIDIA by default; vk_texture.cpp)
+bool game_order();
 /// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
 void barrier_stats(int64_t* made, int64_t* left_out);
+/// (hookshot) Set around a draw's sampled-texture lookups (vk_draw.cpp): a new ASTC texture there may wait for a later frame
+/// once this frame's uploads passed their budget (texture_touch). Never for compute: a dispatch may bake what it reads once
+extern thread_local bool upload_defer_ok;
+/// A draw pass just ended on cmd (end_pass): pass_start_barrier knows nothing else ran after it
+void note_pass_end(VkCommandBuffer cmd);
+/// The barrier a draw pass starts with. Full, unless RX_VK_PASS_BARRIER=game and the last thing on cmd was a draw pass with no
+/// barrier of the game's after it: then the new pass waits for the earlier work in its fragment stages only, so its vertex work
+/// may overlap the previous pass's fragments (NVN asks for a barrier before rendering results are read; only vertex-stage
+/// reads of the previous pass's output with no barrier from the game can change order)
+void pass_start_barrier(VkCommandBuffer cmd);
+/// Pass starts with the fragment-stage barrier, since the start
+int64_t pass_barriers_relaxed();
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
-/// RX_VK_DUMP_TEX: the textures uploaded next written to that folder as PPM (diagnostics)
+/// (hookshot) whether texture_read_texels' walk of r at that row stride (0: the region's own) and its own image stride
+/// stays within avail bytes of the data it is given (overflow-checked: the stride is the game's)
+bool texels_fit(const nvn_tex* t, const NVNcopyRegion* r, uint64_t row, uint64_t avail);
+/// ReadTexels / WriteTexels: the CPU's copy of a region of the texture in guest memory (vk_texture.cpp)
 void texture_read_texels(const nvn_tex* t, unsigned level, unsigned layer0, const NVNcopyRegion* r, uint8_t* dst,
                          uint64_t row, uint64_t img, bool write);
 
