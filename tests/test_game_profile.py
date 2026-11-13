@@ -236,6 +236,33 @@ def check_header_matches():
           "game/game_profile.h is not what nx2/game_profile.py emits: run python -I nx2/game_profile.py --emit-header")
 
 
+def check_build_uses_the_active_header():
+    """nx2/build.py compiles against the active profile's header: game/ for the committed one, otherwise that
+    profile's header written under the work folder. A HOOKSHOT_GAME=mkw build with the committed (oot) header would
+    put Ocarina's graphics-module offsets into a Mario Kart World runtime."""
+    import os
+    import tempfile
+    import build
+    saved = os.environ.get("HOOKSHOT_GAME")
+    try:
+        with tempfile.TemporaryDirectory(prefix="game-profile-") as work, contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("HOOKSHOT_GAME", None)
+            committed = game_profile.active()
+            check(build.active_game_dir(work) == build.GAME, "the default profile's build does not use game/")
+            other = next(k for k in game_profile.GAMES if k != committed.key)
+            os.environ["HOOKSHOT_GAME"] = other
+            folder = build.active_game_dir(work)
+            path = Path(folder) / "game_profile.h"
+            check(Path(folder) != Path(build.GAME) and path.is_file()
+                  and path.read_text(encoding="utf-8") == game_profile.emit_header(game_profile.GAMES[other]),
+                  "a HOOKSHOT_GAME=%s build does not compile against the %s profile's header" % (other, other))
+    finally:
+        if saved is None:
+            os.environ.pop("HOOKSHOT_GAME", None)
+        else:
+            os.environ["HOOKSHOT_GAME"] = saved
+
+
 def check_profiles_are_honest():
     """No profile holds a value it cannot have measured, and one with patch sites says which build it is for."""
     if not check(len(game_profile.GAMES) >= 2, "there is only one game profile, so the seam has nothing to prove"):
@@ -292,6 +319,7 @@ def main():
     check_no_main_base_patches_nothing()
     check_lift_names_no_game()
     check_header_matches()
+    check_build_uses_the_active_header()
     check_profiles_are_honest()
     check_c_reads_the_profile()
     if FAILURES:

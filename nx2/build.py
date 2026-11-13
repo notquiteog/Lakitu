@@ -56,6 +56,31 @@ HOST = os.path.join(kit.HERE, "..", "host")
 # and the renderer both read it, and neither has the other's include path, so it is its own folder on both.
 GAME = os.path.join(kit.HERE, "..", "game")
 
+
+def active_game_dir(work=None):
+    """The folder whose game_profile.h this build compiles against: game/ when the committed header is the active
+    profile's (HOOKSHOT_GAME, default oot), else the active profile's header written under the work folder
+    (work/game-<key>/). Without this a HOOKSHOT_GAME=mkw build compiled the runtime and the renderer with the
+    committed (oot) header: Ocarina's graphics-module offsets and shader keys in a Mario Kart World build, which is
+    the corruption the profile's unknown-is-off rule exists to prevent."""
+    import game_profile
+    text = game_profile.emit_header()
+    with open(os.path.join(GAME, "game_profile.h"), encoding="utf-8", newline="") as f:
+        if f.read() == text:
+            return GAME
+    folder = os.path.join(work if work is not None else kit.WORK, "game-" + game_profile.active().key)
+    path = os.path.join(folder, "game_profile.h")
+    os.makedirs(folder, exist_ok=True)
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            same = f.read() == text
+    except OSError:
+        same = False
+    if not same:   # (written only when it changes: its hash is the objects' dependency, game_profile_key)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    print("game profile: %s, its header %s" % (game_profile.active().key, path), flush=True)
+    return folder
 OPUS = os.path.join(kit.HERE, "..", "third_party", "opus")
 ZSTD = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
 ZSTD_HOST = ("prompts.c", "hos_zstd.c")   # (the host files that use it: a mod's size table; the game's stream decode)
@@ -1172,7 +1197,9 @@ def compile_one(job):
 
 
 def main():
+    global GAME
     kit.wait_for_quiet('the compile')
+    GAME = active_game_dir()   # (the active game profile's header, not only the committed one)
     p = argparse.ArgumentParser()
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--dll", action="store_true")
