@@ -120,6 +120,18 @@ static void *reserve_large(SIZE_T size) {
 
 #if !defined(_WIN32) && !defined(A64_MEM_ZERO)
 extern int hos_guest_memfd;   /* (below) */
+#ifndef _WIN32
+/* (linux) Guest addresses below 1 MB fault, as on Windows (mkw_glue.c commit_on_touch leaves them uncommitted: "a null
+   pointer: the game's own fault") and as on the console, where nothing is mapped there. The window is mapped readable and
+   writable whole, so before this a game's null-pointer reads and writes went into guest page 0 without a word, and its
+   crash came later and elsewhere, through whatever had been left there: Kirby Air Riders' first boot (Dragoon) read a
+   "pointer" 0x3feb3100500 out of guest 0x68 in a job worker, where the fault was a null object read at guest 0x58.
+   Nothing is handed out below HOS_SYSTEM_BASE (16 MB). */
+static void guest_null_guard(void) {
+    if (mprotect((void *)A64_HOST_BASE, 0x100000, PROT_NONE) != 0)
+        hos_log("mem: guest addresses below 1 MB stay accessible (mprotect: errno %d): a null pointer does not fault", errno);
+}
+#endif
 static int startup_stderr = -1;   /* (keep startup warnings visible if stderr becomes hookshot_log.txt) */
 #endif
 /* The guest window lives at the constant A64_HOST_BASE (rt/a64.h), so lifted code never loads its base. */
@@ -197,6 +209,7 @@ static int reserve_guest(void) {
                 void *p = mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
                                MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, fd, 0);
                 if (p == (void *)A64_HOST_BASE) {
+                    guest_null_guard();
                     hos_guest_memfd = fd;
                     hos_log("mem: the guest window is a memfd's (%d), shared with the GPU as dma-bufs", fd);
                     return 1;
@@ -210,6 +223,7 @@ static int reserve_guest(void) {
     if (mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) != (void *)A64_HOST_BASE)
         return 0;
+    guest_null_guard();
     /* (issue 312) no transparent huge pages in the guest window: the renderer imports its pools as userptr memory, and every
        collapse khugepaged makes in them changes their mappings, which the kernel answers by pinning the pages again at the
        next submission: ~250 ms a submit on RADV while the GPU sat idle. HOS_THP=1: as before */

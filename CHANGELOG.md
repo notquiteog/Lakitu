@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0-rc.3](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.2...v2.3.0-rc.3) (2026-11-13)
+
+
+### Bug Fixes
+
+* **linux:** a null guest pointer faults, as on Windows and the console ([#20](https://github.com/notquiteog/Hookshot/issues/20)) ([022928d](https://github.com/notquiteog/Hookshot/commit/022928d3d590f307f08aaaf6e202bcdf3de6d3f5))
+
 ## [2.3.0-rc.2](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.1...v2.3.0-rc.2) (2026-11-13)
 
 
