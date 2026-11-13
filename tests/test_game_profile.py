@@ -263,6 +263,20 @@ def check_build_uses_the_active_header():
             os.environ["HOOKSHOT_GAME"] = saved
 
 
+def check_game_folder_travels():
+    """game/ goes wherever the runtime's sources go: into the AppImage's tools, the Windows release package and the
+    source stamp (nx2/version.py). Each of the three once left it out, so a player's build could not find
+    game_profile.h, or a profile change did not change the build's source id."""
+    appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
+    check(re.search(r"^cp -a [^\n]*\bnx2\b[^\n]*\bgame\b[^\n]*\"\$T/\"$", appimage, re.M),
+          "scripts/linux/appimage.sh does not copy game/ into the AppImage's tools")
+    parts = (ROOT / "scripts" / "release_parts.py").read_text(encoding="utf-8")
+    check(re.search(r'tracked\("game", "gpu", "host", "nx2"', parts),
+          "scripts/release_parts.py does not package game/ with the Windows tools")
+    import version
+    check("game" in version.SOURCES, "nx2/version.py's source stamp does not read game/")
+
+
 def check_profiles_are_honest():
     """No profile holds a value it cannot have measured, and one with patch sites says which build it is for."""
     if not check(len(game_profile.GAMES) >= 2, "there is only one game profile, so the seam has nothing to prove"):
@@ -330,6 +344,7 @@ def main():
     check_lift_names_no_game()
     check_header_matches()
     check_build_uses_the_active_header()
+    check_game_folder_travels()
     check_profiles_are_honest()
     check_c_reads_the_profile()
     if FAILURES:
