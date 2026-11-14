@@ -13,6 +13,8 @@ romfs/
 *.xci
 gamefile/
 *.nup
+# scripts/hookshot_bench.py's run folders: game screenshots and the full log
+bench-runs/
 *.nsz
 *.xcz
 
@@ -34,3 +36,13 @@ __pycache__/
 # ---- Linux builds ----
 build-linux/
 *.so
+
+# NVIDIA's DLSS SDK, fetched at build time and never committed (docs/upscaling.md)
+/streamline-sdk/
+# the release tooling's packages (package.json is release-only; npm install makes this)
+/node_modules/
+# ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
+ngx-sdk/
+
+# ---- nx2/dev.py compdb: the last build's compile commands, for clangd and clang-tidy ----
+/compile_commands.json

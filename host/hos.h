@@ -13,7 +13,6 @@
 #ifndef HOS_H
 #define HOS_H
 #include "a64.h"
-#include "game_profile.h"   /* (the project's name and which game this build is for: game/game_profile.h) */
 #include <stdarg.h>
 
 #define HLE(sym) void imp_##sym(Ctx *c)
@@ -51,10 +50,10 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
 /* (oot-recomp) MKW's own hooks at fixed guest addresses (its frame pacer in nvn_native.c / nn_vi.c, its idle loop in
    hos_thread.c) run only when the lifted main is Mario Kart World's: any other game has other code there */
 int hos_game_is_mkw(void);
-/* The window's name, which is the project's name: one constant, in the game profile (game/game_profile.h, generated
-   from nx2/game_profile.py), so renaming the project is a line there rather than a sweep through the tree. */
-#define HOS_GAME_TITLE GAME_PROJECT
+int hos_game_profile_live(void);   /* the image is the build the game profile is for (hos_main.c) */
+#define HOS_GAME_TITLE "Hookshot"
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
+int hos_mem_region(uint64_t addr, uint64_t size);      /* (hos_mem.c) the control bridge: 0 if not wholly in mapped guest memory */
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))
@@ -70,6 +69,12 @@ extern uint64_t hos_space_end;   /* web: the guest window ends where the host's 
 #else
 #define HOS_SPACE_END 0x8000000000ULL
 #endif
+/* (hookshot) host pointer of the n guest bytes at a, NULL unless all of them lie in the guest window. For addresses
+   and sizes host code takes from guest memory or arguments before it reads or writes there: GP alone wraps around
+   to any host address. */
+static inline void *hos_guest_range(uint64_t a, uint64_t n) {
+    return a < (uint64_t)HOS_SPACE_END && n <= (uint64_t)HOS_SPACE_END - a ? GP(a) : (void *)0;
+}
 #define HOS_TICK_HZ 31250000ULL   /* (mkw-recomp: the Switch 2 counter; the SDK checks it at init) */
 
 /* ---- logging: HOS_TRACE=1 logs every HLE call that uses HOS_TRACE_CALL */
@@ -85,6 +90,7 @@ void hos_fatal(Ctx *c, const char *fmt, ...);
 uint64_t hos_sys_alloc(uint64_t size, uint64_t align);     /* zeroed, from the system region, never freed */
 uint64_t hos_region_alloc(uint64_t size, uint64_t align);  /* address space above the heap */
 void hos_region_free(uint64_t addr);
+int hos_regions(uint64_t (*out)[2], int cap);   /* the regions: {start, end}, at most cap; how many */
 void hos_mem_init(uint64_t image_end);
 extern uint64_t hos_heap_size, hos_heap_used, hos_total_memory, hos_program_size;
 
@@ -104,17 +110,27 @@ void hos_thread_set_name(HosThread *t, const char *name);
 void hos_thread_pin(void *h, const char *name);   /* HOS_PIN: host CPU affinity by thread name */
 int hos_game_cores(void);   /* totk_cores.c: HOS_GAME_CORES, or 0 */
 const char *hos_thread_name(HosThread *t);
+int hos_thread_serial(const HosThread *t);   /* one of the frame's serial threads (game thread, Presentation Thread) */
+int64_t hos_spin_ns(void);   /* the calling thread's spin before a wait sleeps, ns (HOS_SPIN_US, HOS_SPIN_OTHER_US) */
 void hos_thread_affinity(HosThread *t, int ideal, uint64_t mask);
 uint64_t hos_thread_mask(HosThread *t);
 int hos_thread_priority(HosThread *t, int set, int value);
 int hos_thread_core(HosThread *t);
 int hos_cores(void);
 /* virtual cores (hos_thread.c, HOS_VCORES=1): a guest thread gives its core up for a block (hos_vcore_away: 1 if it
-   held one) and takes one again after it (hos_vcore_back); checkpoints hand it to a better waiter that asked */
+   held one, or ran without one since an escape) and takes one again after it (hos_vcore_back); checkpoints hand it to a
+   better waiter that asked */
 int hos_vcores_on(void);
 int hos_vcore_away(void);
 void hos_vcore_back(void);
 void hos_vcore_checkpoint(void);
+/* HOS_CHAIN=<path> (hos_chain.c, diagnostic): blocks, wake-ups, sleeps and presents of the guest threads for
+   scripts/chain.py's critical path. kind: a wait that blocks begins / ends, a signal that can end one, a sleep begins /
+   ends, a present. lr 0: the current guest context's. */
+enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };
+extern volatile int hos_chain_on;
+void hos_chain_note(int kind, uint64_t key, uint64_t lr);
+#define HOS_CHAIN(kind, key) do { if (__builtin_expect(hos_chain_on, 0)) hos_chain_note((kind), (key), 0); } while (0)
 void hos_vcore_yield(void);
 int hos_cv_sleep(void *cv, void *srw_lock, unsigned ms);   /* SleepConditionVariableSRW (exclusive) for guest threads */
 void hos_thread_boost(int level);

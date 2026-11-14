@@ -1,106 +1,91 @@
-// (hookshot) NVIDIA DLSS Super Resolution as a backend for the game's own upscale dispatch:
-// docs/upscaling.md and gpu/vk/upscale_seam.h. The same shape as gpu/vk/vk_fsr3.h, so the seam can
-// hold either one, and the same assembled inputs: the depth the scene passes carry and the motion
-// gpu/vk/vk_camera_motion.h reprojects from it, because this dispatch is handed neither.
-//
-// Nothing of NVIDIA's is in this repository and nothing of NVIDIA's is needed to build it. DLSS is
-// reached through NGX on Linux, and NGX's API -- not just its runtime -- is NVIDIA's licensed SDK,
-// so the NGX half of the backend sits behind a build-time gate, `RX_VK_DLSS_SDK`, that is off by
-// default. With the gate off this file still compiles, links and runs: every entry point below
-// answers, and `supported()` answers false. The "DLSS Super Resolution" section of
-// docs/upscaling.md says why the ABI is not declared here by hand instead.
+// NVIDIA DLSS Super Resolution, one of the temporal upscaler's engines (vk_temporal.h; vk_dlss.cpp). Built in only with
+// NVIDIA's NGX SDK (HOOKSHOT_NGX, scripts/ngx_sdk.py: Linux and Windows); without it these say DLSS is not there and the
+// game's network runs.
 #pragma once
 
-#include <cstdint>
+#include <string>
+#include <vector>
 
 #include "vk_internal.h"
 
-namespace mkwvk::dlss {
+namespace mkwvk {
 
-/// One evaluation's inputs. The first block is FSR's, field for field and meaning for meaning (see
-/// gpu/vk/vk_fsr3.h): the colour is HDR and jittered at the render size, the depth is reversed, the
-/// motion points at the previous frame, and the jitter is in render pixels.
-struct Inputs {
-    VkImageView color = VK_NULL_HANDLE;
-    VkImageView depth = VK_NULL_HANDLE;
-    VkImageView motion = VK_NULL_HANDLE;
-    uint32_t render_width = 0, render_height = 0;
-    uint32_t upscale_width = 0, upscale_height = 0;
-    float jitter[2]{};
-    /// Turns a motion vector into render pixels (the render size, for vectors in UV).
-    float motion_scale[2]{1.0f, 1.0f};
-    /// The game's camera. DLSS does not take a projection, so unlike FSR these two only decide
-    /// whether the inputs are believable at all; an evaluation refuses a non-positive one rather
-    /// than carrying on with a camera it was not given.
-    float near_plane = 0.1f;
-    float fov_y = 60.0f * 3.14159265358979f / 180.0f;
-    float frame_time_ms = 16.667f;
-    bool reset = false;
-    bool sharpen = false;
-    /// 0 to 1. DLSS's own sharpening pass is deprecated from 3.x on and newer runtimes ignore it,
-    /// so this is passed through and nothing is promised by it.
-    float sharpness = 0.0f;
+struct TemporalEngine;
 
-    // ---- what NGX needs and FSR does not ----
-    //
-    // FSR records its own compute passes, so a view is the whole of an input to it. NGX is handed
-    // resources instead: an `NVSDK_NGX_Resource_VK` is a view *and* its image, its subresource
-    // range, its format and its extent, and the extent it is given is the extent DLSS reads. There
-    // is nothing to default these to -- a wrong format or a null image is a wrong picture or a
-    // crash inside the runtime, not a worse picture -- so an evaluation refuses without them. This
-    // is the one place `dlss::Inputs` is not `fsr3::Inputs`, and it is why it is its own struct.
-    VkImage color_image = VK_NULL_HANDLE;
-    VkImage depth_image = VK_NULL_HANDLE;
-    VkImage motion_image = VK_NULL_HANDLE;
-    VkFormat color_format = VK_FORMAT_UNDEFINED;
-    VkFormat depth_format = VK_FORMAT_UNDEFINED;
-    VkFormat motion_format = VK_FORMAT_UNDEFINED;
+/// Whether this build has DLSS in it (HOOKSHOT_NGX)
+bool dlss_built();
+/// Why DLSS cannot be chosen here (the Insert menu's Upscaler row says it), DLSS_OK when it can or is not known yet
+enum DlssWhy { DLSS_OK, DLSS_NOT_BUILT, DLSS_ENV_OFF, DLSS_NEEDS_RTX, DLSS_NEEDS_DRIVER, DLSS_NO_RUNTIME,
+               DLSS_RUNTIME_NOT_ASCII, DLSS_WHY_COUNT };
+DlssWhy dlss_why();
+/// Asks NGX once whether DLSS runs on this device, so dlss_why knows before the first upscale (the menu, when it opens).
+/// Nothing off an NVIDIA device with NGX's extensions, or in a build without DLSS
+void dlss_probe();
+/// A feature that was not made is asked for again at the next upscale (vk_dlss.cpp prepare's `refused`): the player
+/// changed a row the feature is made from (vk_temporal.cpp temporal_reset_failure, with the chain's lock held, as prepare
+/// has it)
+void dlss_retry();
+/// (hookshot) NGX started on this device, by this file, for NGX's other features to use the same session: DLSS 5 neural
+/// rendering through NGX (vk_ngx.cpp, vk_dlssnr_ngx.cpp). NGX is initialized once per device and shut down once; a second
+/// NVSDK_NGX_VULKAN_Init_with_ProjectID beside this one is what it avoids. True even where super resolution itself is not
+/// available, since the session is. Starts it if dlss_probe has not yet (and RX_VK_DLSS is not 0)
+bool dlss_ngx_session();
+/// (hookshot) Whether a file whose name begins `name` ("nvngx_dlssnr.dll", "libnvidia-ngx-dlssnr.so") is in one of the folders
+/// NGX is told to look for its features' runtimes in (ngx_init's: RX_VK_DLSS_DIR, the game folder's ngx, then
+/// %LOCALAPPDATA%\Hookshot\ngx or $XDG_DATA_HOME/hookshot/ngx), or the game folder itself, which NGX also searches. `where`
+/// gets the folders, in UTF-8 for the log; `found` the first such file's path. False and both empty in a build without DLSS
+bool dlss_ngx_runtime(const char* name, std::string* where, std::string* found);
+/// (hookshot) NGX's application data path as ngx_init gives it (the game folder's ngx, as NGX takes a path: vk_dlss.cpp
+/// wide), for the questions asked of NGX before the device exists (vk_ngx.cpp discovery_info: a feature's extensions).
+/// L"." where the game folder is not known, and in a build without DLSS
+const wchar_t* dlss_ngx_data_path();
+/// The instance's extensions DLSS needs, added to `want` when the loader has them (all: what it has)
+void dlss_instance_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
+/// The device's extensions DLSS needs, added to `want` when the device has them
+void dlss_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
+/// DLSS as the temporal upscaler's engine (DLSS and DLAA on the Upscaler row); nullptr in a build without it
+const TemporalEngine* dlss_engine();
+
+// NVIDIA DLSS Frame Generation through NGX (vk_dlss.cpp): the renderer's frame generation (vk_framegen.cpp) shows and paces
+// the frames DLSS-G makes from the temporal chain's depth, motion and camera. Asked for with RX_VK_DLSS_FG=1 for a run.
+struct TemporalFrame;
+/// Whether it is asked for now: the Insert menu's Frame generation by row (Auto), RX_VK_DLSS_FG=0 / 1 over it (and the build
+/// has it)
+bool dlss_fg_wanted();
+/// (hookshot) Why the last set it was asked for went to the renderer's own frame generation, for the Insert menu's Frame
+/// generation by row (its texts are the menu's, to be translated): FG_SKIP_NONE when DLSS-G made it or nothing is known.
+/// most: its runtime's most made frames a set (FG_SKIP_TOO_MANY)
+enum FgSkip {
+    FG_SKIP_NONE,
+    FG_SKIP_OFF,        // (RX_VK_DLSS_FG=0 for the run)
+    FG_SKIP_DEVICE,     // (DLSS does not run on this GPU)
+    FG_SKIP_START,      // (NGX did not start it: no runtime, an older GPU)
+    FG_SKIP_TOO_MANY,   // (more made frames than its runtime makes)
+    FG_SKIP_INPUTS,     // (no picture from a temporal Upscaler this frame)
+    FG_SKIP_REFUSED,    // (NGX refused the set)
+    FG_SKIP_NOT_BUILT,  // (a build without NVIDIA's SDK)
+    FG_SKIP_COUNT
 };
+int dlss_fg_skip(unsigned* most = nullptr);
+/// Whether it makes the sets of `frames` made frames (the multiplier less 1) as far as is known: asked for, on a device DLSS
+/// runs on, NGX's answer not a no, its feature not given up and its runtime making that many (an older one makes 1 at the
+/// most, so 3x and 4x are the renderer's own). The swapchain's present mode follows it: vk_main.cpp swapchain_dlssg
+bool dlss_fg_runs(int frames);
+/// Frame generation's device extensions, asked of NGX, added to `want` when the device has them
+void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
+/// The chain's frame (vk_temporal.cpp, after its engine's evaluation): its depth and motion copied, its camera kept, for the
+/// next present. projection and view_projection: the scene's, jittered by clip_jitter; motion: the chain had the frame before's
+void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float projection[16], const float view_projection[16],
+                    const float clip_jitter[2], bool motion);
+/// At the present (vk_framegen.cpp framegen_record): `count` frames between the last picture and this one (color, the
+/// window's, w x h RGBA8) into out[0..count). Returns count, or 0 when it did not make them (the renderer's own methods do).
+/// blend: there is a picture before this one; sequence: the present's count (one skipped makes a new history)
+int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, uint32_t w, uint32_t h, int count,
+                   const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence);
+/// Frame generation at Off or Auto (no fixed multiplier: dlss_fg_frames is not asked): its feature, if made, let go and its
+/// memory back, as when the Frame generation by row changes. Each such present (vk_replay.cpp); nothing to do is one load
+void dlss_fg_idle();
+/// Before the process exits (mkwvk_close_asked): its feature let go with the queue idle
+void dlss_fg_close();
 
-/// Whether DLSS can run here at all: asked for (`RX_VK_DLSS=1`), built with an NGX SDK, the NGX
-/// runtime loaded, and this driver and GPU reporting Super Resolution as available. Asked once; the
-/// answer is cached, and the one line saying why it is false is logged once.
-/// Whether this build has the NGX SDK compiled in at all. A compile-time fact, not a device one: it
-/// asks nothing of the driver and loads nothing, so the menu can use it to decide whether offering
-/// DLSS would be offering something this binary can never do. Every released build answers false,
-/// because CI has no NVIDIA SDK and none may be committed.
-[[nodiscard]] bool built_with_sdk();
-
-[[nodiscard]] bool supported();
-
-/// Makes the image an evaluation resolves into and remembers these extents, re-making them when the
-/// extents change. False when anything could not be made, which leaves DLSS unavailable rather than
-/// half-built.
-///
-/// Unlike FSR's, this does not make the thing that does the work: `NVSDK_NGX_VULKAN_CreateFeature`
-/// records into a command buffer, and there is none here. The feature is created at the first
-/// `upscale()` after a change of extents instead, which is why this signature can stay FSR's.
-/// The instance and device extensions DLSS needs here, asked of NGX itself rather than written out
-/// from the documentation: the set depends on the driver, and a list hard-coded here would be wrong
-/// on the next one. Both answer before the thing they are about exists, which is why they take what
-/// they do and not `dev`. `out` is filled with at most `max` names and the count is returned; zero
-/// means DLSS was not asked for, this build has no NGX SDK, or NGX does not answer -- in every one
-/// of those the device is created as it would have been. The names are NGX's own storage and last
-/// as long as the process.
-///
-/// Call them before vkCreateInstance / vkCreateDevice. DLSS cannot be made to work afterwards: an
-/// extension it needs and the device does not have is the one failure that is not recoverable at
-/// evaluation time.
-size_t instance_extensions(const char** out, size_t max);
-size_t device_extensions(VkInstance instance, VkPhysicalDevice gpu, const char** out, size_t max);
-
-[[nodiscard]] bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_width,
-                           uint32_t upscale_height);
-
-/// Records one evaluation. False when the inputs are not usable, which leaves the caller to keep
-/// whatever it would otherwise have done.
-[[nodiscard]] bool upscale(VkCommandBuffer cmd, const Inputs& in);
-
-/// The image an evaluation resolves into: RGBA16F at the upscale size, or null before prepare().
-[[nodiscard]] VkImage output_image();
-[[nodiscard]] VkImageView output_view();
-
-/// Frees everything, the NGX feature and NGX itself included. Safe to call when nothing was made.
-void shutdown();
-
-} // namespace mkwvk::dlss
+} // namespace mkwvk

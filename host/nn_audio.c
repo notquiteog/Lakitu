@@ -6,14 +6,19 @@
      voices (PCM16, PCM float, DSP-ADPCM; resampled by sample rate x pitch, voice volume)
        -> their destination mix or splitter (per channel pair volumes)
        -> sub mixes in dependency order (sub mix volume, then to their destination)
-       -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> waveOut
-   and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
-   aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
+       -> the final mix (volume) -> the device sink (its channel map: 5.1 as it is to a 5.1 device, else down to stereo)
+       -> waveOut
+   and signals the renderer event the game's audio thread waits on. I3DL2 reverb is processed locally; Aux effects
+   exchange planar PCM32 with the game's CPU effect workers. Other effects remain incomplete.
+   Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
-   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs). */
+   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs);
+   HOS_AUDIO_CHANNELS=2 or 6: stereo or 5.1 whatever the default output has and the Insert menu's Audio output say
+   (see au_speakers). */
 #include "hos.h"
+#include "../gpu/vk/vk_api.h"   /* (the Audio tab's options: HOS_OPT_VOLUME, HOS_OPT_MUTE_BACKGROUND) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +26,18 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#ifdef _WIN32
+#include <mmreg.h>
+#include <objbase.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#else
+#include "hos_sdl.h"
+#endif
+#include "hos_paths.h"   /* (the game folder: hookshot_options.ini, au_menu_output) */
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -37,7 +54,7 @@ void hos_system_event_signal(uint64_t key);
 #define MAX_WB 32            /* queued wave buffers per voice */
 #define MAX_REL 128
 
-enum { K_VOICE = 1, K_MIX, K_SPLITTER, K_SINK, K_POOL, K_EFFECT, K_CONFIG };
+enum { K_VOICE = 1, K_MIX, K_SPLITTER, K_SINK, K_POOL, K_EFFECT, K_CONFIG, K_AUX };
 enum { FMT_INVALID, FMT_PCM8, FMT_PCM16, FMT_PCM24, FMT_PCM32, FMT_FLOAT, FMT_ADPCM };
 enum { PLAY_STARTED, PLAY_STOPPED, PLAY_PAUSED };
 enum { DEST_NONE, DEST_MIX, DEST_SPLITTER };
@@ -57,6 +74,9 @@ typedef struct {
     int dest_mix[MAX_SPLIT_DESTS];
     float vol[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];
     float ramp[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];   /* the volumes the last frame ended with */
+    int bq_on[MAX_SPLIT_DESTS][2];
+    float bq_b[MAX_SPLIT_DESTS][2][3], bq_a[MAX_SPLIT_DESTS][2][2];
+    uint64_t bq_epoch[MAX_SPLIT_DESTS][2];
 } Splitter;
 
 typedef struct {
@@ -73,7 +93,7 @@ typedef struct {
     WB wbc[MAX_WB];                            /* and their contents when appended */
     int nwb, pending_wb;                       /* (pending: appended, not yet applied by an update) */
     uint64_t rel[MAX_REL];                     /* released, for GetReleasedWaveBuffer */
-    int nrel;
+    int nrel, nrel_seen;                       /* (seen: the first nrel_seen, released by the last update) */
     int64_t played;
     int64_t pos;                               /* sample frame within the current wave buffer */
     int started_wb;                            /* the current one's start was set up */
@@ -82,6 +102,9 @@ typedef struct {
     int16_t yn1, yn2;                          /* ADPCM history (mono) */
     int bq_on[2];                              /* the voice's two biquad filters (BiquadFilterParameter, Q14) */
     float bq_b[2][3], bq_a[2][2], bq_z[2][MAX_CH][2];
+    /* Each source keeps its own history on each splitter route. Filtering one route must not change another's input. */
+    float split_bq_z[MAX_SPLIT_DESTS][2][MAX_CH][2];
+    uint64_t split_bq_epoch[MAX_SPLIT_DESTS][2];
     int dropped;
 } Voice;
 
@@ -90,6 +113,7 @@ static int lock_ready;
 static Voice voices[MAX_VOICES];
 static Mix mixes[MAX_MIXES];
 static Splitter splitters[MAX_SPLITTERS];
+static uint64_t split_bq_epoch;
 static int sink_mix = -1, sink_n;
 static float lim_in = 1.0f, lim_out = 1.0f, lim_threshold = 1.0f, lim_env = 1.0f;   /* the light limiter */
 static int lim_enabled;
@@ -105,13 +129,14 @@ static void put_handle(uint64_t obj, int kind, int index) {
     if (obj) G64(obj) = (uint64_t)AU_MAGIC << 32 | (uint64_t)kind << 24 | (uint32_t)index;
 }
 static int au_trace = -1;   /* HOS_AUDIO_TRACE=1: the graph setup calls */
-#define AUT(...) do { if (au_trace < 0) au_trace = getenv("HOS_AUDIO_TRACE") != NULL; if (au_trace) hos_log(__VA_ARGS__); } while (0)
+#define AUT(...) do { if (au_trace < 0) au_trace = env_on("HOS_AUDIO_TRACE"); if (au_trace) hos_log(__VA_ARGS__); } while (0)
 static int get_handle(uint64_t obj, int kind) {
     if (!obj) return -1;
     const uint64_t h = G64(obj);
     if ((uint32_t)(h >> 32) != AU_MAGIC || (int)((h >> 24) & 0xFF) != kind) return -1;
     return (int)(h & 0xFFFFFF);
 }
+static int pool_index(uint64_t obj);   /* (a memory pool's handle, checked against the pool table: below) */
 static float farg(Ctx *c, int n) {
     float f;
     memcpy(&f, &c->vreg[n][0], 4);
@@ -225,6 +250,7 @@ static void release_wb(Voice *v, uint64_t wb) {
     if (v->nrel == MAX_REL) {
         memmove(v->rel, v->rel + 1, (size_t)(MAX_REL - 1) * sizeof v->rel[0]);
         v->nrel--;
+        if (v->nrel_seen) v->nrel_seen--;
     }
     v->rel[v->nrel++] = wb;
 }
@@ -275,6 +301,7 @@ static int next_source_frame(Voice *v) {
 #define REV_LINE 4096               /* each late line, at most ~85 ms */
 typedef struct {
     int used, mix, enabled, n;
+    uint64_t order;
     int8_t in[MAX_CH], out[MAX_CH];
     float room, room_hf, refl, reverb, hf_ratio, diffusion, density, hf_ref, dry;   /* (mB for the gains) */
     int64_t decay_ns, refl_delay_ns, late_delay_ns;
@@ -285,10 +312,11 @@ typedef struct {
     float lp[4];                    /* damping filter states */
 } Reverb;
 static Reverb reverbs[MAX_EFFECTS];
+static uint64_t effect_order;
 static float mb_gain(float mb) { return powf(10.0f, mb / 2000.0f); }
 static void reverb_frame(Reverb *rv, Mix *m) {
     static int off = -1;
-    if (off < 0) off = getenv("HOS_AUDIO_NO_REVERB") != NULL;
+    if (off < 0) off = env_on("HOS_AUDIO_NO_REVERB");
     if (off || !rv->enabled || rv->n <= 0) return;
     static const int base_len[4] = {1559, 1617, 1491, 1422};
     const float density = rv->density > 0 ? rv->density / 100.0f : 1.0f;
@@ -307,11 +335,12 @@ static void reverb_frame(Reverb *rv, Mix *m) {
     const float refl = rv->refl > -10000 ? mb_gain(rv->refl) : 0.0f;
     const float late = rv->reverb > -10000 ? mb_gain(rv->reverb) : 0.0f;
     const float dry = rv->dry;
-    int pre_d = (int)((double)rv->refl_delay_ns * RATE / 1e9);
-    int late_d = pre_d + (int)((double)rv->late_delay_ns * RATE / 1e9);
-    if (pre_d < 0) pre_d = 0;
-    if (pre_d >= REV_PRE / 2) pre_d = REV_PRE / 2 - 1;
-    if (late_d >= REV_PRE) late_d = REV_PRE - 1;
+    /* (hookshot) the game's delays are any 64-bit TimeSpan: clamped as doubles, before they become ints, and from both
+       sides (a negative late delay read before the line) */
+    const double pre_f = (double)rv->refl_delay_ns * RATE / 1e9, late_f = (double)rv->late_delay_ns * RATE / 1e9;
+    const int pre_d = pre_f > 0 ? (pre_f < REV_PRE / 2 - 1 ? (int)pre_f : REV_PRE / 2 - 1) : 0;
+    const double late_sum = pre_d + (late_f > 0 ? late_f : 0);
+    const int late_d = late_sum < REV_PRE - 1 ? (int)late_sum : REV_PRE - 1;
     float g[4];
     for (int k = 0; k < 4; k++) g[k] = powf(10.0f, -3.0f * rv->len[k] / (RATE * decay));
     static const int er_tap[6] = {113, 397, 709, 1013, 1301, 1663};
@@ -353,12 +382,127 @@ static void reverb_frame(Reverb *rv, Mix *m) {
         }
     }
 }
+/* ---- Aux: the game supplies the processing, the renderer exchanges complete planar frames --------------------
+   An enabled Aux REPLACES its output with the return signal. Passing its input through instead makes an effect
+   send audible as another dry source. Each sample is an int32 in PCM16 units (1.0 in our mixer is 32768).
+   All access is under the audio lock. The two guest allocations reserve 128 bytes before their sample data;
+   cursor/count bookkeeping lives here because both the renderer and SDK operations are implemented by this HLE.
+   Never replay old return data on underrun, and never enqueue part of a multichannel frame on send overflow. */
+typedef struct {
+    int32_t *data;
+    int capacity, read, write, count;
+} AuxRing;
+typedef struct {
+    int used, released, mix, enabled, active_enabled, n, active_n, sample_count;
+    int8_t in[MAX_BUF], out[MAX_BUF], active_in[MAX_BUF], active_out[MAX_BUF];
+    uint64_t order, sent_frames, returned_frames, underruns, overruns;
+    AuxRing send, ret;
+} Aux;
+static Aux auxes[MAX_EFFECTS];
+
+static void aux_ring_reset(AuxRing *r) { r->read = r->write = r->count = 0; }
+static int aux_ring_read(AuxRing *r, int32_t *dst, int count) {
+    if (!dst || count <= 0) return 0;
+    if (count > r->count) count = r->count;
+    const int first = count < r->capacity - r->read ? count : r->capacity - r->read;
+    memcpy(dst, r->data + r->read, (size_t)first * sizeof *dst);
+    memcpy(dst + first, r->data, (size_t)(count - first) * sizeof *dst);
+    r->read = r->capacity ? (r->read + count) % r->capacity : 0;
+    r->count -= count;
+    return count;
+}
+static int aux_ring_write(AuxRing *r, const int32_t *src, int count) {
+    if (!src || count <= 0) return 0;
+    if (count > r->capacity - r->count) count = r->capacity - r->count;
+    const int first = count < r->capacity - r->write ? count : r->capacity - r->write;
+    memcpy(r->data + r->write, src, (size_t)first * sizeof *src);
+    memcpy(r->data, src + first, (size_t)(count - first) * sizeof *src);
+    r->write = r->capacity ? (r->write + count) % r->capacity : 0;
+    r->count += count;
+    return count;
+}
+static void aux_reset(Aux *a) { aux_ring_reset(&a->send); aux_ring_reset(&a->ret); }
+static int32_t aux_pcm(float sample) {
+    const double pcm = (double)sample * 32768.0;
+    if (!isfinite(pcm)) return 0;
+    if (pcm >= INT32_MAX) return INT32_MAX;
+    if (pcm <= INT32_MIN) return INT32_MIN;
+    return (int32_t)pcm;
+}
+static void aux_frame(Aux *a, Mix *m) {
+    const int n = a->active_n, count = n * FRAME;
+    if (n <= 0) return;
+    /* Snapshot all inputs before overwriting any output, including cross-channel maps. */
+    float input[MAX_BUF][FRAME];
+    int32_t pcm[MAX_BUF * FRAME];
+    for (int ch = 0; ch < n; ch++) {
+        const int b = a->active_in[ch];
+        if (b >= 0 && b < m->buffers) memcpy(input[ch], m->buf[b], sizeof input[ch]);
+        else memset(input[ch], 0, sizeof input[ch]);
+    }
+    if (!a->active_enabled) {
+        for (int ch = 0; ch < n; ch++) {
+            const int b = a->active_out[ch];
+            if (b >= 0 && b < m->buffers) memcpy(m->buf[b], input[ch], sizeof input[ch]);
+        }
+        return;
+    }
+    if (a->send.capacity - a->send.count >= count) {
+        for (int ch = 0; ch < n; ch++)
+            for (int i = 0; i < FRAME; i++) pcm[ch * FRAME + i] = aux_pcm(input[ch][i]);
+        aux_ring_write(&a->send, pcm, count);
+        a->sent_frames++;
+    } else a->overruns++;
+    if (a->ret.count >= count) {
+        aux_ring_read(&a->ret, pcm, count);
+        a->returned_frames++;
+    } else {
+        memset(pcm, 0, (size_t)count * sizeof *pcm);
+        a->underruns++;
+    }
+    for (int ch = 0; ch < n; ch++) {
+        const int b = a->active_out[ch];
+        if (b >= 0 && b < m->buffers)
+            for (int i = 0; i < FRAME; i++) m->buf[b][i] = pcm[ch * FRAME + i] * (1.0f / 32768.0f);
+    }
+}
 static void effects_frame(int mix) {
-    for (int e = 0; e < MAX_EFFECTS; e++)
-        if (reverbs[e].used && reverbs[e].mix == mix) reverb_frame(&reverbs[e], &mixes[mix]);
+    /* Preserve insertion order across effect types, e.g. reverb followed by a CPU delay. */
+    uint64_t previous = 0;
+    for (;;) {
+        uint64_t next = UINT64_MAX;
+        int reverb = -1, aux = -1;
+        for (int e = 0; e < MAX_EFFECTS; e++) {
+            if (reverbs[e].used && reverbs[e].mix == mix && reverbs[e].order > previous && reverbs[e].order < next)
+                next = reverbs[e].order, reverb = e, aux = -1;
+            if (auxes[e].used && auxes[e].mix == mix && auxes[e].order > previous && auxes[e].order < next)
+                next = auxes[e].order, aux = e, reverb = -1;
+        }
+        if (reverb < 0 && aux < 0) break;
+        if (reverb >= 0) reverb_frame(&reverbs[reverb], &mixes[mix]);
+        else aux_frame(&auxes[aux], &mixes[mix]);
+        previous = next;
+    }
 }
 
 /* ---- the mixer ------------------------------------------------------------------------------------------------- */
+static void biquad_frame(float *samples, const float b[3], const float a[2], float z[2]) {
+    float z0 = z[0], z1 = z[1];
+    for (int i = 0; i < FRAME; i++) {
+        const float x = samples[i], y = b[0] * x + z0;
+        /* The denominator is already negated: a one-pole low pass has b0 = 1 - p, a1 = p. */
+        z0 = b[1] * x + a[0] * y + z1;
+        z1 = b[2] * x + a[1] * y;
+        samples[i] = y;
+    }
+    if (!isfinite(z0) || !isfinite(z1)) {
+        z0 = z1 = 0;
+        memset(samples, 0, FRAME * sizeof *samples);
+    }
+    z[0] = z0;
+    z[1] = z1;
+}
+
 static void render_voice(Voice *v) {
     /* (a started voice without a destination still plays, as on the DSP: its buffers run out and are released) */
     if (v->state != PLAY_STARTED) return;
@@ -390,22 +534,8 @@ static void render_voice(Voice *v) {
     /* the biquad filters (transposed direct form II, as the DSP's) */
     for (int f = 0; f < 2; f++) {
         if (!v->bq_on[f]) continue;
-        const float b0 = v->bq_b[f][0], b1 = v->bq_b[f][1], b2 = v->bq_b[f][2], a1 = v->bq_a[f][0], a2 = v->bq_a[f][1];
-        for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++) {
-            float z0 = v->bq_z[f][ch][0], z1 = v->bq_z[f][ch][1];
-            for (int i = 0; i < FRAME; i++) {
-                const float x = out[ch][i], y = b0 * x + z0;
-                z0 = b1 * x + a1 * y + z1;   /* (the denominator comes negated: a one-pole low pass is b0 = 1 - p, a1 = p) */
-                z1 = b2 * x + a2 * y;
-                out[ch][i] = y;
-            }
-            if (!isfinite(z0) || !isfinite(z1)) {   /* (blown up: silence and start over rather than a full-scale burst) */
-                z0 = z1 = 0;
-                memset(out[ch], 0, sizeof out[ch]);
-            }
-            v->bq_z[f][ch][0] = z0;
-            v->bq_z[f][ch][1] = z1;
-        }
+        for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
+            biquad_frame(out[ch], v->bq_b[f], v->bq_a[f], v->bq_z[f][ch]);
     }
     if (v->dest_kind == DEST_MIX && mixes[v->dest].used) {
         Mix *m = &mixes[v->dest];
@@ -422,13 +552,27 @@ static void render_voice(Voice *v) {
             const int mi = s->dest_mix[d];
             if (mi < 0 || !mixes[mi].used) continue;
             Mix *m = &mixes[mi];
-            for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
+            for (int f = 0; f < 2; f++)
+                if (v->split_bq_epoch[d][f] != s->bq_epoch[d][f]) {
+                    memset(v->split_bq_z[d][f], 0, sizeof v->split_bq_z[d][f]);
+                    v->split_bq_epoch[d][f] = s->bq_epoch[d][f];
+                }
+            for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++) {
+                float filtered[FRAME];
+                const float *samples = out[ch];
+                if (s->bq_on[d][0] || s->bq_on[d][1]) {
+                    memcpy(filtered, out[ch], sizeof filtered);
+                    for (int f = 0; f < 2; f++)
+                        if (s->bq_on[d][f]) biquad_frame(filtered, s->bq_b[d][f], s->bq_a[d][f], v->split_bq_z[d][f][ch]);
+                    samples = filtered;
+                }
                 for (int b = 0; b < m->buffers; b++) {
                     const float g0 = s->ramp[d][ch][b], g1 = s->vol[d][ch][b];
                     if (g0 == 0.0f && g1 == 0.0f) continue;
                     const float dg = (g1 - g0) / FRAME;
-                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * (g0 + dg * (float)(i + 1));
+                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += samples[i] * (g0 + dg * (float)(i + 1));
                 }
+            }
         }
     }
     memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);   /* (splitters catch up in render_frame) */
@@ -439,7 +583,7 @@ static int mix_depth(int i, int guard) {   /* how many sub mixes lie between thi
     return 1 + mix_depth(mixes[i].dest, guard + 1);
 }
 
-static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
+static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the device's 2 or 6 channels */
     for (int m = 0; m < MAX_MIXES; m++)
         if (mixes[m].used) {
             const int rows = mixes[m].buffers < 0 ? 0 : mixes[m].buffers > MAX_BUF ? MAX_BUF : mixes[m].buffers;
@@ -470,8 +614,11 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
                 for (int i = 0; i < FRAME; i++) d->buf[dst][i] += s->buf[src][i] * g;
             }
     }
-    /* the final mix through the sink's channel map: FL FR FC LFE RL RR, down to stereo */
-    float l[FRAME] = {0}, r[FRAME] = {0};
+    /* the final mix through the sink's channel map: FL FR FC LFE RL RR, as it is to a 5.1 device (the same order on
+       Windows' and SDL's 5.1), else down to stereo */
+    const int six = channels == 6;
+    float out[6][FRAME];
+    memset(out, 0, sizeof out);
     if (sink_mix >= 0 && mixes[sink_mix].used) {
         effects_frame(sink_mix);
         Mix *f = &mixes[sink_mix];
@@ -479,17 +626,22 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
         for (int k = 0; k < sink_n && k < 6; k++) {
             const int b = sink_in[k];
             if (b < 0 || b >= f->buffers) continue;
+            if (six) {
+                for (int i = 0; i < FRAME; i++) out[k][i] += f->buf[b][i] * g;
+                continue;
+            }
             const float gl = k == 0 ? 1.0f : k == 1 ? 0.0f : k == 2 ? 0.7071f : k == 4 ? 0.7071f : k == 3 ? 0.5f : 0.0f;
             const float gr = k == 1 ? 1.0f : k == 0 ? 0.0f : k == 2 ? 0.7071f : k == 5 ? 0.7071f : k == 3 ? 0.5f : 0.0f;
             for (int i = 0; i < FRAME; i++) {
-                l[i] += f->buf[b][i] * g * gl;
-                r[i] += f->buf[b][i] * g * gr;
+                out[0][i] += f->buf[b][i] * g * gl;
+                out[1][i] += f->buf[b][i] * g * gr;
             }
         }
     }
+    const int nch = six ? 6 : 2;
     {   /* HOS_AUDIO_STATS=1: once a second, what plays and where the signal is */
         static int stats = -1, frames;
-        if (stats < 0) stats = getenv("HOS_AUDIO_STATS") != NULL;
+        if (stats < 0) stats = env_on("HOS_AUDIO_STATS");
         if (stats && ++frames % 200 == 0) {
             int started = 0, with_buffers = 0, to_mix = 0, to_split = 0;
             for (int i = 0; i < MAX_VOICES; i++) {
@@ -543,25 +695,23 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
             }
         }
     }
-    if (lim_enabled)   /* fast attack, ~50 ms release */
+    if (lim_enabled)   /* fast attack, ~50 ms release (one gain for every channel, so the picture does not move) */
         for (int i = 0; i < FRAME; i++) {
-            const float x = fmaxf(fabsf(l[i]), fabsf(r[i])) * lim_in;
+            float x = 0;
+            for (int ch = 0; ch < nch; ch++) x = fmaxf(x, fabsf(out[ch][i]));
+            x *= lim_in;
             const float want = x > lim_threshold ? lim_threshold / x : 1.0f;
             lim_env = want < lim_env ? want : lim_env + (want - lim_env) * 0.0004f;
-            l[i] *= lim_in * lim_env * lim_out;
-            r[i] *= lim_in * lim_env * lim_out;
+            for (int ch = 0; ch < nch; ch++) out[ch][i] *= lim_in * lim_env * lim_out;
         }
-    for (int i = 0; i < FRAME; i++) {
-        float a = l[i] * 32767.0f, b = r[i] * 32767.0f;
-        if (a != a) a = 0;   /* (NaN) */
-        if (b != b) b = 0;
-        if (a > 32767) a = 32767;
-        if (a < -32768) a = -32768;
-        if (b > 32767) b = 32767;
-        if (b < -32768) b = -32768;
-        pcm[i * 2] = (int16_t)a;
-        pcm[i * 2 + 1] = (int16_t)b;
-    }
+    for (int i = 0; i < FRAME; i++)
+        for (int ch = 0; ch < nch; ch++) {
+            float a = out[ch][i] * 32767.0f;
+            if (a != a) a = 0;   /* (NaN) */
+            if (a > 32767) a = 32767;
+            if (a < -32768) a = -32768;
+            pcm[i * nch + ch] = (int16_t)a;
+        }
 }
 
 /* (the output's platform parts, outside the section tests/audio_output_errors_test.c compiles with its own) */
@@ -580,21 +730,160 @@ static void au_device_name(unsigned device, char *out, size_t size) {
 #endif
 }
 static uint64_t au_ms(void) { return (uint64_t)GetTickCount64(); }
+/* (hookshot) Which output Windows has as its default now (the waveOut mapper's preferred device, its number and name):
+   a key that changes when the default does; 0 when unknown. A device opened as the default stays on that device when
+   Windows moves its default (a Bluetooth headset gone and back), so the output section asks every second */
+#ifndef DRVM_MAPPER_PREFERRED_GET
+#define DRVM_MAPPER_PREFERRED_GET (0x2000 + 21)   /* (mmddk.h: DRVM_MAPPER + 21) */
+#endif
+static uint32_t au_default_key(void) {
+#ifdef _WIN32
+    DWORD id = (DWORD)-1, flags = 0;
+    if (waveOutMessage((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, DRVM_MAPPER_PREFERRED_GET, (DWORD_PTR)&id, (DWORD_PTR)&flags) !=
+            MMSYSERR_NOERROR || id == (DWORD)-1)
+        return 0;
+    char name[64];
+    au_device_name(id, name, sizeof name);
+    uint32_t h = 2166136261u ^ id;
+    for (const char *p = name; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    return h ? h : 1;
+#else
+    return 0;   /* (linux: SDL follows the default device itself) */
+#endif
+}
 /* HOS_AUDIO_MUTE=1 (test runs): the device opened and fed as for a player, at volume 0 */
 static void au_opened(HWAVEOUT w) {
 #ifdef _WIN32
-    if (getenv("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
+    if (env_on("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
 #else
     (void)w;
+#endif
+}
+/* The default output's channels (its shared-mode mix format on Windows, SDL's default device on Linux); 2 when
+   unknown. */
+#ifdef _WIN32
+/* (hookshot) The channels of a mix format that are 5.1 speakers: its channel count when its mask names a centre and a
+   pair behind or beside the player (5.1 back or side, 7.1), else 2. A device with more channels than speakers (an
+   audio interface's outputs, a Scarlett's 8 with mask 0; quad without a centre; no mask at all) was counted by its
+   channels: the game mixed 5.1, and what it puts in the centre (voices, the ocarina, Link's own sounds) and behind went
+   to outputs nothing listens to, silent (issue 2182). As stereo, the game's own mix down keeps every sound. */
+static int au_layout_channels(int channels, int extensible, unsigned long mask) {
+    if (channels <= 2 || !extensible) return 2;
+    const unsigned long front = 0x7, back = 0x30, side = 0x600;   /* FL FR FC; BL BR; SL SR (ksmedia.h SPEAKER_) */
+    if ((mask & front) == front && ((mask & back) == back || (mask & side) == side)) return channels;
+    return 2;
+}
+static int au_device_channels(void) {
+    static const GUID clsid_enumerator = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+    static const GUID iid_enumerator = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+    static const GUID iid_audio_client = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
+    int n = 2;
+    const HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* (a thread in another apartment keeps it) */
+    IMMDeviceEnumerator *e = NULL;
+    if (SUCCEEDED(CoCreateInstance(&clsid_enumerator, NULL, CLSCTX_ALL, &iid_enumerator, (void **)&e)) && e) {
+        IMMDevice *d = NULL;
+        if (SUCCEEDED(e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &d)) && d) {
+            IAudioClient *a = NULL;
+            if (SUCCEEDED(d->lpVtbl->Activate(d, &iid_audio_client, CLSCTX_ALL, NULL, (void **)&a)) && a) {
+                WAVEFORMATEX *mix = NULL;
+                if (SUCCEEDED(a->lpVtbl->GetMixFormat(a, &mix)) && mix) {
+                    const int extensible = mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                                           (size_t)mix->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+                    const unsigned long mask = extensible ? (unsigned long)((WAVEFORMATEXTENSIBLE *)mix)->dwChannelMask : 0;
+                    n = au_layout_channels(mix->nChannels, extensible, mask);
+                    if (n != mix->nChannels)
+                        hos_log("audio: the default output has %d channels but not 5.1 speakers (channel mask %#lx): "
+                                "counted as stereo", mix->nChannels, mask);
+                    CoTaskMemFree(mix);
+                }
+                a->lpVtbl->Release(a);
+            }
+            d->lpVtbl->Release(d);
+        }
+        e->lpVtbl->Release(e);
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+    return n;
+}
+#else
+static int au_device_channels(void) { return hos_sdl_audio_channels(); }
+#endif
+/* (hookshot) The Insert menu's Audio output (gpu/vk/vk_menu.cpp): audio_output= in hookshot_options.ini beside the game,
+   0 Auto, 1 Stereo, 2 5.1 (a number past them is the nearest, as the menu reads it). Read from the file, as
+   host/nn_applet.c reads the Handheld profile: the game asks for its speakers only once, at its start */
+static int au_menu_output(void) {
+    char path[MAX_PATH];
+    const DWORD len = hos_game_path_a(path, MAX_PATH);
+    char *slash = len ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/') */
+    if (!slash) return 0;
+    snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[80];
+    int v = 0;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "audio_output=", 13)) v = atoi(line + 13);
+    fclose(f);
+    return v < 1 ? 0 : v > 2 ? 2 : v;
+}
+/* The speakers the game mixes for: the Insert menu's Audio output, Stereo 2 or 5.1 6, HOS_AUDIO_CHANNELS=2 or 6 over it;
+   Auto: 6 when the default output has 5.1 or more speakers (au_layout_channels), else 2. The game asks once, at its start
+   (GetActiveAudioDeviceChannelCountForOutput), and pans for that many, so a change takes a restart. Told 2 (always,
+   before), it put nothing behind the player, and a 5.1 system played the whole game from the front speakers (issue
+   1124). Its device sink has the six channels either way; with two speakers they are mixed down. */
+static int au_speakers(void) {
+    static volatile int known;
+    if (!known) {
+        au_lock();   /* (the game's thread and the mixer's ask at about the same time: one of them looks) */
+        if (!known) {
+            const char *want = getenv("HOS_AUDIO_CHANNELS");
+            const int menu = want && *want ? 0 : au_menu_output();
+            int n;
+            if (want && *want) {
+                n = atoi(want) >= 6 ? 6 : 2;
+                hos_log("audio: %s for the game (HOS_AUDIO_CHANNELS)", n == 6 ? "5.1" : "stereo");
+            } else if (menu) {
+                n = menu == 2 ? 6 : 2;
+                hos_log("audio: %s for the game (the Insert menu's Audio output)", n == 6 ? "5.1" : "stereo");
+            } else {
+                const int device = au_device_channels();
+                n = device >= 6 ? 6 : 2;
+                hos_log("audio: %s for the game (the default output has %d channels)", n == 6 ? "5.1" : "stereo", device);
+            }
+            known = n;
+        }
+        au_unlock();
+    }
+    return known;
+}
+/* The device's format, 16-bit PCM at 48 kHz: Windows takes more than two channels only as WAVE_FORMAT_EXTENSIBLE,
+   with the speakers named (5.1: FL FR FC LFE BL BR, the device sink's order). SDL takes the channel count as it is. */
+static const WAVEFORMATEX *au_format(const WAVEFORMATEX *f) {
+#ifdef _WIN32
+    if (f->nChannels <= 2) return f;
+    static const GUID pcm = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+    static WAVEFORMATEXTENSIBLE x;
+    memset(&x, 0, sizeof x);
+    x.Format = *f;
+    x.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    x.Format.cbSize = sizeof x - sizeof x.Format;
+    x.Samples.wValidBitsPerSample = f->wBitsPerSample;
+    x.dwChannelMask = 0x3F;   /* front left, right, centre, low frequency, back left, right */
+    x.SubFormat = pcm;        /* (KSDATAFORMAT_SUBTYPE_PCM) */
+    return &x.Format;
+#else
+    return f;
 #endif
 }
 
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
+#define OUT_MAX_CH 6
 static HWAVEOUT wout;
 static WAVEHDR hdr[NBLOCKS];
-static int16_t blocks[NBLOCKS][FRAME * 2 * 2];
+static int16_t blocks[NBLOCKS][FRAME * 2 * OUT_MAX_CH];
 static int fill_block, fill_frames;
+static int out_channels = 2;   /* the device's (and the dump's): 2, or 6 for 5.1 */
 static FILE *dump;
 static uint32_t dump_bytes;
 
@@ -613,6 +902,15 @@ static void output_error(const char *operation, MMRESULT result) {
 static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
 static uint64_t out_opened, out_stall_since;
 static unsigned out_played, out_peak, out_reported;
+/* (hookshot) A device gone (a Bluetooth headset off, the audio service restarted: "no driver", "invalid handle" from the
+   next call) is closed and the default opened again; none opening, the default is tried every second until one does.
+   Opened as the default, the output follows Windows': its key (au_default_key) looked at every second, a change reopens
+   there. Before, a call that failed this way was only logged, the same block tried again for good, and the game had no
+   sound for the rest of the run, on any device (RX 5500M laptop, a WH-CH720N headset) */
+static int out_retry, out_reopens;
+static uint64_t out_retry_at, out_default_seen;
+static uint32_t out_default_key;   /* (0: not opened as the default, or Windows did not say which it is) */
+static int au_device_gone(MMRESULT r) { return r == 2 || r == 5 || r == 6; }   /* BADDEVICEID, INVALHANDLE, NODRIVER */
 static int output_try(int candidate, const WAVEFORMATEX *f) {
     const char *want = getenv("HOS_AUDIO_DEVICE");
     unsigned device;
@@ -620,46 +918,62 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
         if (!want || !*want) return 0;
         device = (unsigned)atoi(want);
     } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
-    const MMRESULT result = waveOutOpen(&wout, device, f, 0, 0, CALLBACK_NULL);
+    const MMRESULT result = waveOutOpen(&wout, device, au_format(f), 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
         output_error("waveOutOpen", result);
         wout = NULL;
         return 0;
     }
     au_opened(wout);
+    out_default_key = device == WAVE_MAPPER ? au_default_key() : 0;
+    out_default_seen = au_ms();
     char name[64];
     if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
     else au_device_name(device, name, sizeof name);
-    hos_log("audio: output on %s (%u devices)", name, au_device_count());
+    hos_log("audio: output on %s (%u devices), %s", name, au_device_count(), f->nChannels == 6 ? "5.1" : "stereo");
     return 1;
 }
+/* The channels: the game's speakers (au_speakers). A 5.1 format no device takes is stereo instead: the device sink's
+   six channels are then mixed down, nothing is lost. */
 static void output_open(void) {
     static int dump_done;
-    const char *d = getenv("HOS_AUDIO_DUMP");
-    if (!dump_done && d && (dump = fopen(d, "wb")) != NULL) {
-        static const uint8_t z[44];
-        fwrite(z, 1, 44, dump);
+    int channels = au_speakers();
+    if (!dump_done) {
+        const char *d = getenv("HOS_AUDIO_DUMP");
+        if (d && (dump = fopen(d, "wb")) != NULL) {
+            static const uint8_t z[44];
+            fwrite(z, 1, 44, dump);
+        }
+        out_channels = channels;
+        dump_done = 1;
     }
-    dump_done = 1;
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
-    WAVEFORMATEX f = {0};
-    f.wFormatTag = WAVE_FORMAT_PCM;
-    f.nChannels = 2;
-    f.nSamplesPerSec = RATE;
-    f.wBitsPerSample = 16;
-    f.nBlockAlign = 4;
-    f.nAvgBytesPerSec = RATE * 4;
-    const int candidates = 2 + (int)au_device_count();
-    for (int tried = 0; tried < candidates && !wout; tried++) {
-        const int c = out_next;
-        out_next = (out_next + 1) % candidates;
-        output_try(c, &f);
+    if (dump) channels = out_channels;   /* (a dump keeps one layout: no stereo fallback) */
+    for (;;) {
+        WAVEFORMATEX f = {0};
+        f.wFormatTag = WAVE_FORMAT_PCM;
+        f.nChannels = channels;
+        f.nSamplesPerSec = RATE;
+        f.wBitsPerSample = 16;
+        f.nBlockAlign = 2 * channels;
+        f.nAvgBytesPerSec = RATE * 2 * channels;
+        const int candidates = 2 + (int)au_device_count();
+        for (int tried = 0; tried < candidates && !wout; tried++) {
+            const int c = out_next;
+            out_next = (out_next + 1) % candidates;
+            output_try(c, &f);
+        }
+        if (wout || channels == 2 || dump) break;
+        hos_log("audio: no device took 5.1: stereo instead");
+        channels = 2;
     }
+    out_channels = channels;
+    out_retry = !wout, out_retry_at = au_ms();   /* (none opened: tried again in a second, output_frame) */
     if (!wout) return;
     for (int i = 0; i < NBLOCKS; i++) {
         memset(&hdr[i], 0, sizeof hdr[i]);
         hdr[i].lpData = (LPSTR)blocks[i];
-        hdr[i].dwBufferLength = sizeof blocks[i];
+        hdr[i].dwBufferLength = FRAME * 2 * channels * sizeof blocks[0][0];   /* (two frames) */
         hdr[i].dwFlags = WHDR_DONE;
     }
     fill_block = fill_frames = 0;
@@ -667,24 +981,36 @@ static void output_open(void) {
     out_stall_since = 0;
     out_played = out_peak = out_reported = 0;
 }
-static void output_reopen(void) {
-    static int reopens;
-    out_stall_since = 0;
-    if (++reopens > 6) return;
-    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+static void output_close(void) {   /* (what fails here is not looked at: a device gone takes none of these calls) */
     waveOutReset(wout);
     for (int i = 0; i < NBLOCKS; i++)
         if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, &hdr[i], sizeof hdr[i]);
     waveOutClose(wout);
     wout = NULL;
+}
+static void output_reopen(void) {   /* (a device that takes nothing: the next candidate, 6 times; again after 30 s of sound) */
+    out_stall_since = 0;
+    if (++out_reopens > 6) return;
+    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+    output_close();
     output_open();
+}
+static void output_open_default(void) {   /* (HOS_AUDIO_DEVICE first when it is set, as at the start) */
+    const char *want = getenv("HOS_AUDIO_DEVICE");
+    out_next = want && *want ? 0 : 1;
+    output_open();
+}
+static void output_move(const char *why) {
+    hos_log("audio: %s: the output opened again on the default device", why);
+    output_close();
+    output_open_default();
 }
 static void dump_finish(void) {
     if (!dump) return;
     uint8_t h[44];
     memcpy(h, "RIFF", 4);
-    const uint32_t riff = 36 + dump_bytes, fmt = 16, rate = RATE, brate = RATE * 4, data = dump_bytes;
-    const uint16_t pcm = 1, ch = 2, align = 4, bits = 16;
+    const uint16_t pcm = 1, ch = (uint16_t)out_channels, align = (uint16_t)(2 * out_channels), bits = 16;
+    const uint32_t riff = 36 + dump_bytes, fmt = 16, rate = RATE, brate = RATE * align, data = dump_bytes;
     memcpy(h + 4, &riff, 4);
     memcpy(h + 8, "WAVEfmt ", 8);
     memcpy(h + 16, &fmt, 4);
@@ -702,8 +1028,8 @@ static void dump_finish(void) {
 }
 static void output_frame(const int16_t *pcm) {
     if (dump) {
-        fwrite(pcm, 4, FRAME, dump);
-        dump_bytes += FRAME * 4;
+        fwrite(pcm, (size_t)(2 * out_channels), FRAME, dump);
+        dump_bytes += (uint32_t)(FRAME * 2 * out_channels);
         static int n;
         if (++n % 200 == 0) {   /* (the header kept valid every second: the process may end without notice) */
             const long at = ftell(dump);
@@ -711,8 +1037,20 @@ static void output_frame(const int16_t *pcm) {
             fseek(dump, at, SEEK_SET);
         }
     }
-    if (!wout) return;
-    for (int i = 0; i < FRAME * 2; i++) {
+    if (!wout) {
+        if (!out_retry || au_ms() - out_retry_at < 1000) return;
+        output_open_default();   /* (the service back, a device plugged in) */
+        if (!wout) return;
+    }
+    if (out_default_key && au_ms() - out_default_seen >= 1000) {
+        out_default_seen = au_ms();
+        const uint32_t now = au_default_key();
+        if (now && now != out_default_key) {
+            output_move("Windows' default output changed");
+            if (!wout) return;
+        }
+    }
+    for (int i = 0; i < FRAME * out_channels; i++) {
         const unsigned a = (unsigned)(pcm[i] < 0 ? -pcm[i] : pcm[i]);
         if (a > out_peak) out_peak = a;
     }
@@ -734,11 +1072,12 @@ static void output_frame(const int16_t *pcm) {
             const MMRESULT result = waveOutUnprepareHeader(wout, h, sizeof *h);
             if (result != MMSYSERR_NOERROR) {
                 output_error("waveOutUnprepareHeader", result);
+                if (au_device_gone(result)) output_move("the output device went away");
                 return;   /* the driver has not released the header: do not change its samples or flags */
             }
         }
     }
-    memcpy(blocks[fill_block] + fill_frames * FRAME * 2, pcm, FRAME * 4);
+    memcpy(blocks[fill_block] + fill_frames * FRAME * out_channels, pcm, (size_t)(FRAME * 2 * out_channels));
     if (++fill_frames == 2) {
         h->dwFlags = 0;
         const char *operation = "waveOutPrepareHeader";
@@ -746,10 +1085,17 @@ static void output_frame(const int16_t *pcm) {
         if (result == MMSYSERR_NOERROR) {
             operation = "waveOutWrite";
             result = waveOutWrite(wout, h, sizeof *h);
-            if (result == MMSYSERR_NOERROR) out_played++;
+            if (result == MMSYSERR_NOERROR) {
+                out_played++;
+                if (out_reopens && au_ms() - out_opened > 30000) out_reopens = 0;   /* (sound again: the stall rule's 6 anew) */
+            }
         }
         if (result != MMSYSERR_NOERROR) {
             output_error(operation, result);
+            if (au_device_gone(result)) {
+                output_move("the output device went away");
+                return;
+            }
             /* A failed submission has no completion to set DONE. Reuse only a host-owned block; a prepared header
                is unprepared on its next turn. Without this, returning to this slot drops every later audio frame. */
             if (!(h->dwFlags & WHDR_INQUEUE)) h->dwFlags |= WHDR_DONE;
@@ -771,16 +1117,22 @@ static void output_frame(const int16_t *pcm) {
    its VoiceType for the next sound right after releasing it, so its handle names the new voice by the time the
    update comes (looked up then, a queued release ended the new sound: no footsteps or hits). A released slot stays
    taken until the update applies the release, so the indices hold for the queue's life.
+   The other way too: the wave buffers the mixer finishes reach the game at the next update (GetReleasedWaveBuffer
+   returns them, GetWaveBufferCount stops counting them), as the console's renderer reports them. Seen as the mixer
+   finished them, a pass over the voices could find the first ones full and a later one a buffer short: Ocarina's sound
+   thread feeds its six speaker voices that way, appended the short one an extra buffer, then one more each pass, until
+   the queue was full and that speaker went silent for good (a run in five or so).
    HOS_AUDIO_IMMEDIATE=1: every change applied as it comes (as before). */
 enum { OP_VOICE_RELEASE, OP_VOICE_DEST, OP_VOICE_MIX_VOLUME, OP_VOICE_VOLUME, OP_VOICE_PITCH, OP_VOICE_BIQUAD,
        OP_VOICE_STATE, OP_VOICE_APPEND, OP_MIX_RELEASE, OP_MIX_VOLUME, OP_MIX_DEST, OP_MIX_MIX_VOLUME, OP_SPLIT_RELEASE,
-       OP_SPLIT_DEST, OP_SPLIT_VOLUME };
+       OP_SPLIT_DEST, OP_SPLIT_VOLUME, OP_SPLIT_BIQUAD, OP_AUX_ENABLE, OP_AUX_MAP, OP_AUX_RELEASE };
 typedef struct {
     int op, idx, tgt;          /* our voice / mix / splitter; a destination mix or splitter (-1: none) */
     int i0, i1, i2;            /* (op-specific: a kind, an index, channels, a state) */
     uint64_t wbp;              /* an appended WaveBuffer's identity */
     float f, b[3], a[2];
     WB wb;
+    int8_t in[MAX_BUF], out[MAX_BUF];
 } Cmd;
 static Cmd *cmds;
 static int ncmds, cmds_cap;
@@ -793,6 +1145,8 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
         switch (k->op) {
         case OP_VOICE_RELEASE: v->used = 0; break;
         case OP_VOICE_DEST:
+            if (v->dest != k->tgt || v->dest_kind != k->i0)
+                memset(v->split_bq_epoch, 0, sizeof v->split_bq_epoch);
             v->dest = k->tgt;
             v->dest_kind = k->tgt < 0 ? DEST_NONE
                          : k->i0 == DEST_MIX ? (mixes[k->tgt].used ? DEST_MIX : DEST_NONE)
@@ -841,6 +1195,8 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
         case OP_MIX_RELEASE:
             m->used = 0;
             if (sink_mix == k->idx) sink_mix = -1;
+            for (int e = 0; e < MAX_EFFECTS; e++)
+                if (auxes[e].used && auxes[e].mix == k->idx) auxes[e].mix = -1;
             break;
         case OP_MIX_VOLUME: m->volume = k->f; break;
         case OP_MIX_DEST:   /* (a sub mix into a splitter: not used by TOTK so far) */
@@ -851,20 +1207,51 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
         }
         return;
     }
+    if (k->op >= OP_AUX_ENABLE) {
+        Aux *a = &auxes[k->idx];
+        if (!a->used) return;
+        switch (k->op) {
+        case OP_AUX_ENABLE:
+            a->active_enabled = k->i0;
+            aux_reset(a);
+            break;
+        case OP_AUX_MAP:
+            if (a->active_n != k->i0 || memcmp(a->active_in, k->in, (size_t)k->i0) ||
+                memcmp(a->active_out, k->out, (size_t)k->i0)) aux_reset(a);
+            a->active_n = k->i0;
+            memcpy(a->active_in, k->in, (size_t)k->i0);
+            memcpy(a->active_out, k->out, (size_t)k->i0);
+            a->send.capacity = a->ret.capacity = k->i0 ? a->sample_count / (FRAME * k->i0) * (FRAME * k->i0) : 0;
+            break;
+        case OP_AUX_RELEASE: memset(a, 0, sizeof *a); break;
+        }
+        return;
+    }
     Splitter *s = &splitters[k->idx];
     if (!s->used) return;
     switch (k->op) {
     case OP_SPLIT_RELEASE: s->used = 0; break;
-    case OP_SPLIT_DEST: s->dest_mix[k->i0] = tgt_mix; break;
+    case OP_SPLIT_DEST:
+        if (s->dest_mix[k->i0] != tgt_mix)
+            for (int f = 0; f < 2; f++) s->bq_epoch[k->i0][f] = ++split_bq_epoch;
+        s->dest_mix[k->i0] = tgt_mix;
+        break;
     case OP_SPLIT_VOLUME:
         s->vol[k->i0][k->i1][k->i2] = k->f;
         if (s->dest_mix[k->i0] < 0) s->dest_mix[k->i0] = tgt_mix;
+        break;
+    case OP_SPLIT_BIQUAD:
+        if (tgt_mix < 0 || s->dest_mix[k->i0] != tgt_mix) break;
+        if (s->bq_on[k->i0][k->i1] != k->i2) s->bq_epoch[k->i0][k->i1] = ++split_bq_epoch;
+        s->bq_on[k->i0][k->i1] = k->i2;
+        memcpy(s->bq_b[k->i0][k->i1], k->b, sizeof k->b);
+        memcpy(s->bq_a[k->i0][k->i1], k->a, sizeof k->a);
         break;
     }
 }
 static void submit(const Cmd *k) {   /* (with the lock held) */
     static int immediate = -1;
-    if (immediate < 0) immediate = getenv("HOS_AUDIO_IMMEDIATE") != NULL;
+    if (immediate < 0) immediate = env_on("HOS_AUDIO_IMMEDIATE");
     if (ncmds == cmds_cap && !immediate) {
         const int cap = cmds_cap ? cmds_cap * 2 : 4096;
         Cmd *grown = (Cmd *)realloc(cmds, (size_t)cap * sizeof *grown);
@@ -876,6 +1263,7 @@ static void submit(const Cmd *k) {   /* (with the lock held) */
 static void commit(void) {   /* (with the lock held) */
     for (int i = 0; i < ncmds; i++) apply(&cmds[i]);
     ncmds = 0;
+    for (int i = 0; i < MAX_VOICES; i++) voices[i].nrel_seen = voices[i].nrel;   /* (the finished buffers, to the game) */
 }
 
 /* The mixer's next deadline. `next` was the one just woken for; one frame is `period` later, on that same grid.
@@ -889,6 +1277,57 @@ static int64_t audio_mix_deadline(int64_t now, int64_t next, int64_t period) {
     return next;
 }
 
+/* ---- the player's volume (the Insert menu's Audio tab, gpu/vk/vk_menu.cpp) ------------------------------------- */
+/* The frame's samples (frames x channels, interleaved) scaled from `from`, the gain the last frame ended at, to `want`,
+   step by step over the frame, so a change does not click. The gains are 0 to 1: nothing clips. Returns the gain the
+   frame ended at. tests/test_audio_volume.py */
+static float audio_apply_gain(int16_t *pcm, int frames, int channels, float from, float want) {
+    if (from == 1.0f && want == 1.0f) return want;
+    for (int i = 0; i < frames; i++) {
+        const float g = from + (want - from) * (float)(i + 1) / (float)frames;
+        for (int c = 0; c < channels; c++) pcm[i * channels + c] = (int16_t)lrintf((float)pcm[i * channels + c] * g);
+    }
+    return want;
+}
+
+/* Whether the game's window counts as in front, as host/nn_hid.c's game_in_front decides it: the game's own window does,
+   another normal window does not, and an overlay (a tool or no-activate window: Steam's, Discord's, but also a toast or
+   a tray flyout) counts as the game's only while the last normal window in front was the game's. *last_normal_was_us
+   keeps that between calls. tests/test_audio_volume.py */
+static int audio_front_decide(int ours, int overlay, int *last_normal_was_us) {
+    if (ours) return *last_normal_was_us = 1;
+    if (overlay && *last_normal_was_us) return 1;
+    *last_normal_was_us = 0;
+    return 0;
+}
+static int audio_window_in_front(void) {   /* (the mixer thread's only: its own state, not game_in_front's) */
+    static int last_normal_was_us = 1;
+    DWORD pid = 0;
+    HWND w = GetForegroundWindow();
+    if (!w) return 0;
+    GetWindowThreadProcessId(w, &pid);
+    const int ours = pid == GetCurrentProcessId();
+    const int overlay = !ours && (GetWindowLongPtrA(w, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0;
+    return audio_front_decide(ours, overlay, &last_normal_was_us);
+}
+
+/* The Volume row's percent (0 to 100) as a gain (0 to 1), on a squared curve so the slider's steps sound about even: 50%
+   is a quarter, -12 dB. A straight line left the bottom half of the slider nearly all very quiet. */
+static float audio_volume_curve(int percent) {
+    const float v = (float)(percent < 0 ? 0 : percent > 100 ? 100 : percent) / 100.0f;
+    return v * v;
+}
+/* The gain the menu asks for: Volume and Mute in background. With no menu (the WebGPU renderer) the game plays at full
+   volume. */
+static float audio_player_gain(void) {
+    int rx_option(int id, int otherwise);
+    int volume = rx_option(HOS_OPT_VOLUME, 100);
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    if (volume && rx_option(HOS_OPT_MUTE_BACKGROUND, 0) && !audio_window_in_front()) volume = 0;
+    return audio_volume_curve(volume);
+}
+
 /* ---- the renderer thread --------------------------------------------------------------------------------------- */
 static uint64_t renderer_event;
 static volatile int renderer_running;
@@ -900,15 +1339,19 @@ static DWORD WINAPI renderer_main(void *p) {
     hos_thread_boost(2);
     output_open();
     int64_t period = 5000000, next = hos_now_ns() + period;   /* one audio frame: 240 samples at 48 kHz */
-    static int16_t pcm[FRAME * 2];
+    static int16_t pcm[FRAME * OUT_MAX_CH];
+    float gain = 1.0f, gain_want = 1.0f;
+    int gain_frames = 0;
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
         next = audio_mix_deadline(hos_now_ns(), next, period);
         if (!renderer_running) continue;
         au_lock();
         if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
-        render_frame(pcm);
+        render_frame(pcm, out_channels);
         au_unlock();
+        if (gain_frames-- <= 0) gain_want = audio_player_gain(), gain_frames = 20;   /* (the menu read every 100 ms) */
+        gain = audio_apply_gain(pcm, FRAME, out_channels, gain, gain_want);
         output_frame(pcm);
         elapsed_frames++;
         if (renderer_event) hos_system_event_signal(renderer_event);
@@ -949,7 +1392,12 @@ HLE(_ZN2nn5audio30GetRequiredBufferSizeForReverbEii) { RET(0x10000); }
 HLE(_ZN2nn5audio29GetRequiredBufferSizeForDelayENS_8TimeSpanEii) { RET(0x10000); }
 HLE(_ZN2nn5audio36GetRequiredBufferSizeForLightLimiterENS_8TimeSpanEii) { RET(0x1000); }
 HLE(_ZN2nn5audio43GetRequiredBufferSizeForAuxSendReturnBufferEPKNS0_22AudioRendererParameterEii) {
-    RET((uint64_t)(int)ARG(1) * (uint64_t)(int)ARG(2) * 4 + 0x100);   /* frames x channels of int32 */
+    const int frames = (int)ARG(1), channels = (int)ARG(2);
+    const int samples = ARG(0) ? (int)G32(ARG(0) + 4) : 0;
+    if (frames <= 0 || channels <= 0 || samples <= 0 ||
+        (uint64_t)frames * channels > (INT32_MAX - 191u) / (4u * (uint64_t)samples)) { RET(0); return; }
+    const uint64_t bytes = (uint64_t)frames * channels * samples * sizeof(int32_t);
+    RET(((bytes + 63) & ~63ULL) + 128);  /* cache-line-aligned samples plus two cursor blocks */
 }
 
 /* AudioRendererParameter: sampleRate, sampleCount, mixBufferCount, subMixCount, voiceCount, sinkCount, effectCount,
@@ -970,9 +1418,10 @@ HLE(_ZN2nn5audio29InitializeAudioRendererConfigEPNS0_19AudioRendererConfigERKNS0
     put_handle(ARG(0), K_CONFIG, 0);
 }
 
-/* The output device: one stereo device, "MainAudioOut". AudioDeviceName is char[256]. */
+/* The output device: one device, "MainAudioOut", stereo or 5.1 as the PC's default output (au_speakers).
+   AudioDeviceName is char[256]. */
 HLE(_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE) { hos_system_event_init(ARG(0), 1); }
-HLE(_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv) { RET(2); }
+HLE(_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv) { RET(au_speakers()); }
 HLE(_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE) {
     memset(GP(ARG(0)), 0, 256);
     memcpy(GP(ARG(0)), "MainAudioOut", 12);
@@ -1000,6 +1449,11 @@ HLE(_ZN2nn5audio17GetSampleByteSizeENS0_12SampleFormatE) {
    a handle only. The three words written into it before overwrote the 16 bytes after it: MKW keeps pool objects
    where those bytes are a heap's links (its "Sound" heap's free list broke). */
 static struct { uint64_t addr, size; int used; } au_pools[1024];
+/* (hookshot) the handle lives in the game's MemoryPoolType (guest memory): its index is checked against the table */
+static int pool_index(uint64_t obj) {
+    const int i = get_handle(obj, K_POOL);
+    return i >= 0 && i < 1024 && au_pools[i].used ? i : -1;
+}
 HLE(_ZN2nn5audio17AcquireMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeEPvm) {
     au_lock();
     int i = 0;
@@ -1011,7 +1465,7 @@ HLE(_ZN2nn5audio17AcquireMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPool
     RET(1);
 }
 HLE(_ZN2nn5audio17ReleaseMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeE) {
-    const int i = get_handle(ARG(1), K_POOL);
+    const int i = pool_index(ARG(1));
     if (i >= 0) au_pools[i].used = 0;
     G64(ARG(1)) = 0;
 }
@@ -1019,11 +1473,11 @@ HLE(_ZN2nn5audio23RequestAttachMemoryPoolEPNS0_14MemoryPoolTypeE) { RET(1); }
 HLE(_ZN2nn5audio23RequestDetachMemoryPoolEPNS0_14MemoryPoolTypeE) { RET(1); }
 HLE(_ZN2nn5audio20IsMemoryPoolAttachedEPKNS0_14MemoryPoolTypeE) { RET(1); }
 HLE(_ZN2nn5audio20GetMemoryPoolAddressEPKNS0_14MemoryPoolTypeE) {
-    const int i = get_handle(ARG(0), K_POOL);
+    const int i = pool_index(ARG(0));
     RET(i >= 0 ? au_pools[i].addr : 0);
 }
 HLE(_ZN2nn5audio17GetMemoryPoolSizeEPKNS0_14MemoryPoolTypeE) {
-    const int i = get_handle(ARG(0), K_POOL);
+    const int i = pool_index(ARG(0));
     RET(i >= 0 ? au_pools[i].size : 0);
 }
 
@@ -1153,6 +1607,27 @@ static void set_split_volume(Ctx *c) {
 }
 HLE(_ZN2nn5audio20SetSplitterMixVolumeEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEfii) { set_split_volume(c); }
 HLE(_ZN2nn5audio20SetSplitterMixVolumeEPNS0_12SplitterTypeEiPNS0_12FinalMixTypeEfii) { set_split_volume(c); }
+
+/* Float biquad parameters: bool enable @0, float numerator[3] @4, denominator[2] @16.
+   Copy now: callers reuse the parameter memory before RequestUpdateAudioRenderer. */
+static void read_float_biquad(Cmd *k, uint64_t p) {
+    memcpy(k->b, GP(p + 4), sizeof k->b);
+    memcpy(k->a, GP(p + 16), sizeof k->a);
+}
+static void set_split_biquad(Ctx *c) {
+    au_lock();
+    const int d = (int)ARG(1), f = (int)ARG(3), mix = mix_index(ARG(2));
+    Splitter *s = splitter_of(ARG(0));
+    if (s && d >= 0 && d < s->dests && f >= 0 && f < 2 && mix >= 0 && ARG(4)) {
+        Cmd k = {.op = OP_SPLIT_BIQUAD, .idx = (int)(s - splitters), .tgt = mix,
+                 .i0 = d, .i1 = f, .i2 = *(uint8_t *)GP(ARG(4)) != 0};
+        read_float_biquad(&k, ARG(4));
+        submit(&k);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEiRKNS0_22TBiquadFilterParameterIfEE) { set_split_biquad(c); }
+HLE(_ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_12FinalMixTypeEiRKNS0_22TBiquadFilterParameterIfEE) { set_split_biquad(c); }
 
 /* ---- the device sink: AddDeviceSink(config, DeviceSinkType*, FinalMixType*, const int8* input, int count, name) - */
 HLE(_ZN2nn5audio13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc) {
@@ -1289,10 +1764,8 @@ HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquad
     Voice *v = voice_of(ARG(0));
     const int f = (int)ARG(1);
     if (v && f >= 0 && f < 2 && ARG(2)) {
-        const uint64_t p = ARG(2);
-        Cmd k = {.op = OP_VOICE_BIQUAD, .idx = (int)(v - voices), .i0 = f, .i1 = *(uint8_t *)GP(p) != 0};
-        memcpy(k.b, GP(p + 4), sizeof k.b);
-        memcpy(k.a, GP(p + 16), sizeof k.a);
+        Cmd k = {.op = OP_VOICE_BIQUAD, .idx = (int)(v - voices), .i0 = f, .i1 = *(uint8_t *)GP(ARG(2)) != 0};
+        read_float_biquad(&k, ARG(2));
         submit(&k);
     }
     au_unlock();
@@ -1350,10 +1823,11 @@ HLE(_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
     uint64_t r = 0;
-    if (v && v->nrel) {
+    if (v && v->nrel_seen) {   /* (those released by the last update: see "parameter updates") */
         r = v->rel[0];
         memmove(v->rel, v->rel + 1, (size_t)(v->nrel - 1) * sizeof v->rel[0]);
         v->nrel--;
+        v->nrel_seen--;
     }
     au_unlock();
     RET(r);
@@ -1361,7 +1835,7 @@ HLE(_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE) {
 HLE(_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
-    RET(v ? v->nwb + v->pending_wb : 0);
+    RET(v ? v->nwb + v->pending_wb + (v->nrel - v->nrel_seen) : 0);   /* (finished since the last update: still queued) */
     au_unlock();
 }
 HLE(_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE) {
@@ -1372,14 +1846,128 @@ HLE(_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE) {
 }
 HLE(_ZN2nn5audio20IsVoiceDroppedFlagOnEPKNS0_9VoiceTypeE) { RET(0); }
 
-/* ---- effects: accepted, not processed (the dry signal goes through) -------------------------------------------- */
-HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeEPvS7_m) { RET(0); }
-HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeEPvS7_m) { RET(0); }
-HLE(_ZN2nn5audio12IsAuxEnabledEPKNS0_7AuxTypeE) { RET(1); }
-HLE(_ZN2nn5audio14IsAuxRemovableEPKNS0_7AuxTypeE) { RET(1); }
-HLE(_ZN2nn5audio17ReadAuxSendBufferEPNS0_7AuxTypeEPii) { RET(0); }
-HLE(_ZN2nn5audio20WriteAuxReturnBufferEPNS0_7AuxTypeEPKii) { RET((int)ARG(2)); }
-HLE(_ZN2nn5audio17GetAuxSampleCountEPKNS0_7AuxTypeE) { RET(0); }
+/* ---- Aux API --------------------------------------------------------------------------------------------------- */
+static Aux *aux_of(uint64_t obj) {
+    const int i = get_handle(obj, K_AUX);
+    return i >= 0 && i < MAX_EFFECTS && auxes[i].used && !auxes[i].released ? &auxes[i] : NULL;
+}
+static void add_aux(Ctx *c) {
+    au_lock();
+    int e = 0;
+    while (e < MAX_EFFECTS && auxes[e].used) e++;
+    const int m = mix_index(ARG(2));
+    const uint64_t bytes = ARG(5);
+    if (e == MAX_EFFECTS || m < 0 || !ARG(1) || !ARG(3) || !ARG(4) ||
+        bytes < 128 + FRAME * sizeof(int32_t) || bytes > INT32_MAX ||
+        (ARG(3) < ARG(4) ? ARG(4) - ARG(3) : ARG(3) - ARG(4)) < bytes) {
+        au_unlock();
+        RET(0x1A9 << 9 | 153);
+        return;
+    }
+    Aux *a = &auxes[e];
+    memset(a, 0, sizeof *a);
+    a->used = a->enabled = 1;
+    a->mix = m;
+    a->order = ++effect_order;
+    a->sample_count = (int)(((bytes - 128) / sizeof(int32_t)) & ~15ULL) / FRAME * FRAME;
+    memset(GP(ARG(3)), 0, (size_t)bytes);
+    memset(GP(ARG(4)), 0, (size_t)bytes);
+    a->send.data = (int32_t *)GP(ARG(3) + 128);
+    a->ret.data = (int32_t *)GP(ARG(4) + 128);
+    put_handle(ARG(1), K_AUX, e);
+    const Cmd k = {.op = OP_AUX_ENABLE, .idx = e, .i0 = 1};
+    submit(&k);
+    AUT("audio: aux %d on mix %d, %d samples", e, m, a->sample_count);
+    au_unlock();
+    RET(0);
+}
+HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeEPvS7_m) { add_aux(c); }
+HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeEPvS7_m) { add_aux(c); }
+static void remove_aux(Ctx *c) {
+    au_lock();
+    Aux *a = aux_of(ARG(1));
+    if (a) {
+        a->released = 1;
+        const Cmd k = {.op = OP_AUX_RELEASE, .idx = (int)(a - auxes)};
+        submit(&k);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio9RemoveAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeE) { remove_aux(c); }
+HLE(_ZN2nn5audio9RemoveAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeE) { remove_aux(c); }
+HLE(_ZN2nn5audio13SetAuxEnabledEPNS0_7AuxTypeEb) {
+    au_lock();
+    Aux *a = aux_of(ARG(0));
+    if (a) {
+        a->enabled = (int)ARG(1) & 1;
+        const Cmd k = {.op = OP_AUX_ENABLE, .idx = (int)(a - auxes), .i0 = a->enabled};
+        submit(&k);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio12IsAuxEnabledEPKNS0_7AuxTypeE) {
+    au_lock();
+    const Aux *a = aux_of(ARG(0));
+    RET(a ? a->enabled : 0);
+    au_unlock();
+}
+HLE(_ZN2nn5audio14IsAuxRemovableEPKNS0_7AuxTypeE) {
+    au_lock();
+    const Aux *a = aux_of(ARG(0));
+    RET(a && !a->enabled && !a->active_enabled);
+    au_unlock();
+}
+HLE(_ZN2nn5audio17SetAuxInputOutputEPNS0_7AuxTypeEPKaS4_i) {
+    au_lock();
+    Aux *a = aux_of(ARG(0));
+    int n = (int)ARG(3);
+    if (a && a->mix >= 0 && n >= 0 && n <= MAX_BUF && (n == 0 || (ARG(1) && ARG(2)))) {
+        if (n > mixes[a->mix].buffers) n = mixes[a->mix].buffers;
+        Cmd k = {.op = OP_AUX_MAP, .idx = (int)(a - auxes), .i0 = n};
+        if (n) {
+            memcpy(k.in, GP(ARG(1)), (size_t)n);
+            memcpy(k.out, GP(ARG(2)), (size_t)n);
+        }
+        a->n = n;
+        memcpy(a->in, k.in, (size_t)n);
+        memcpy(a->out, k.out, (size_t)n);
+        submit(&k);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio17GetAuxInputOutputEPKNS0_7AuxTypeEPaS4_Pii) {
+    au_lock();
+    const Aux *a = aux_of(ARG(0));
+    int n = a ? a->n : 0;
+    if (n > (int)ARG(4)) n = (int)ARG(4);
+    if (n < 0) n = 0;
+    if (n && ARG(1) && ARG(2)) {
+        memcpy(GP(ARG(1)), a->in, (size_t)n);
+        memcpy(GP(ARG(2)), a->out, (size_t)n);
+    }
+    if (ARG(3)) G32(ARG(3)) = n;
+    au_unlock();
+}
+HLE(_ZN2nn5audio17ReadAuxSendBufferEPNS0_7AuxTypeEPii) {
+    au_lock();
+    Aux *a = aux_of(ARG(0));
+    RET(a && ARG(1) ? aux_ring_read(&a->send, (int32_t *)GP(ARG(1)), (int)ARG(2)) : 0);
+    au_unlock();
+}
+HLE(_ZN2nn5audio20WriteAuxReturnBufferEPNS0_7AuxTypeEPKii) {
+    au_lock();
+    Aux *a = aux_of(ARG(0));
+    RET(a && ARG(1) ? aux_ring_write(&a->ret, (const int32_t *)GP(ARG(1)), (int)ARG(2)) : 0);
+    au_unlock();
+}
+HLE(_ZN2nn5audio17GetAuxSampleCountEPKNS0_7AuxTypeE) {
+    au_lock();
+    const Aux *a = aux_of(ARG(0));
+    RET(a ? a->sample_count : 0);  /* allocation capacity, not the number currently waiting to be read */
+    au_unlock();
+}
+
+/* ---- other effects --------------------------------------------------------------------------------------------- */
 HLE(_ZN2nn5audio17IsReverbRemovableEPKNS0_10ReverbTypeE) { RET(1); }
 HLE(_ZN2nn5audio22IsBufferMixerRemovableEPKNS0_15BufferMixerTypeE) { RET(1); }
 HLE(_ZN2nn5audio22IsI3dl2ReverbRemovableEPKNS0_15I3dl2ReverbTypeE) { RET(1); }
@@ -1412,6 +2000,7 @@ static void add_reverb(Ctx *c) {
     Reverb *rv = &reverbs[e];
     memset(rv, 0, sizeof *rv);
     rv->used = 1;
+    rv->order = ++effect_order;
     rv->mix = m;
     rv->n = (int)ARG(5) > MAX_CH ? MAX_CH : (int)ARG(5);
     for (int k = 0; k < MAX_CH; k++) rv->in[k] = rv->out[k] = (int8_t)k;

@@ -26,6 +26,7 @@
    pad } = 0x28 bytes. */
 #include "hos.h"
 #include "hos_paths.h"
+#include "control.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,11 @@
 #include <windows.h>
 #include <xinput.h>
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
+#include "hos_motion.h"
+#include "auto_run.h"   /* (the Insert menu's Auto run) */
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
 #define STATE_SIZE 0x28
@@ -137,6 +143,63 @@ static void mouse_look_tick(void) {
     if (fabs(look_x) < 1e-6 && fabs(look_y) < 1e-6) look_x = look_y = 0;
 }
 
+/* (host/oot_menu.c) A drag of the free mouse in the game's own menus (the map, the tapestry): panned as
+   the camera's mouse is (mouse_look_move, mouse_look_tick: the same sensitivity, least deflection and decay), on the
+   left stick (right = 0: the map's and the tapestry's pan) or the right (1: Key Items' stones turned). The pixels it
+   moved (y up) come from the game's thread; the read takes them. The camera's 0.03 a count is for raw counts, several
+   to a screen pixel at a mouse's usual DPI: a pixel here is HOS_MENU_DRAG_GAIN of them (6) */
+/* (display.c hides the free mouse in the game's menus while the player uses a pad or the keys) the last
+   time the player's pads (a button, a stick past a third) or bound keys were used */
+static volatile LONG64 player_input_ns;
+int64_t hos_player_input_ns(void) { return InterlockedCompareExchange64(&player_input_ns, 0, 0); }
+static void player_used(void) { InterlockedExchange64(&player_input_ns, hos_now_ns()); }
+static volatile LONG drag_dx, drag_dy, drag_right;
+static double drag_x, drag_y;
+void hos_hid_drag(int dx, int dy, int right) {
+    if (right != (int)drag_right) InterlockedExchange(&drag_right, right);
+    InterlockedExchangeAdd(&drag_dx, dx);
+    InterlockedExchangeAdd(&drag_dy, dy);
+}
+static void host_drag_read(int32_t stick[4]) {
+    static int64_t next_tick;
+    const int64_t now = hos_now_ns();
+    const int dx = (int)InterlockedExchange(&drag_dx, 0), dy = (int)InterlockedExchange(&drag_dy, 0);
+    if (dx || dy) {
+        static double gain = -1;
+        if (gain < 0) {
+            const char *e = getenv("HOS_MENU_DRAG_GAIN");
+            gain = e && atof(e) > 0 ? atof(e) : 6.0;
+        }
+        const double k = (hos_mouse_sens > 0 ? hos_mouse_sens : 1.0) * 0.03 * gain;
+        drag_x += dx * k;
+        drag_y += dy * k;
+        const double length = sqrt(drag_x * drag_x + drag_y * drag_y), least = 0.2;
+        if (length > 0 && length < least) drag_x *= least / length, drag_y *= least / length;
+    }
+    if (drag_x == 0 && drag_y == 0) { next_tick = 0; return; }
+    double ox = drag_x, oy = drag_y;
+    const double shown = sqrt(ox * ox + oy * oy);
+    if (shown > 1) ox /= shown, oy /= shown;
+    const int32_t v[2] = {(int32_t)(ox * 32767), (int32_t)(oy * 32767)};
+    const int at = drag_right ? 2 : 0;
+    for (int i = 0; i < 2; i++)
+        if ((v[i] < 0 ? -v[i] : v[i]) > (stick[at + i] < 0 ? -stick[at + i] : stick[at + i])) stick[at + i] = v[i];
+    /* (the decay, a tick each 10 ms since the last read, as the camera's) */
+    int64_t ticks = next_tick ? (now - next_tick) / MOUSE_TICK_NS + 1 : 1;
+    if (ticks > 10) ticks = 10;
+    next_tick = now + MOUSE_TICK_NS;
+    static double decay_rate = -1, min_decay;
+    if (decay_rate < 0) decay_rate = mouse_percent("HOS_MOUSE_DECAY", 0.30), min_decay = mouse_percent("HOS_MOUSE_MIN_DECAY", 0.20);
+    for (int64_t t = 0; t < ticks; t++) {
+        double length = sqrt(drag_x * drag_x + drag_y * drag_y);
+        if (length > 1.5) drag_x *= 1.5 / length, drag_y *= 1.5 / length, length = 1.5;
+        const double c = length < 1 ? length : 1, decay = 1 - c * c * decay_rate, most = 1 - min_decay;
+        const double keep = decay < most ? (decay > 0 ? decay : 0) : most;
+        drag_x *= keep, drag_y *= keep;
+    }
+    if (fabs(drag_x) < 1e-6 && fabs(drag_y) < 1e-6) drag_x = drag_y = 0;
+}
+
 /* While the ability wheel is open (L held, Q on the keyboard), the mouse points instead of panning (MacNativeGames
    2d0f0f0, MIT): the wheel picks the ability the right stick points at, and with panning the stick settled back to
    the centre as soon as the mouse stopped, taking the pick with it. The stick starts at the centre, stays where the
@@ -145,7 +208,7 @@ static void mouse_look_tick(void) {
 static int invert = -1;
 static void mouse_setup(void) {   /* (once: the sensitivity kept in <user>/mouse_sens.txt, HOS_MOUSE_SENS, the inversion) */
     if (invert < 0) {
-        invert = getenv("HOS_MOUSE_INVERT_Y") != NULL;
+        invert = env_on("HOS_MOUSE_INVERT_Y");
         hos_mouse_sens = 1.0;
         char path[512];
         snprintf(path, sizeof path, "%s/mouse_sens.txt", hos_user_dir ? hos_user_dir : "user");
@@ -264,12 +327,15 @@ static void parse_script(void) {
     {
         const char *e = getenv("HOS_INPUT_FRAME_CLOCK");
         script_frame_clock = e && atoi(e) != 0;
-        if (script_frame_clock) script_frame0 = InterlockedCompareExchange64(&hos_present_count, 0, 0);
+        if (script_frame_clock) {
+            script_frame0 = InterlockedCompareExchange64(&hos_present_count, 0, 0);
+            hos_log("hid: input frame clock origin=%lld native presents; rate=60", (long long)script_frame0);
+        }
     }
     parse_presses(getenv("HOS_INPUT_SCRIPT"), 0, 0);
     if (npresses)
-        hos_log("hid: input script of %d presses (last at %.0f s; the player's devices count too)", npresses,
-                script_end_ms / 1000.0);
+        hos_log("hid: input script of %d presses (last at %.0f s; the player's devices count too); origin_ns=%lld", npresses,
+                script_end_ms / 1000.0, (long long)script_t0);
 }
 
 static void live_input(void) {
@@ -303,6 +369,13 @@ static void live_input(void) {
                 if (!strncmp(line, "!flasharm", 9)) rx_flash_dark_arm();
                 extern volatile int hos_oot_live_action;   /* host/hos_main.c: "!cheat <action>", as the Cheats page sends */
                 if (!strncmp(line, "!cheat ", 7)) __atomic_store_n(&hos_oot_live_action, atoi(line + 7), __ATOMIC_RELAXED);
+                void hos_bind(int set, int button, int slot, int code);   /* "!bind <HOS_SW_*> <HOS_PAD_*>", as the Controls page */
+                int bind_b = -1, bind_pad = -2;
+                if (!strncmp(line, "!bind ", 6) && sscanf(line + 6, "%d %d", &bind_b, &bind_pad) == 2 &&
+                    bind_b >= 0 && bind_b < HOS_SW_N)
+                    hos_bind(HOS_BIND_PAD, bind_b, 0, bind_pad);
+                extern volatile int hos_prompts_row;   /* host/prompts.c: "!prompts <0 Auto, HOS_PROMPT_* + 1>", as the row */
+                if (!strncmp(line, "!prompts ", 9)) __atomic_store_n(&hos_prompts_row, atoi(line + 9), __ATOMIC_RELAXED);
                 hos_log("hid: live command at %.1f s: %.*s", at / 1000.0, (int)(n > 1 ? n - 1 : 0), line);
                 continue;
             }
@@ -358,9 +431,15 @@ static int parse_presses(const char *s, int64_t base_ms, int live) {
     return got;
 }
 
+/* the host's own presses and stick (host/oot_menu.c: the game's menus' mouse), below: taken with the script's */
+static void host_taps(void);
+static void host_stick_read(int32_t stick[4]);
+static void host_drag_read(int32_t stick[4]);   /* (above) */
+
 static void scripted_input(uint64_t *buttons, int32_t stick[4]) {
     if (npresses < 0) parse_script();
     live_input();
+    host_taps();
     const int64_t ms = script_elapsed_ms(hos_now_ns());
     for (int i = 0; i < npresses; i++)
         if (ms >= presses[i].start_ms && ms < presses[i].end_ms) {
@@ -368,6 +447,51 @@ static void scripted_input(uint64_t *buttons, int32_t stick[4]) {
             for (int k = 0; k < 4; k++)
                 if (presses[i].stick[k]) stick[k] = presses[i].stick[k];
         }
+    host_stick_read(stick);
+    host_drag_read(stick);
+}
+
+/* (host/oot_menu.c) presses from the host, in the script's syntax ("0:A/100"), from now: the game's pause
+   menu's clicks. Any thread; the next read takes them */
+static SRWLOCK tap_lock = SRWLOCK_INIT;
+static char tap_text[256];
+void hos_hid_tap(const char *press) {
+    AcquireSRWLockExclusive(&tap_lock);
+    const size_t n = strlen(tap_text);
+    if (n + strlen(press) + 2 < sizeof tap_text) snprintf(tap_text + n, sizeof tap_text - n, "%s%s", n ? "," : "", press);
+    ReleaseSRWLockExclusive(&tap_lock);
+}
+/* a stick from the host (the pause menu's map: a drag pans, the wheel zooms): the four axes (left x, y,
+   right x, y; +-32767) until hold_ms from now, the latest call's */
+static volatile LONG host_stick[4];
+static volatile LONG64 host_stick_until;
+void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms) {
+    InterlockedExchange(&host_stick[0], lx), InterlockedExchange(&host_stick[1], ly);
+    InterlockedExchange(&host_stick[2], rx), InterlockedExchange(&host_stick[3], ry);
+    InterlockedExchange64(&host_stick_until, hos_now_ns() + (int64_t)hold_ms * 1000000);
+}
+static void host_stick_read(int32_t stick[4]) {
+    if (hos_now_ns() >= InterlockedCompareExchange64(&host_stick_until, 0, 0)) return;
+    {   /* (HOS_MENU_TRACE: the stick as the game reads it, at most 4 a second) */
+        static int trace = -1;
+        static int64_t logged;
+        if (trace < 0) trace = env_on("HOS_MENU_TRACE");
+        if (trace && hos_now_ns() - logged > 250000000)
+            logged = hos_now_ns(), hos_log("hid: the host's stick %ld %ld %ld %ld read", (long)host_stick[0], (long)host_stick[1],
+                                          (long)host_stick[2], (long)host_stick[3]);
+    }
+    for (int i = 0; i < 4; i++) {
+        const int32_t v = (int32_t)host_stick[i];
+        if ((v < 0 ? -v : v) > (stick[i] < 0 ? -stick[i] : stick[i])) stick[i] = v;
+    }
+}
+static void host_taps(void) {
+    char text[sizeof tap_text];
+    AcquireSRWLockExclusive(&tap_lock);
+    memcpy(text, tap_text, sizeof text);
+    tap_text[0] = 0;
+    ReleaseSRWLockExclusive(&tap_lock);
+    if (text[0]) parse_presses(text, script_elapsed_ms(hos_now_ns()), 1);
 }
 
 static void stick_max(int32_t stick[4], const int32_t v[4]) {
@@ -375,34 +499,64 @@ static void stick_max(int32_t stick[4], const int32_t v[4]) {
         if ((v[i] < 0 ? -v[i] : v[i]) > (stick[i] < 0 ? -stick[i] : stick[i])) stick[i] = v[i];
 }
 
-/* ---- (hookshot) the controls: the gamepad input (by position) and the keys that press each Switch button, from
-   hookshot_options.ini beside the executable when it has them: pad_<button>=<HOS_PAD_* position, -1 none> and
+/* ---- (hookshot) the controls: the gamepad inputs (by position) and the keys that press each Switch button, from
+   hookshot_options.ini beside the executable when it has them: pad_<button>=<position>[,<position>] (HOS_PAD_*, -1 none) and
    key_<button>=<key code>,<key code> (Windows key codes, 0 none), <button> one of bind_names. Read once, at the
    first use; what the file leaves out keeps its default. Keys only, after the Switch's buttons (HOS_KEY_*): the left
-   stick's and the camera's directions. A key can be a mouse button (1 2 4 5 6: left, right, middle, 4, 5), which counts
+   stick's and the camera's directions, and the ocarina's five note controls (which take a gamepad input too).
+   A key can be a mouse button (1 2 4 5 6: left, right, middle, 4, 5), which counts
    only while the mouse is captured ---- */
 static const char *const bind_names[HOS_KEY_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus",
                                                   "minus", "left", "up", "right", "down", "move_up", "move_down",
                                                   "move_left", "move_right", "cam_up", "cam_down", "cam_left",
-                                                  "cam_right"};
+                                                  "cam_right", "note_l", "note_r", "note_a", "note_y", "note_x"};
 static const signed char pad_default[HOS_SW_N] = {
     HOS_PAD_EAST, HOS_PAD_SOUTH, HOS_PAD_NORTH, HOS_PAD_WEST, HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER,
     HOS_PAD_RSHOULDER, HOS_PAD_LTRIGGER, HOS_PAD_RTRIGGER, HOS_PAD_START, HOS_PAD_BACK, HOS_PAD_LEFT, HOS_PAD_UP,
     HOS_PAD_RIGHT, HOS_PAD_DOWN};
+static int is_note_row(int i) { return i >= HOS_KEY_OC_NOTE_L && i <= HOS_KEY_OC_NOTE_X; }
+static int has_pad(int i) { return i < HOS_SW_N || is_note_row(i); }
+#ifndef VK_XBUTTON1
+#define VK_XBUTTON1 0x05
+#define VK_XBUTTON2 0x06
+#endif
+/* (a mouse button bound to a note row would be seen by nobody: oc_notes never reads the mouse) */
+static int is_mouse_vk(int vk) { return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
+                                        vk == VK_XBUTTON1 || vk == VK_XBUTTON2; }
 /* (the keys of totk-pc-recomp's docs/controls.md, github.com/valentderah/totk-pc-recomp, MIT; plus Enter for Plus; the
    mouse's left button Y, attack, and right button ZL, shield and lock-on, as before; WASD the left stick, the arrows or
    IJKL the camera) */
 static const unsigned char key_default[HOS_KEY_N][2] = {
     {'E'}, {VK_SHIFT}, {VK_SPACE}, {VK_LBUTTON}, {VK_CONTROL}, {'C'}, {'Q'}, {'R'}, {'Z', VK_RBUTTON}, {'X', 'F'},
     {VK_TAB, VK_RETURN}, {'M'}, {'1'}, {'2'}, {'3'}, {'4'}, {'W'}, {'S'}, {'A'}, {'D'}, {VK_UP, 'I'}, {VK_DOWN, 'K'},
-    {VK_LEFT, 'J'}, {VK_RIGHT, 'L'}};
-static volatile LONG pad_bind[HOS_SW_N], key_bind[HOS_KEY_N][2];   /* (the menu changes them as the game reads them) */
+    {VK_LEFT, 'J'}, {VK_RIGHT, 'L'}, {0}, {0}, {0}, {0}, {0}};   /* (the five note rows start unset: oc_pad_word) */
+static SRWLOCK pad_bind_lock = SRWLOCK_INIT;
+static int pad_bind[HOS_KEY_N][2];
+static volatile LONG key_bind[HOS_KEY_N][2];   /* (the menu changes them as the game reads them) */
+
+/* ---- (hookshot) the ocarina's five note controls, driven by the wait flag nx2/oot_patches.py's patch sets ---- */
+volatile uint64_t hos_oc_note_bits;
+volatile int hos_oc_wait;
+volatile int hos_oc_last_kind;
+volatile unsigned hos_oc_beat;   /* (stamped by the wait action's tick: a wait nobody ticks is not a wait) */
+static LONG oc_consumed_keys[256];
+static uint64_t oc_consumed_pads;
 
 static void binds_default(void) {
+    AcquireSRWLockExclusive(&pad_bind_lock);
     for (int i = 0; i < HOS_KEY_N; i++) {
-        if (i < HOS_SW_N) InterlockedExchange(&pad_bind[i], pad_default[i]);
-        for (int k = 0; k < 2; k++) InterlockedExchange(&key_bind[i][k], key_default[i][k]);
+        pad_bind[i][0] = i < HOS_SW_N ? pad_default[i] : -1;   /* (the note rows: -1, unset) */
+        pad_bind[i][1] = -1;
     }
+    ReleaseSRWLockExclusive(&pad_bind_lock);
+    for (int i = 0; i < HOS_KEY_N; i++)
+        for (int k = 0; k < 2; k++) InterlockedExchange(&key_bind[i][k], key_default[i][k]);
+}
+
+static int pad_code(const char *text) {
+    char *end;
+    const long code = strtol(text, &end, 10);
+    return end != text && code >= 0 && code < HOS_PAD_N ? (int)code : -1;
 }
 
 static void binds_load(void) {
@@ -433,13 +587,13 @@ static void binds_load(void) {
             const int pad = !strncmp(line, "pad_", 4), keys = !strncmp(line, "key_", 4);
             had_keys |= keys;
             for (int i = 0; (pad || keys) && i < HOS_KEY_N; i++) {
-                if (strcmp(line + 4, bind_names[i]) || (pad && i >= HOS_SW_N)) continue;
+                if (strcmp(line + 4, bind_names[i]) || (pad && !has_pad(i))) continue;
                 changed++;
+                const char *comma = strchr(eq + 1, ',');
                 if (pad) {
-                    const int v = atoi(eq + 1);
-                    pad_bind[i] = v >= 0 && v < HOS_PAD_N ? v : -1;
+                    pad_bind[i][0] = pad_code(eq + 1);
+                    pad_bind[i][1] = comma ? pad_code(comma + 1) : -1;
                 } else {
-                    const char *comma = strchr(eq + 1, ',');
                     const int a = atoi(eq + 1), b = comma ? atoi(comma + 1) : 0;
                     key_bind[i][0] = a > 0 && a < 256 ? a : 0;
                     key_bind[i][1] = b > 0 && b < 256 ? b : 0;
@@ -464,36 +618,92 @@ static void binds_load(void) {
 }
 int hos_binding(int set, int button, int slot) {
     binds_load();
-    if (button < 0 || button >= (set == HOS_BIND_PAD ? HOS_SW_N : HOS_KEY_N) || slot < 0 || slot > 1)
+    if (button < 0 || button >= HOS_KEY_N || slot < 0 || slot > 1)
         return set == HOS_BIND_PAD ? -1 : 0;
-    return set == HOS_BIND_PAD ? (slot ? -1 : (int)pad_bind[button]) : (int)key_bind[button][slot];
+    if (set != HOS_BIND_PAD) return (int)key_bind[button][slot];
+    AcquireSRWLockShared(&pad_bind_lock);
+    const int code = pad_bind[button][slot];
+    ReleaseSRWLockShared(&pad_bind_lock);
+    return code;
 }
-/* A gamepad input moved to another button gives that one this button's old input (one button an input, none left
-   without); a key moved to it is taken from the others */
+/* A gamepad input already bound to a slot trades places with the input being replaced; into an empty slot it is
+   taken only from a button that keeps another gamepad input (no button left without one). A key moved to a slot
+   is taken from the others. The ocarina's note rows are outside both rules: they take nothing and are not taken
+   from, so one input can be a note and its other control at once (the note wait consumes it as a note, oc_notes) */
 void hos_bind(int set, int button, int slot, int code) {
     binds_load();
     if (button < 0) {
         binds_default();
         return;
     }
-    if (button >= (set == HOS_BIND_PAD ? HOS_SW_N : HOS_KEY_N) || slot < 0 || slot > 1) return;
+    if (button >= HOS_KEY_N || slot < 0 || slot > 1) return;
     if (set == HOS_BIND_PAD) {
-        if (slot || code < -1 || code >= HOS_PAD_N) return;
-        const LONG old = pad_bind[button];
-        for (int i = 0; i < HOS_SW_N; i++)
-            if (i != button && code >= 0 && pad_bind[i] == code) InterlockedExchange(&pad_bind[i], old);
-        InterlockedExchange(&pad_bind[button], code);
+        if (!has_pad(button) || code < -1 || code >= HOS_PAD_N) return;
+        AcquireSRWLockExclusive(&pad_bind_lock);
+        if (button < HOS_SW_N) {   /* (among the Switch's buttons: the slot rules; the note rows keep theirs) */
+            const int old = pad_bind[button][slot];
+            if (code >= 0 && code != old) {
+                /* (the input taken from where it is: it gets the replaced input; with none (an empty Input 2), its own
+                   other input moves into its Input 1; a button it is the only gamepad input of keeps it, and nothing changes) */
+                for (int i = 0; i < HOS_SW_N; i++)
+                    for (int k = 0; k < 2; k++)
+                        if (pad_bind[i][k] == code && old < 0 && pad_bind[i][1 - k] < 0) {
+                            ReleaseSRWLockExclusive(&pad_bind_lock);
+                            return;
+                        }
+                for (int i = 0; i < HOS_SW_N; i++)
+                    for (int k = 0; k < 2; k++)
+                        if (pad_bind[i][k] == code) {
+                            if (old >= 0) pad_bind[i][k] = old;
+                            else if (k == 0) pad_bind[i][0] = pad_bind[i][1], pad_bind[i][1] = -1;
+                            else pad_bind[i][1] = -1;
+                        }
+            }
+        }
+        pad_bind[button][slot] = code;
+        ReleaseSRWLockExclusive(&pad_bind_lock);
     } else {
         if (code < 0 || code > 255) return;
-        for (int i = 0; i < HOS_KEY_N; i++)
-            for (int k = 0; k < 2; k++)
-                if (code && key_bind[i][k] == code) InterlockedExchange(&key_bind[i][k], 0);
+        if (is_note_row(button) && is_mouse_vk(code)) return;   /* (a note is a key or a pad button, never a mouse click) */
+        if (!is_note_row(button))
+            for (int i = 0; i < HOS_KEY_N; i++)
+                if (!is_note_row(i))
+                    for (int k = 0; k < 2; k++)
+                        if (code && key_bind[i][k] == code) InterlockedExchange(&key_bind[i][k], 0);
         InterlockedExchange(&key_bind[button][slot], code);
     }
 }
 
+static uint64_t bound_pad_buttons(uint64_t raw) {
+    binds_load();
+    uint64_t buttons = 0;
+    AcquireSRWLockShared(&pad_bind_lock);
+    for (int i = 0; i < HOS_SW_N; i++) {
+        const int a = pad_bind[i][0], alt = pad_bind[i][1];
+        if ((a >= 0 && (raw >> a & 1) && !(oc_consumed_pads >> a & 1)) ||
+            (alt >= 0 && (raw >> alt & 1) && !(oc_consumed_pads >> alt & 1))) buttons |= 1ULL << i;
+    }
+    ReleaseSRWLockShared(&pad_bind_lock);
+    return buttons;
+}
+
 static volatile LONG pad_raw_now;   /* the gamepads' inputs at the last read, 1 << HOS_PAD_* */
+static int pad_after_menu;          /* (the menu just closed: the pads wait until they are let go; oc_pad_word too) */
 uint32_t hos_pad_raw(void) { return (uint32_t)pad_raw_now; }
+
+/* Apply the Insert menu's Stick dead zone to each stick as a pair, for XInput and SDL.
+   Keep both components outside the circle so the filter does not snap toward an axis. */
+void hos_filter_stick(int16_t x, int16_t y, int zone, int32_t out[2]) {
+    static const int32_t cut[6] = {7849, 1638, 3277, 4915, 6553, 9830};
+    const int32_t a = x < -32767 ? -32767 : x, b = y < -32767 ? -32767 : y;
+    const int32_t t = cut[(unsigned)zone < 6 ? zone : 0];
+    const int active = a * a + b * b > t * t;   /* both components are clamped, so the sum fits in int32_t */
+    out[0] = active ? a : 0;
+    out[1] = active ? b : 0;
+}
+
+static volatile int xinput_pads_now;   /* (pads_read: the controllers XInput has, while it is polled) */
+int hos_xinput_pads(void) { return xinput_pads_now; }   /* (host/prompts.c: Auto's face) */
 
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     static int64_t next_read, retry[XUSER_MAX_COUNT];
@@ -509,69 +719,83 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
     next_read = now + 2000000;
     uint64_t raw = 0;   /* (by position: 1 << HOS_PAD_*) */
     int32_t s[4] = {0};
+    int sdl_pads = 0;
     {   /* every controller SDL knows (DualSense, DualShock 4, Switch Pro, ...: hos/pad_sdl.c) */
         int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);
         static int was;
         const int n = hos_sdl_pads(&raw, s);
         if (n != was) hos_log("hid: %d controller%s through SDL", n, n == 1 ? "" : "s");
         was = n;
+        sdl_pads = n;
     }
 #ifdef __EMSCRIPTEN__
     xinput_get = XInputGetState;
 #endif
-    if (!xinput_get) {
-        static int64_t load_retry;
-        if (now >= load_retry) {
-            load_retry = now + 5000000000LL;
-            HMODULE x = LoadLibraryA("xinput1_4.dll");
-            if (!x) x = LoadLibraryA("xinput9_1_0.dll");
-            if (x) xinput_get = (XInputGetStateFn)GetProcAddress(x, "XInputGetState");
+    /* Polling XInput alongside SDL causes double-reads and conflicting button mappings when Steam Input
+       or controller wrappers emulate an XInput controller for a pad SDL is already reading (#1480, #1583).
+       Only poll XInput when SDL has no open controllers, unless HOS_XINPUT=1 is explicitly requested. */
+    static int poll_xinput_env = -1;
+    if (poll_xinput_env < 0) poll_xinput_env = env_on("HOS_XINPUT");
+    if (!sdl_pads || poll_xinput_env) {
+        if (!xinput_get) {
+            static int64_t load_retry;
+            if (now >= load_retry) {
+                load_retry = now + 5000000000LL;
+#ifdef _WIN32   /* (hookshot: System32's, not one beside the game, in the current folder or on PATH) */
+                HMODULE x = LoadLibraryExA("xinput1_4.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (!x) x = LoadLibraryExA("xinput9_1_0.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+#else
+                HMODULE x = LoadLibraryA("xinput1_4.dll");
+                if (!x) x = LoadLibraryA("xinput9_1_0.dll");
+#endif
+                if (x) xinput_get = (XInputGetStateFn)GetProcAddress(x, "XInputGetState");
+            }
         }
-    }
-    static const struct { WORD x; int b; } map[] = {
-        {XINPUT_GAMEPAD_A, HOS_PAD_SOUTH}, {XINPUT_GAMEPAD_B, HOS_PAD_EAST}, {XINPUT_GAMEPAD_X, HOS_PAD_WEST},
-        {XINPUT_GAMEPAD_Y, HOS_PAD_NORTH}, {XINPUT_GAMEPAD_LEFT_THUMB, HOS_PAD_LSTICK},
-        {XINPUT_GAMEPAD_RIGHT_THUMB, HOS_PAD_RSTICK}, {XINPUT_GAMEPAD_LEFT_SHOULDER, HOS_PAD_LSHOULDER},
-        {XINPUT_GAMEPAD_RIGHT_SHOULDER, HOS_PAD_RSHOULDER}, {XINPUT_GAMEPAD_START, HOS_PAD_START},
-        {XINPUT_GAMEPAD_BACK, HOS_PAD_BACK}, {XINPUT_GAMEPAD_DPAD_LEFT, HOS_PAD_LEFT},
-        {XINPUT_GAMEPAD_DPAD_UP, HOS_PAD_UP}, {XINPUT_GAMEPAD_DPAD_RIGHT, HOS_PAD_RIGHT},
-        {XINPUT_GAMEPAD_DPAD_DOWN, HOS_PAD_DOWN}};
-    for (int p = 0; p < XUSER_MAX_COUNT && xinput_get; p++) {
-        if (now < retry[p]) continue;
-        XINPUT_STATE xs;
-        if (xinput_get((DWORD)p, &xs) != ERROR_SUCCESS) {
-            if (was_connected[p]) hos_log("hid: controller %d disconnected", p);
-            was_connected[p] = 0;
-            retry[p] = now + 1000000000LL;
-            continue;
+        static const struct { WORD x; int b; } map[] = {
+            {XINPUT_GAMEPAD_A, HOS_PAD_SOUTH}, {XINPUT_GAMEPAD_B, HOS_PAD_EAST}, {XINPUT_GAMEPAD_X, HOS_PAD_WEST},
+            {XINPUT_GAMEPAD_Y, HOS_PAD_NORTH}, {XINPUT_GAMEPAD_LEFT_THUMB, HOS_PAD_LSTICK},
+            {XINPUT_GAMEPAD_RIGHT_THUMB, HOS_PAD_RSTICK}, {XINPUT_GAMEPAD_LEFT_SHOULDER, HOS_PAD_LSHOULDER},
+            {XINPUT_GAMEPAD_RIGHT_SHOULDER, HOS_PAD_RSHOULDER}, {XINPUT_GAMEPAD_START, HOS_PAD_START},
+            {XINPUT_GAMEPAD_BACK, HOS_PAD_BACK}, {XINPUT_GAMEPAD_DPAD_LEFT, HOS_PAD_LEFT},
+            {XINPUT_GAMEPAD_DPAD_UP, HOS_PAD_UP}, {XINPUT_GAMEPAD_DPAD_RIGHT, HOS_PAD_RIGHT},
+            {XINPUT_GAMEPAD_DPAD_DOWN, HOS_PAD_DOWN}};
+        for (int p = 0; p < XUSER_MAX_COUNT && xinput_get; p++) {
+            if (now < retry[p]) continue;
+            XINPUT_STATE xs;
+            if (xinput_get((DWORD)p, &xs) != ERROR_SUCCESS) {
+                if (was_connected[p]) hos_log("hid: controller %d disconnected", p);
+                was_connected[p] = 0;
+                int any = 0;
+                for (int q = 0; q < XUSER_MAX_COUNT; q++) any |= was_connected[q];
+                xinput_pads_now = any;
+                retry[p] = now + 1000000000LL;
+                continue;
+            }
+            if (!was_connected[p]) hos_log("hid: controller %d connected", p);
+            was_connected[p] = 1;
+            xinput_pads_now = 1;
+            const WORD w = xs.Gamepad.wButtons;
+            for (unsigned i = 0; i < sizeof map / sizeof *map; i++)
+                if (w & map[i].x) raw |= 1ULL << map[i].b;
+            if (xs.Gamepad.bLeftTrigger > 64) raw |= 1ULL << HOS_PAD_LTRIGGER;
+            if (xs.Gamepad.bRightTrigger > 64) raw |= 1ULL << HOS_PAD_RTRIGGER;
+            const int16_t thumb[4] = {xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY, xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY};
+            int32_t v[4];
+            int rx_option(int id, int otherwise);
+            const int zone = rx_option(11, 0);   /* (the menu's Stick dead zone) */
+            hos_filter_stick(thumb[0], thumb[1], zone, v);
+            hos_filter_stick(thumb[2], thumb[3], zone, v + 2);
+            if (rx_option(16, 0)) v[2] = -v[2];
+            if (rx_option(17, 0)) v[3] = -v[3];
+            stick_max(s, v);
         }
-        if (!was_connected[p]) hos_log("hid: controller %d connected", p);
-        was_connected[p] = 1;
-        const WORD w = xs.Gamepad.wButtons;
-        for (unsigned i = 0; i < sizeof map / sizeof *map; i++)
-            if (w & map[i].x) raw |= 1ULL << map[i].b;
-        if (xs.Gamepad.bLeftTrigger > 64) raw |= 1ULL << HOS_PAD_LTRIGGER;
-        if (xs.Gamepad.bRightTrigger > 64) raw |= 1ULL << HOS_PAD_RTRIGGER;
-        const int16_t thumb[4] = {xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY, xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY};
-        int32_t v[4];
-        for (int i = 0; i < 4; i++) {
-            const int a = thumb[i] < -32767 ? -32767 : thumb[i];
-            v[i] = (a > 7849 || a < -7849) ? a : 0;
-        }
-        int rx_option(int id, int otherwise);
-        if (rx_option(16, 0)) v[2] = -v[2];
-        if (rx_option(17, 0)) v[3] = -v[3];
-        stick_max(s, v);
     }
     InterlockedExchange(&pad_raw_now, (LONG)raw);
     /* Back and Start together open the Insert menu (gpu/vk/vk_menu.cpp, for pads whose Home button the system
        keeps): they reach the game only one at a time */
     const uint64_t chord = 1ULL << HOS_PAD_BACK | 1ULL << HOS_PAD_START;
     if ((raw & chord) == chord) raw &= ~chord;
-    binds_load();
-    uint64_t b = 0;
-    for (int i = 0; i < HOS_SW_N; i++)
-        if (pad_bind[i] >= 0 && (raw >> pad_bind[i] & 1)) b |= 1ULL << i;
+    const uint64_t b = bound_pad_buttons(raw);
     cached_buttons = b;
     memcpy(cached_stick, s, sizeof s);
     *buttons |= b;
@@ -582,6 +806,21 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
    otherwise the Insert menu's "Controller in background" row */
 static int pads_in_background(const char *env, int menu) {
     return env ? atoi(env) != 0 : menu != 0;
+}
+/* (read_input's rule for the background, for the ocarina's notes there: oc_pad_word) */
+static int pads_behind(void) {
+    static const char *env;
+    static int looked;
+    if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
+    return pads_in_background(env, rx_option(4, 0));
+}
+
+/* (hookshot) Whether a pad's motion counts: when its buttons do, with the game's window in front, or behind another
+   window when the player asked for the pads there, and never while the Insert menu is open (insert: read_input holds the
+   buttons and sticks back then). Otherwise GetSixAxisSensorStates hands out the pad at rest, so a gyro moved while the
+   player is in another window or in the menu does not turn the camera. tests/test_motion_background.py */
+static int motion_counts(int front, const char *env, int menu, int insert) {
+    return !insert && (front || pads_in_background(env, menu));
 }
 
 #ifndef VK_XBUTTON1
@@ -604,6 +843,7 @@ static int bound_down(int i, int mouse) {
     for (int k = 0; k < 2; k++) {
         const int vk = (int)key_bind[i][k];
         if (vk <= 0) continue;
+        if (oc_consumed_keys[vk]) continue;   /* (drives an ocarina note this frame, not this control: oc_notes) */
         const int m = mouse_vk_slot(vk);
         if (m >= 0 ? mouse && mouse_armed[m] && key(vk) : kmap_down(key_bind[i][k], key)) return 1;
     }
@@ -613,10 +853,15 @@ static int bound_down(int i, int mouse) {
 static uint64_t flight_input;
 static uint64_t free_camera_axes;
 static int free_camera_height;
+static int move_stick_held;   /* (the left stick pushed as the game got it: hos_move_stick_held) */
 
 uint64_t hos_flight_input(void) {
     return __atomic_load_n(&flight_input, __ATOMIC_RELAXED);
 }
+
+/* The left stick as the game got it is pushed (the Debug tab's Movement speed scales Link only while the player steers him: not a
+   scene's walk) */
+int hos_move_stick_held(void) { return __atomic_load_n(&move_stick_held, __ATOMIC_RELAXED); }
 
 uint64_t hos_free_camera_input(int *height) {
     *height = __atomic_load_n(&free_camera_height, __ATOMIC_RELAXED);
@@ -654,10 +899,103 @@ static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int 
     return mode > 0;
 }
 
+/* (the ocarina's note layer, rebuilt every read_input(): the note rows' held state, then their inputs marked consumed) */
+static void oc_notes(void) {
+    binds_load();
+    int wait = hos_oc_wait;
+    /* (a wait nobody ticks is not a wait: an action a pause cancelled must not keep eating the shared keys) */
+    if (wait == 1) {
+        static uint64_t last_beat;
+        static int64_t beat_ns;
+        const uint64_t beat = hos_oc_beat;
+        const int64_t now = hos_now_ns();
+        if (beat != last_beat) last_beat = beat, beat_ns = now;
+        else if (now - beat_ns > 500000000LL) wait = hos_oc_wait = 0;
+    }
+    static int last_wait;
+    if (wait != last_wait) {
+        last_wait = wait;
+        hos_log("oc: the note wait turned %s (the action's kind %d)",
+                wait == 1 ? "on (buttons)" : wait == 2 ? "on (another way)" : "off", hos_oc_last_kind);
+    }
+    memset(oc_consumed_keys, 0, sizeof oc_consumed_keys);
+    oc_consumed_pads = 0;
+    uint64_t bits = 0;
+    if (wait != 1) {
+        hos_oc_note_bits = 0;
+        return;
+    }
+    /* (behind another window the keys are not the player's input, only the pads may be: oc_pad_word) */
+    const int keys = game_in_front();
+    AcquireSRWLockShared(&pad_bind_lock);
+    for (int i = 0; i < 5; i++) {
+        const int row = HOS_KEY_OC_NOTE_L + i;
+        int held = keys && bound_down(row, 0);
+        for (int k = 0; k < 2 && !held; k++)
+            if (pad_bind[row][k] >= 0 && (pad_raw_now >> pad_bind[row][k] & 1)) held = 1;
+        if (held) bits |= 1ULL << i;
+    }
+    for (int i = 0; i < 5; i++) {
+        const int row = HOS_KEY_OC_NOTE_L + i;
+        for (int k = 0; k < 2; k++) {
+            if (pad_bind[row][k] >= 0) oc_consumed_pads |= 1ULL << pad_bind[row][k];
+            const int vk = (int)key_bind[row][k];
+            if (vk > 0 && mouse_vk_slot(vk) < 0) oc_consumed_keys[vk] = 1;
+        }
+    }
+    ReleaseSRWLockShared(&pad_bind_lock);
+    hos_oc_note_bits = bits;
+}
+
+/* (npad_states writes the game's one merged word: during a button wait its five note buttons are the note controls) */
+static uint64_t oc_pad_word(uint64_t buttons) {
+    if (hos_oc_wait != 1) return buttons;
+    /* (no notes where read_input gives the game no player input either: menu open, pads held after it, background
+       unless the pads count there) */
+    if (rx_option(1, 0) || pad_after_menu || (!game_in_front() && !pads_behind())) return buttons;
+    static const uint64_t note_to[5] = {1ULL << HOS_SW_L, 1ULL << HOS_SW_R, 1ULL << HOS_SW_A,
+                                        1ULL << HOS_SW_Y, 1ULL << HOS_SW_X};
+    uint64_t w = buttons;
+    AcquireSRWLockShared(&pad_bind_lock);
+    for (int i = 0; i < 5; i++) {
+        const int row = HOS_KEY_OC_NOTE_L + i;
+        if (pad_bind[row][0] < 0 && pad_bind[row][1] < 0 && !key_bind[row][0] && !key_bind[row][1])
+            continue;   /* (unset: that button plays on) */
+        /* (kind 2, the song lesson, teaches the game's own note buttons: the remap adds to them, never replaces) */
+        if (hos_oc_last_kind != 2) w &= ~note_to[i];
+        if (hos_oc_note_bits & (1ULL << i)) w |= note_to[i];
+    }
+    ReleaseSRWLockShared(&pad_bind_lock);
+    return w;
+}
+
+/* (hookshot) The pads into the game's input, in front and behind other windows alike: while the Insert menu is open they
+   are its own, as the keyboard is (key()), and after it closed until they are let go (the press that closed it never
+   reaches the game). They are read either way, so the letting go is seen. Whether they were used (a button, or a stick
+   past a third) */
+static int pads_merge(uint64_t *buttons, int32_t stick[4]) {
+    uint64_t pb = 0;
+    int32_t ps[4] = {0};
+    pads_read(&pb, ps);
+    if (rx_option(1, 0)) pad_after_menu = 1;
+    else if (pad_after_menu && !pad_raw_now) pad_after_menu = 0;
+    if (!pad_after_menu) {
+        *buttons |= pb;
+        stick_max(stick, ps);
+    }
+    return pb || ps[0] > 12000 || ps[0] < -12000 || ps[1] > 12000 || ps[1] < -12000 || ps[2] > 12000 || ps[2] < -12000 ||
+           ps[3] > 12000 || ps[3] < -12000;
+}
+
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
+    void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
+    /* (hookshot) HOS_CONTROL: the control bridge's presses (host/control.c); one that asked to be exclusive keeps the
+       player's devices out while it lasts */
+    if (hos_control_input(buttons, stick)) return;
+    oc_notes();   /* (marks the note rows' inputs consumed before the pads and keys below are read) */
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
        while the game's window is in front, like the keyboard: XInput is global, so a test run in the background
@@ -665,7 +1003,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     /* (hookshot) The player's devices count during a script too (the user plays along in test runs, 2026-11-05):
        the presses add to theirs. HOS_INPUT_EXCLUSIVE=1: the script alone until 5 s after its last press, as before */
     static int exclusive = -1;
-    if (exclusive < 0) exclusive = getenv("HOS_INPUT_EXCLUSIVE") != NULL;
+    if (exclusive < 0) exclusive = env_on("HOS_INPUT_EXCLUSIVE");
     if (exclusive && npresses > 0 && script_elapsed_ms(hos_now_ns()) < script_end_ms + 5000)
         return;
     /* (hookshot, issue 389) A scripted press (HOS_INPUT_SCRIPT, HOS_INPUT_LIVE) is the test's own, not the
@@ -673,44 +1011,37 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
        monitor while the player works in the front window. HOS_INPUT_BACKGROUND still decides the pads. */
     static int scripted_background = -1;
     if (scripted_background < 0) {
-        scripted_background = getenv("HOS_INPUT_SCRIPT_BACKGROUND") != NULL;
+        scripted_background = env_on("HOS_INPUT_SCRIPT_BACKGROUND");
         if (scripted_background) hos_log("hid: scripted input runs with the game in the background (HOS_INPUT_SCRIPT_BACKGROUND)");
     }
     if (!game_in_front() && !scripted_background) {   /* (the pads alone, when the player asked for them behind other windows) */
         static const char *env;
         static int looked;
         if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
-        if (pads_in_background(env, rx_option(4, 0))) pads_read(buttons, stick);
+        if (pads_in_background(env, rx_option(4, 0))) pads_merge(buttons, stick);
         return;
     }
-    {   /* (hookshot) while the Insert menu is open the pads are its own, as the keyboard is (key()), and after it
-           closed until they are let go (the press that closed it never reaches the game) */
-        uint64_t pb = 0;
-        int32_t ps[4] = {0};
-        pads_read(&pb, ps);
-        static int after_menu;
-        if (rx_option(1, 0)) after_menu = 1;
-        else if (after_menu && !pad_raw_now) after_menu = 0;
-        if (!after_menu) {
-            *buttons |= pb;
-            stick_max(stick, ps);
-        }
-    }
+    if (pads_merge(buttons, stick)) player_used();
     binds_load();   /* (the keys: key_default's, or hookshot_options.ini's; the mouse's buttons once its capture is known) */
     for (int i = 0; i < HOS_SW_N; i++)
-        if (bound_down(i, 0)) *buttons |= 1ULL << i;
+        if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used();
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
-       stick; also the stick while no camera has been found (mouse_native.c gives the motion back) */
+       stick; also the stick while the game does not give the camera free control (a menu, a lock-on, the pause menu,
+       other cameras: mouse_native.c) and while a button it takes the stick for is held: ZR (the bow's aim), L (the
+       item wheel) or R, where the mouse points as it does in As the stick */
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");
     const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
     int hos_mouse_native(void);
+    void hos_mouse_native_free(int free);
+    const uint64_t game_stick = (1ULL << B_ZR) | (1ULL << B_L) | (1ULL << B_R);
     int captured = 0, as_stick = !native;
     if (native) {
         mouse_setup();
         mouse_sens_keys();
+        hos_mouse_native_free(!(*buttons & game_stick));
         captured = hos_mouse_native();
         if (captured < 0) captured = 0, as_stick = 1;
     }
@@ -729,6 +1060,10 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
                              (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
                              cx * 32767, cy * 32767};
     stick_max(stick, keys);
+    if (keys[0] || keys[1] || keys[2] || keys[3]) player_used();
+    /* (hookshot, mouse_native.c) the keys and the pads are the right stick too: while they turn the camera, its angles are
+       the native mouse's new start, so the two do not undo each other */
+    hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);
@@ -751,6 +1086,8 @@ static void npad_states(Ctx *c) {
             hos_log("hid: the game read no controller for %.1f s (lr %#llx)", (now - last_read) / 1e9,
                     (unsigned long long)c->x[30]);
         if (connected) last_read = hos_hid_last_read = now;
+        void hos_prompts_live(void);   /* (hookshot, prompts.c: a new face or new controls shown at once) */
+        if (connected) hos_prompts_live();
         int known = 0;
         for (int i = 0; i < nseen; i++) known |= seen_ids[i] == id;
         if (!known && nseen < 16) {
@@ -780,7 +1117,21 @@ static void npad_states(Ctx *c) {
             stick[0] = stick[1] = 0;
             buttons &= ~(climb | (1ULL << B_L));
         }
+        /* (hookshot) Auto run (Controls; host/auto_run.h): A (the sprint) held long enough while moving and then let go
+           stays held for the game while the stick is pushed and Link is the player's to move. After the flight and the
+           free camera, which take the stick (none left: nothing kept). The ocarina's note wait (hos_oc_wait 1: A is a
+           note there, oc_pad_word) ends it too, so a kept A is never heard as a held note */
+        {
+            int hos_oot_player_free(void);
+            static AutoRun auto_run;
+            static int logged_lock;
+            const int on = rx_option(HOS_OPT_AUTO_RUN, 0) != 0;
+            buttons = hos_auto_run(&auto_run, buttons, stick[0], stick[1], on,
+                                   !menu_open && hos_oc_wait != 1 && hos_oot_player_free(), hos_now_ns());
+            if (auto_run.locked && !logged_lock) logged_lock = 1, hos_log("hid: auto run: A kept held for the sprint");
+        }
         __atomic_store_n(&flight_input, flight, __ATOMIC_RELAXED);
+        __atomic_store_n(&move_stick_held, abs(stick[0]) > 4096 || abs(stick[1]) > 4096, __ATOMIC_RELAXED);
         __atomic_store_n(&free_camera_axes, axes, __ATOMIC_RELAXED);
         __atomic_store_n(&free_camera_height, height, __ATOMIC_RELAXED);
     }
@@ -793,7 +1144,7 @@ static void npad_states(Ctx *c) {
         uint64_t e = out + (uint64_t)i * STATE_SIZE;
         memset(GP(e), 0, STATE_SIZE);
         G64(e) = (uint64_t)(s - i);
-        G64(e + 8) = buttons;
+        G64(e + 8) = oc_pad_word(buttons);   /* (while the game waits for a note button, the five are the controls: oc_notes) */
         memcpy(GP(e + 16), stick, 16);
         G32(e + 32) = connected ? ATTR_CONNECTED : 0;
     }
@@ -804,6 +1155,31 @@ HLE(_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj) { npad_states(c); }
 HLE(_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj) { npad_states(c); }
 HLE(_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj) { npad_states(c); }
 HLE(_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj) { npad_states(c); }
+/* GetNpadState(State* out, unsigned int const& npadId): the latest state alone. Ocarina reads its pad with
+   GetNpadStates; a game that calls GetNpadState instead (Kirby Air Riders, for every style) got the SDK's own code,
+   which reads the shared memory this runtime does not map, and so no input at all. Only the full-key style is ever
+   reported (GetNpadStyleSet below), so only its state is the player's: GetNpadStates with a count of one. The other
+   styles' are a pad that is not there, as the console's are for a style the pad does not have: no buttons, centred
+   sticks, no attributes (not connected), and the sampling number the last reading had. They do not read the input:
+   a game that polls every style each frame would otherwise take each press, the menus' keys and the auto run's
+   state once for each style. (The GameCube controller's NpadGcState is another layout and is not answered: no Gc
+   style is ever reported either.) */
+static void npad_state_one(Ctx *c) {
+    const uint64_t id = ARG(1);
+    c->x[1] = 1;
+    c->x[2] = id;
+    npad_states(c);
+}
+static void npad_state_absent(Ctx *c) {
+    const uint64_t out = ARG(0);
+    memset(GP(out), 0, STATE_SIZE);
+    G64(out) = (uint64_t)sampling;
+}
+HLE(_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj) { npad_state_one(c); }
+HLE(_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj) { npad_state_absent(c); }
+HLE(_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj) { npad_state_absent(c); }
+HLE(_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj) { npad_state_absent(c); }
+HLE(_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj) { npad_state_absent(c); }
 /* GetNpadStyleSet(unsigned int const&) -> BitFlagSet<32, NpadStyleTag> */
 HLE(_ZN2nn3hid15GetNpadStyleSetERKj) { RET(G32(ARG(0)) == NPAD_NO1 ? STYLE_FULLKEY : 0); }
 
@@ -827,24 +1203,63 @@ HLE(_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_2
 /* Handles: six-axis ones are opaque u32s; a vibration handle is {u8 style type (3 = full key), u8 npad id, u8 device
    index (0 left, 1 right), u8 reserved}, which the SDK's vibration classes read. Vibration goes nowhere yet. */
 HLE(_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE) {
-    for (int i = 0; i < (int)ARG(1); i++) G32(ARG(0) + 4 * (uint64_t)i) = 0x100u + (uint32_t)i;
-    RET((int)ARG(1));
+    /* (hookshot) OoT asks for two (a Joy-Con pair) but runs its motion path only when three come back: at two its
+       third source (the console's own, through JCMS) stays dead, and that branch is what marks motion active for the
+       aim (spluton, issue 112). The count says three; only the handles asked for are written, so a caller's array
+       sized for two is never written past (the handles are opaque: GetSixAxisSensorStates does not read them). */
+    const int asked = (int)ARG(1) < 0 ? 0 : (int)ARG(1) > 16 ? 16 : (int)ARG(1);
+    static int logged;
+    if (!logged) logged = 1, hos_log("hid: six-axis handles: %d asked for, %d reported", asked, asked < 3 ? 3 : asked);
+    for (int i = 0; i < asked; i++) G32(ARG(0) + 4 * (uint64_t)i) = 0x100u + (uint32_t)i;
+    RET(asked < 3 ? 3 : asked);
 }
+/* SixAxisSensorState, 0x60 bytes: {i64 delta time (ns), i64 sampling number, f32 acceleration[3] (G), angular velocity[3]
+   (revolutions a second), angle[3] (revolutions), direction[3][3], u32 attributes (1 connected), pad}. Newest first.
+   (hookshot) With Motion controls on and a pad with a gyroscope (host/pad_sdl.c), the state OoT aims with
+   (host/hos_motion.h: the full state, as the console and Eden build it); else a pad lying still. */
 HLE(_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE) {
-    static int64_t six_sampling;
+    /* (the sampling number goes up once per reading, as the hardware's does: while live it is the readings' own count,
+       moved on past the last number handed out; each entry is its own reading, with the time since the one before) */
+    static int64_t six_sampling, six_base;
+    static int was_live;
     const uint64_t out = ARG(0);
-    const int count = (int)ARG(1) < 1 ? 0 : (int)ARG(1) > 32 ? 32 : (int)ARG(1);
-    const int64_t s = ++six_sampling;
+    const int count = (int)ARG(1) < 1 ? 0 : (int)ARG(1) > HOS_MOTION_HISTORY ? HOS_MOTION_HISTORY : (int)ARG(1);
     static const float at_rest[18] = {0, 0, -1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
-    for (int i = 0; i < count; i++) {
+    int hos_sdl_motion_history(HosMotionSample *out, int max);   /* pad_sdl.c */
+    HosMotionSample h[HOS_MOTION_HISTORY];
+    static const char *background_env;
+    static int background_looked;
+    if (!background_looked) background_looked = 1, background_env = getenv("HOS_INPUT_BACKGROUND");
+    const int counts = motion_counts(game_in_front(), background_env, rx_option(4, 0), rx_option(1, 0));
+    const int live = count && counts ? hos_sdl_motion_history(h, count) : 0;
+    /* (each switch between live and at rest moves the numbers a whole history past the last ones given out, so no entry
+       of one ever has a number an entry of the other had) */
+    if (live) {
+        if (!was_live || six_base + h[0].n < six_sampling) six_base = six_sampling + HOS_MOTION_HISTORY - h[0].n;
+        six_sampling = six_base + h[0].n;
+    } else {
+        six_sampling += was_live ? HOS_MOTION_HISTORY : 1;
+    }
+    was_live = live > 0;
+    const int n = live ? live : count;
+    for (int i = 0; i < n; i++) {
         const uint64_t e = out + (uint64_t)i * 0x60;
+        float v[18];
         memset(GP(e), 0, 0x60);
-        G64(e) = 5000000;
-        G64(e + 8) = (uint64_t)(s - i);
-        memcpy(GP(e + 0x10), at_rest, sizeof at_rest);
+        if (live) {
+            const HosMotionState *m = &h[i].st;
+            memcpy(v, m->accel, 12), memcpy(v + 3, m->gyro, 12), memcpy(v + 6, m->rotation, 12), memcpy(v + 9, m->direction, 36);
+            G64(e) = (uint64_t)(h[i].dt_ns > 0 ? h[i].dt_ns : 5000000);
+            G64(e + 8) = (uint64_t)(six_base + h[i].n);
+        } else {
+            memcpy(v, at_rest, sizeof v);
+            G64(e) = 5000000;
+            G64(e + 8) = (uint64_t)(six_sampling - i);
+        }
+        memcpy(GP(e + 0x10), v, sizeof v);
         G32(e + 0x58) = 1;
     }
-    RET(count);
+    RET(n);
 }
 HLE(_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE) {
     int n = (int)ARG(1) < 2 ? (int)ARG(1) : 2;
@@ -857,7 +1272,7 @@ HLE(_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14Vibrati
 /* nn::hid::detail vibration: what the SDK's own classes (VibrationNode, VibrationTarget, VibrationPlayer) call; on
    hardware each is an IPC to hid. A device is an LRA on its side of the controller, always mounted and permitted. */
 /* A vibration value for one of the two motors of the pad (handle +2 = device index): the pads that rumble (SDL) get
-   the stronger of the two sides' low and high band amplitudes. */
+   the stronger of the two sides' heavy and light motor strengths. (OoT sends both sides the same values.) */
 /* (issue 263) An HD rumble amplitude is not a motor's: OoT asks for 0.02-0.06 for most effects, a few percent of a DualSense's or an
    Xbox pad's motor, nothing you feel. Eden's SDL driver's mapping (Eglantine src/input_common/drivers/sdl_driver.cpp, GPL-3.0):
    (a + a^0.35) / 2, then less for higher frequencies, to give some feel of them */
@@ -871,13 +1286,37 @@ static float rumble_motor(float amp, float freq, float start, float width) {
     const float boosted = (amp + powf(amp, 0.35f)) * 0.5f;
     return boosted * scale > 1.0f ? 1.0f : boosted * scale;
 }
+/* How much of a band at this frequency the heavy (low-frequency) motor plays, 0 to 1; the light motor plays the rest.
+   The Switch's HD rumble bands overlap (low about 41-626 Hz, high about 82-1253 Hz, 160 and 320 Hz by default; OoT asks
+   for about 100-130 Hz low and 250-300 Hz high), so the band a value came in says less than its frequency: up to 160 Hz
+   is all heavy, from 200 Hz all light, and between them a crossfade on a log scale (log2(1.25), about a third of an
+   octave). The defaults and what OoT sends land on the same motors as before, with room below OoT's high band; a high
+   band played low reaches the heavy motor, a low band played high the light one. */
+#define RUMBLE_HEAVY_TOP 160.0f
+#define RUMBLE_LIGHT_BOTTOM 200.0f
+static float rumble_heavy_share(float freq) {
+    if (!(freq > RUMBLE_HEAVY_TOP)) return 1.0f;   /* (also a NaN or a 0 Hz value: the heavy motor, as the low band went) */
+    if (freq >= RUMBLE_LIGHT_BOTTOM) return 0.0f;
+    const float s = 1.0f - log2f(freq / RUMBLE_HEAVY_TOP) / log2f(RUMBLE_LIGHT_BOTTOM / RUMBLE_HEAVY_TOP);
+    return s < 0.0f ? 0.0f : s > 1.0f ? 1.0f : s;   /* (rounding: sqrtf below takes 1 - s) */
+}
+/* One VibrationValue {amp_low, freq_low, amp_high, freq_high} -> the motors' strengths, 0 to 1: motor[0] heavy, motor[1]
+   light. Each band keeps its strength (rumble_motor, with its band's falloff) and is split between the motors by its
+   frequency with constant power (sqrt of the shares), so a band in the crossfade is not felt weaker; each motor takes
+   the stronger of the two bands' parts. */
+static void rumble_map(const float v[4], float motor[2]) {
+    const float low = rumble_motor(v[0], v[1], 140.0f, 400.0f), high = rumble_motor(v[2], v[3], 200.0f, 700.0f);
+    const float lh = rumble_heavy_share(v[1]), hh = rumble_heavy_share(v[3]);
+    const float heavy[2] = {low * sqrtf(lh), high * sqrtf(hh)}, light[2] = {low * sqrtf(1.0f - lh), high * sqrtf(1.0f - hh)};
+    motor[0] = heavy[0] > heavy[1] ? heavy[0] : heavy[1];
+    motor[1] = light[0] > light[1] ? light[0] : light[1];
+}
 static void vibration_send(uint64_t handle, uint64_t value) {
     static float amp[2][2];
     float v[4];
     memcpy(v, GP(value), sizeof v);
     const int dev = (G32(handle) >> 16) & 1;
-    amp[dev][0] = rumble_motor(v[0], v[1], 140.0f, 400.0f);
-    amp[dev][1] = rumble_motor(v[2], v[3], 200.0f, 700.0f);
+    rumble_map(v, amp[dev]);
     {   /* (hookshot, issue 263) what the game asks for: the first values, then a count now and then */
         static long long n, strong;
         static float peak;
@@ -887,6 +1326,8 @@ static void vibration_send(uint64_t handle, uint64_t value) {
             hos_log("hid: vibration #%lld: handle %08x, low %.2f @ %.0f Hz, high %.2f @ %.0f Hz", n, G32(handle), v[0], v[1], v[2], v[3]);
         if ((++n & 4095) == 0) hos_log("hid: %lld vibration values, strongest %.2f since the last count", n, peak), peak = 0;
     }
+    void hos_sdl_rumble_hd(int side, const float value[4]);   /* pad_sdl.c: the value as it is, for HD rumble */
+    hos_sdl_rumble_hd(dev, v);
     void hos_sdl_rumble(float low, float high);   /* pad_sdl.c */
     hos_sdl_rumble(amp[0][0] > amp[1][0] ? amp[0][0] : amp[1][0], amp[0][1] > amp[1][1] ? amp[0][1] : amp[1][1]);
 }
@@ -933,10 +1374,18 @@ HLE(_ZN2nn3hid6detail28FlushEnqueuedVibrationValuesEv) { RET(0); }
    states written: one, with no touches (the lifted SDK version read the touch screen's shared memory, which this
    runtime does not have). TouchScreenState<16>: {s64 sampling number, s32 count, s32 reserved, TouchState[16]}. */
 HLE(_ZN2nn3hid21InitializeTouchScreenEv) {}
+static volatile LONG64 touch_sampling;
 HLE(_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi) {
-    static volatile LONG64 sampling;
     if ((int)ARG(1) < 1) { RET(0); return; }
     memset(GP(ARG(0)), 0, 16 + 16 * 0x28);
-    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&sampling);
+    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&touch_sampling);
     RET(1);
+}
+/* (dkb) GetTouchScreenState<1>(TouchScreenState<1>*): the latest state alone, with no touch, as the plural above. The
+   lifted SDK's read aborted: Donkey Kong Bananza reads the touch screen this way on its first frames
+   (svcBreak, from nn::hid::GetTouchScreenState<1>, lr 0x82e7eee0 on its 3.2.0 sdk). TouchScreenState<1>:
+   {s64 sampling number, s32 count, s32 reserved, TouchState[1]}. */
+HLE(_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE) {
+    memset(GP(ARG(0)), 0, 16 + 1 * 0x28);
+    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&touch_sampling);
 }

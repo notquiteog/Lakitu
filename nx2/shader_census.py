@@ -36,8 +36,12 @@ SLOTS = (8, 16, 24, 32, 40, 48, 56, 64, 72)
 
 
 def dictionaries(romfs, zs):
-    """The game's zstd dictionaries: the files of a SARC, Pack/ZsDic.pack.zs"""
-    raw = zs.ZstdDecompressor().decompress(open(os.path.join(romfs, "Pack", "ZsDic.pack.zs"), "rb").read(), max_output_size=1 << 28)
+    """The game's zstd dictionaries: the files of a SARC, Pack/ZsDic.pack.zs. (dkb) None when the game has no such pack:
+    Donkey Kong Bananza's .zs files are plain zstd, and the census stopped with FileNotFoundError at every build"""
+    path = os.path.join(romfs, "Pack", "ZsDic.pack.zs")
+    if not os.path.exists(path):
+        return []
+    raw = zs.ZstdDecompressor().decompress(open(path, "rb").read(), max_output_size=1 << 28)
     start = struct.unpack_from("<I", raw, 0x0c)[0]
     out = []
     for k in range(struct.unpack_from("<H", raw, 0x1a)[0]):
@@ -263,7 +267,7 @@ def main():
                 # from two archives is one)
                 end = struct.unpack_from("<I", control, 0x44)[0]
                 control, code = control[:0xd8], code[:end] if end <= len(code) else code
-                key = int.from_bytes(hashlib.sha1(control + code).digest()[:8], "little")
+                key = int.from_bytes(hashlib.sha1(control + code, usedforsecurity=False).digest()[:8], "little")
                 if key not in stage_index:
                     stage_index[key] = len(stage_list)
                     stage_list.append((key, stage, control, code))

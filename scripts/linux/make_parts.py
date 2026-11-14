@@ -10,10 +10,15 @@ own release carries hookshot-linux.txt, which names them.
 The list is not inside a zip (it names the zips' checksums).
 """
 import argparse
+import concurrent.futures
 import hashlib
 import os
 import sys
 import zipfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                               "builder", "linux"))
+from part_links import SYSROOT_PART, is_absolute_link, relative_sysroot_link  # noqa: E402
 
 # (dest under the AppDir, and None for the whole directory or the file names when the directory holds other parts too)
 PARTS = (
@@ -58,7 +63,10 @@ def write_zip(path, root, dest, files):
             info.create_system = 3
             if os.path.islink(full):
                 info.external_attr = 0o120777 << 16
-                zipped.writestr(info, os.readlink(full), compresslevel=6)
+                link_to = os.readlink(full)
+                if dest == SYSROOT_PART and is_absolute_link(link_to):
+                    link_to = relative_sysroot_link(os.path.join(root, dest), full, link_to)
+                zipped.writestr(info, link_to, compresslevel=6)
                 continue
             info.external_attr = (0o755 if os.access(full, os.X_OK) else 0o644) << 16
             with open(full, "rb") as handle:
@@ -79,7 +87,7 @@ def main():
     parser.add_argument("appdir")
     parser.add_argument("tag")
     parser.add_argument("out")
-    parser.add_argument("--base", default="https://github.com/NotRexed/Hookshot/releases/download/linux-parts")
+    parser.add_argument("--base", default="https://github.com/notquiteog/Hookshot/releases/download/linux-parts")
     args = parser.parse_args()
     root = os.path.abspath(args.appdir)
     if not os.path.isfile(os.path.join(root, "AppRun")):
@@ -90,9 +98,18 @@ def main():
     for dest, files in PARTS:
         if not os.path.isdir(os.path.join(root, dest)):
             sys.exit("the AppDir has no %s" % dest)
+
+    def zip_part(part):
+        dest, files = part
+        path = os.path.join(args.out, "HookshotLinux-%s.zip" % dest.replace("/", "-"))
+        return write_zip(path, root, dest, files)
+    # (the parts zipped at once, one thread each: zlib lets go of the GIL while it compresses, and each zip is the same bytes
+    # as when they are made one after the other. The list keeps PARTS' order)
+    with concurrent.futures.ThreadPoolExecutor(min(len(PARTS), os.cpu_count() or 1)) as pool:
+        zipped = list(pool.map(zip_part, PARTS))
+    for (dest, files), (digest, size) in zip(PARTS, zipped):
         leaf = dest.replace("/", "-")
         path = os.path.join(args.out, "HookshotLinux-%s.zip" % leaf)
-        digest, size = write_zip(path, root, dest, files)
         named = os.path.join(args.out, "HookshotLinux-%s-%s.zip" % (leaf, digest[:12]))
         os.replace(path, named)
         lines.append("part %s %d %s %s/%s" % (digest, size, dest, base, os.path.basename(named)))

@@ -11,12 +11,17 @@ and the play profile (addresses and counts made on the development PC).
         llvm-mingw as scripts/make_setup_parts.py names it (its official release, SHA-256 checked) unpacked into <folder>;
         prints its folder. --name: only prints its name (a cache key)
     python -I scripts/release_parts.py package <out folder> --publish <dotnet publish folder> --setup <setup exe>
-                                       [--list <setup list>]
+                                       [--list <setup list>] [--python-packages <requirements>] [--cpm-add <CPM folder>]
         the package folder make_setup_parts.py splits: the published builder, the setup, LICENSE, the tracked gpu, host, nx2
-        and scripts under tools/, tools/work (the profile) and tools/third_party: the tracked files and, from the list's
+        and scripts under tools/, the pipeline state list's sources (assets/pipeline_states/, which must be there and read),
+        tools/work (the profile) and tools/third_party: the tracked files and, from the list's
         third_party part, the prebuilt files the repository does not carry (a64emit.dll, lld-link.exe, SDL2.dll, SDL3.dll,
         zbic.dll; rebuilt on the player's PC when their sources' stamps differ). Python, emsdk, CPM and wgpu-native are not
-        in it: make_setup_parts.py --reuse takes their parts from the list.
+        in it: make_setup_parts.py --reuse takes their parts from the list. --python-packages: when the list's Python part
+        lacks one of those pinned packages, the part goes into tools/python with them installed (by this Python's pip, for
+        the part's version), and make_setup_parts.py makes a new Python part of it. --cpm-add: when the list's CPM part
+        lacks one of the folder's <package>/<version> (dav1d, scripts/windows/dav1d.sh), the part goes into tools/cpm with
+        them added, and make_setup_parts.py makes a new CPM part of it
 
 GitHub's API is read with $GH_TOKEN when it is set. Downloads are retried (GitHub answers 5xx now and then). Progress goes to
 stderr: what a command prints on stdout is its answer.
@@ -42,14 +47,19 @@ PREBUILT_EXT = (".dll", ".lib", ".exe", ".sha1")
 
 
 def get(url, api=False, tries=5):
+    if not url.startswith("https://"):   # (only https: the token is never sent over plain http, nor a file: link read)
+        raise ValueError("not an https link: " + url)
     headers = {"User-Agent": "hookshot-ci"}
+    token = None
     if api:
         headers["Accept"] = "application/vnd.github+json"
-        if os.environ.get("GH_TOKEN"):
-            headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+        token = os.environ.get("GH_TOKEN")
     for i in range(tries):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as r:
+            req = urllib.request.Request(url, headers=headers)
+            if token:   # (not sent again on a redirect, which may lead to another host: urllib copies plain headers)
+                req.add_unredirected_header("Authorization", "Bearer " + token)
+            with urllib.request.urlopen(req, timeout=120) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.code < 500 or i == tries - 1:
@@ -127,6 +137,10 @@ def extract(zip_path, prefix, dest, keep=lambda rel: True):
             if ".." in rel.split("/") or not keep(rel):
                 continue
             out = os.path.join(dest, *rel.split("/"))
+            # (a name with a drive or a root, such as "C:/x" on Windows, would leave dest: such members are skipped)
+            root = os.path.realpath(dest)
+            if os.path.commonpath([os.path.realpath(out), root]) != root:
+                continue
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with z.open(m) as src, open(out, "wb") as f:
                 shutil.copyfileobj(src, f)
@@ -182,7 +196,7 @@ def package(a):
     copy(a.setup, os.path.join(out, "HookshotBuilder-Setup.exe"))   # (the builder's Repair runs it)
     copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE"))
     tools = os.path.join(out, "tools")
-    for f in tracked("gpu", "host", "nx2", "scripts", "third_party"):
+    for f in tracked("game", "gpu", "host", "nx2", "scripts", "third_party"):   # (game/: the game profile header)
         copy(os.path.join(ROOT, f), os.path.join(tools, *f.split("/")))
     if a.list:
         if not profile(argparse.Namespace(list=a.list, work=os.path.join(tools, "work"))) == 0:
@@ -193,9 +207,110 @@ def package(a):
             prebuilt = lambda rel: rel.startswith("third_party/") and rel not in known and rel.lower().endswith(PREBUILT_EXT)
             n = extract(tp, "HookshotBuilder/tools/", tools, keep=prebuilt)
             print("%d prebuilt third_party files from %s" % (n, os.path.basename(tp)))
+        if a.python_packages and python_packages(a.list, a.python_packages, tools) != 0:
+            return 1
+        if a.cpm_add and cpm_add(a.list, a.cpm_add, tools) != 0:
+            return 1
     else:
         print("no setup list: the package has no play profile and no prebuilt third_party files")
+    if state_list(tools) != 0:
+        return 1
+    # (hookshot) the renderer CI built with NVIDIA DLSS, DLSS 5 neural rendering and AMD FSR 4 in it, which nx2/make_game.py
+    # uses on the player's PC instead of compiling one without those (prebuilt_renderer), and AMD's FSR runtime beside it
+    # (the fork's options: a caller of package() without them, as tests/test_ship_state_list.py's, gets none of the three)
+    vk, amd_fsr, repository = getattr(a, "vk", None), getattr(a, "amd_fsr", None), getattr(a, "repository", None)
+    if vk:
+        copy(vk, os.path.join(tools, "prebuilt", "hookshot_vk.dll"))
+        print("prebuilt renderer: %s" % vk)
+    if amd_fsr:
+        n = 0
+        for f in sorted(os.listdir(amd_fsr)):
+            if f.lower().startswith("amd_fidelityfx_") and f.lower().endswith("_vk.dll"):
+                copy(os.path.join(amd_fsr, f), os.path.join(tools, "amd-fsr", f))
+                n += 1
+        if os.path.isfile(os.path.join(amd_fsr, "LICENSE.txt")):
+            copy(os.path.join(amd_fsr, "LICENSE.txt"), os.path.join(tools, "amd-fsr", "LICENSE.txt"))
+        print("AMD FSR runtime: %d DLLs from %s" % (n, amd_fsr))
+    # (hookshot) the repository the release is from, for the Builder's updater and the game's update check (nx2/version.py)
+    if repository:
+        with open(os.path.join(tools, "repository.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(repository.strip() + "\n")
+        print("repository: %s" % repository.strip())
     print("package folder: %s" % out)
+    return 0
+
+
+def state_list(tools):
+    """The sources of the pipeline state list a release ships (assets/pipeline_states/: the tour's list, the contributed ones and
+    their notes), into tools/ at the same path: nx2/make_game.py merges them beside the game. Required: without them a new
+    install's first field load is drawn white for seconds while its pipelines compile (v2.0.8 to v2.0.14 shipped none). 1, with
+    the reason, when there are none or one does not read (nx2/pipeline_states.py check)"""
+    spec = importlib.util.spec_from_file_location("pipeline_states", os.path.join(ROOT, "nx2", "pipeline_states.py"))
+    states = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(states)
+    src = states.sources_dir(ROOT)
+    try:
+        recs = states.check_sources(src)
+    except SystemExit as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    dst = states.sources_dir(tools)
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+    print("the pipeline state list: %s" % states.describe(recs))
+    return 0
+
+
+def python_packages(list_path, requirements, tools):
+    """The list's Python part with requirements' pins (name==version) installed into tools/python, if it lacks one: by this
+    Python's pip, for the part's version and win_amd64 (the part has no pip)"""
+    with open(requirements, encoding="utf-8") as f:
+        pins = [p for p in (l.split("#")[0].strip() for l in f.read().splitlines()) if p]
+    part = named_part(list_path, "python")
+    if not part:
+        sys.exit("no python part in %s" % list_path)
+    with zipfile.ZipFile(part) as z:
+        names = [m.split("/") for m in z.namelist()]
+    have = {m[-2].lower() for m in names if len(m) > 1 and m[-2].endswith(".dist-info")}
+    missing = [p for p in pins if "%s-%s.dist-info" % tuple(x.strip().lower().replace("-", "_") for x in p.split("==")) not in have]
+    if not missing:
+        print("the Python part has %s" % ", ".join(pins))
+        return 0
+    dll = [m[-1] for m in names if m[:-1] == ["HookshotBuilder", "tools", "python"] and m[-1].lower().startswith("python3")
+           and m[-1][7:-4].isdigit()]
+    if len(dll) != 1:
+        sys.exit("%s: no pythonXY.dll to give the version" % os.path.basename(part))
+    version = "3." + dll[0][7:-4]
+    py = os.path.join(tools, "python")
+    n = extract(part, "HookshotBuilder/tools/python/", py)
+    print("%d files of %s (Python %s) into %s, with %s" % (n, os.path.basename(part), version, py, ", ".join(missing)))
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--only-binary", ":all:", "--no-compile", "--no-cache-dir",
+                    "--disable-pip-version-check", "-q", "--platform", "win_amd64", "--python-version", version,
+                    "--implementation", "cp", "--target", os.path.join(py, "Lib", "site-packages")] + missing, check=True)
+    return 0
+
+
+def cpm_add(list_path, add, tools):
+    """The list's CPM part with the packages of the CPM folder `add` (<name>/<version>/...: dav1d for the AV1 movies,
+    scripts/windows/dav1d.sh) into tools/cpm, if it lacks one of them: make_setup_parts.py then makes a new CPM part of it"""
+    want = sorted((n, v) for n in os.listdir(add) if os.path.isdir(os.path.join(add, n))
+                  for v in os.listdir(os.path.join(add, n)) if os.path.isdir(os.path.join(add, n, v)))
+    if not want:
+        sys.exit("%s: no <package>/<version> folders" % add)
+    part = named_part(list_path, "cpm")
+    if not part:
+        sys.exit("no cpm part in %s" % list_path)
+    with zipfile.ZipFile(part) as z:
+        have = {tuple(m.split("/")[3:5]) for m in z.namelist() if m.startswith("HookshotBuilder/tools/cpm/")}
+    missing = [nv for nv in want if nv not in have]
+    if not missing:
+        print("the CPM part has %s" % ", ".join("/".join(nv) for nv in want))
+        return 0
+    cpm = os.path.join(tools, "cpm")
+    n = extract(part, "HookshotBuilder/tools/cpm/", cpm)
+    for name, version in missing:
+        shutil.copytree(os.path.join(add, name, version), os.path.join(cpm, name, version))
+    print("%d files of %s into %s, with %s" % (n, os.path.basename(part), cpm, ", ".join("/".join(nv) for nv in missing)))
     return 0
 
 
@@ -217,6 +332,11 @@ def main():
     s.add_argument("--publish", required=True)
     s.add_argument("--setup", required=True)
     s.add_argument("--list")
+    s.add_argument("--python-packages")
+    s.add_argument("--vk", help="(hookshot) a hookshot_vk.dll built by CI, into tools/prebuilt")
+    s.add_argument("--amd-fsr", help="(hookshot) a folder holding AMD's amd_fidelityfx_*_vk.dll, into tools/amd-fsr")
+    s.add_argument("--repository", help="(hookshot) owner/name the release is from, into tools/repository.txt")
+    s.add_argument("--cpm-add")
     a = p.parse_args()
     return {"previous": previous, "profile": profile, "llvm-mingw": llvm_mingw, "package": package}[a.cmd](a)
 

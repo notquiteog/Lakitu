@@ -3,6 +3,7 @@
    "Player". */
 #include "hos.h"
 #include "hos_paths.h"
+#include "hos_wide_size.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,57 +86,133 @@ HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
 }
 /* HOS_HANDHELD=1: handheld (the 1080p screen: 1080p output and the game's handheld resolutions) instead of docked
    (MKW docked composes 3840 x 2160) */
-static int ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
+int hos_ini_option(const char *key, int otherwise);
+#define ini_option hos_ini_option
+/* (hookshot) An option's text in hookshot_options.ini, the game folder's (the Insert menu's choices, gpu/vk/vk_menu.cpp), the last
+   line that sets it, its line end cut: whether there was one */
+static int ini_text(const char *key, char *out, size_t size) {
     char path[MAX_PATH];
     const DWORD n = hos_game_path_a(path, MAX_PATH);
     char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/'; the game folder's, not bin\\'s) */
-    if (!slash) return otherwise;
+    if (!slash || !size) return 0;
     snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
     FILE *f = fopen(path, "r");
-    if (!f) return otherwise;
+    if (!f) return 0;
     char line[80];
     const size_t len = strlen(key);
+    int found = 0;
     while (fgets(line, sizeof line, f))
-        if (!strncmp(line, key, len) && line[len] == '=') otherwise = atoi(line + len + 1);
+        if (!strncmp(line, key, len) && line[len] == '=') {
+            snprintf(out, size, "%s", line + len + 1);
+            out[strcspn(out, "\r\n")] = 0;
+            found = 1;
+        }
     fclose(f);
-    return otherwise;
+    return found;
+}
+int hos_ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp; nn_vi.c reads it too) */
+    char text[80];
+    return ini_text(key, text, sizeof text) ? atoi(text) : otherwise;
 }
 static int handheld(void) {
     static int v = -1;
     if (v < 0) v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : ini_option("handheld_profile", 0) != 0;
     return v;
 }
-/* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
-   1 2560 x 1440, 2 3840 x 2160. The game's frame is its display size (2560 x 1440 as shipped; nx2/oot_patches.py
-   apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it
-   saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; 1 and 2 ask for x1 of a 2560 x 1440 or 3840 x 2160 display. */
-static int output_mode(void) {
-    static int v = -1;
-    if (v < 0) {
-        v = getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0);
-        if (v < 0 || v > 2 || handheld()) v = 0;
-        hos_log("oe: output resolution %s", v == 2 ? "3840x2160" : v == 1 ? "2560x1440" : "2048x1152 (the game's)");
+/* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: a size, "<width>x<height>",
+   each side a multiple of 8 (rounded down to one), at least 640 x 360, at most 5120 x 2880's pixels (the largest the render
+   targets' pool, hos_rt_pool_size, was played at) and between 5:4 and 48:9 in shape (host/hos_main.c's screen shapes); anything
+   else is the game's own size, said in the log. The menu offers 2048x1152 and the screen's display modes (gpu/vk/display_modes.h;
+   where they are not known 1920x1080, 2560x1440, 3840x2160, 5120x1440 and 5120x2880), and any other size as its own choice. The numbers it saved before are read as their sizes: 0 the game's
+   2048 x 1152, 1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880. The game's frame is its display size
+   (2560 x 1440 as shipped; nx2/oot_patches.py apply_output_size asks hos_output_size) times its graphics scale
+   (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it saw scale 1 (x0 left at the call before's answer), so 2048 x 1152,
+   the game's own, which 2048x1152 asks for; each other size uses x1. */
+int hos_output_parse(const char *text, uint32_t *w, uint32_t *h) {   /* (an explicit size: 1, and *w x *h; the game's own: 0) */
+    static const uint32_t old[][2] = {{0, 0}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}};
+    unsigned a = 0, b = 0;
+    *w = *h = 0;
+    if (!text) return 0;
+    if (sscanf(text, "%u%*[xX]%u", &a, &b) == 2) {
+        a &= ~7u, b &= ~7u;
+        if (!hos_output_size_valid(a, b)) {
+            hos_log("oe: output_res=%s is not a size the game can use (640x360 to 5120x2880's pixels, 5:4 to 48:9): the game's own", text);
+            return 0;
+        }
+        if (a == 2048 && b == 1152) return 0;   /* (the game's own) */
+        *w = a, *h = b;
+        return 1;
     }
-    return v;
+    const int i = atoi(text);
+    if (i < 1 || i >= (int)(sizeof old / sizeof *old)) {
+        if (*text && strcmp(text, "0")) hos_log("oe: output_res=%s is not a size or one of the numbers saved before: the game's own", text);
+        return 0;
+    }
+    *w = old[i][0], *h = old[i][1];
+    return 1;
 }
-uint32_t hos_output_size(int height) { return output_mode() == 2 ? (height ? 2160 : 3840) : (height ? 1440 : 2560); }
+static uint32_t output_w, output_h;   /* (the explicit size; 0: the game's own) */
+static int output_mode(void) {   /* (an explicit size: 1; the game's own: 0) */
+    static int read;
+    if (!read) {
+        read = 1;
+        char text[80] = "";
+        const char *e = getenv("HOS_OUTPUT_RES");
+        if (!handheld() && (e || ini_text("output_res", text, sizeof text))) hos_output_parse(e ? e : text, &output_w, &output_h);
+        if (output_w) hos_log("oe: output resolution %ux%u", output_w, output_h);
+        else hos_log("oe: output resolution 2048x1152 (the game's)");
+    }
+    return output_w != 0;
+}
+uint32_t hos_output_size(int height) {
+    if (!output_mode()) return height ? 1440 : 2560;
+    return height ? output_h : output_w;
+}
 /* (hookshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
    the 4K output ran out of it. Scaled with the output's pixels, or the widescreen picture's when it has more (host/hos_main.c:
    hos_wide_out, the output's height at the screen's shape: 7680 x 2160 for a 32:9 screen at the 4K output, twice the pixels the pool
    was scaled for, and the game crashed as Kokiri Forest loaded, a null pointer or "texture handle ids -1", issue 1031);
-   HOS_RT_POOL_MB=<MB> over it */
+   Castle Town's guard-house conversation/camera test crashed with 305 MB at 2560 x 1440 and passed with 512 MB.
+   Keep at least 512 MB by default; larger scaled pools and an explicit HOS_RT_POOL_MB=<MB> still win. An output with more pixels
+   than 3840 x 2160 (a size of the player's own, up to 5120 x 2880's pixels: hos_output_parse) keeps its pool to 900 MB:
+   5120 x 2880 scales to 1220 MB, and 1220 and 1000 MB both failed the game's own reservation at boot; at 900 MB it boots and
+   plays with the 3D at the full size. */
 uint64_t hos_rt_pool_size(uint64_t game) {
     const char *e = getenv("HOS_RT_POOL_MB");
     extern volatile uint64_t hos_wide_out;
     const uint64_t wide = hos_wide_out, wide_px = (wide >> 32) * (wide & 0xffffffffULL);
     uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
     if (wide_px > px) px = wide_px;
-    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    const uint64_t scaled = px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    const uint64_t minimum = 512ULL << 20, most = 900ULL << 20;
+    const int big = (uint64_t)hos_output_size(0) * hos_output_size(1) > 3840ULL * 2160;
+    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : scaled < minimum ? minimum : big && scaled > most ? most : scaled;
     static int logged;
     if (!logged++) hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
     return v;
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(handheld() ? 0 : 1); }     /* OperationMode_Handheld / _Console (docked) */
+/* GetDefaultDisplayResolution(int* width, int* height): what a Switch 2 answers: 1920 x 1080 in handheld mode (its
+   screen), 3840 x 2160 docked (the dock's output to a 4K TV, which is what HOS_HANDHELD=0, the runtime's default, plays
+   as; on a 1080p TV the console says 1920 x 1080). It is the console's output, not this runtime's: the picture's
+   size here is hos_output_size's and the game's own render targets, which this answer does not change. Kirby Air
+   Riders asks at start (found in Dragoon, its fork); left to the SDK's own code, which asks the applet service this
+   runtime does not serve over IPC, both stayed whatever the stack held. Ocarina's SDK has the call too; the log says
+   whether it asks. */
+HLE(_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_) {
+    const uint32_t w = handheld() ? 1920 : 3840, h = handheld() ? 1080 : 2160;
+    static int logged;
+    if (!logged++) hos_log("oe: default display resolution %ux%u (%s; lr %#llx)", w, h, handheld() ? "handheld" : "docked",
+                           (unsigned long long)c->x[30]);
+    if (ARG(0) && hos_guest_range(ARG(0), 4)) G32(ARG(0)) = w;
+    if (ARG(1) && hos_guest_range(ARG(1), 4)) G32(ARG(1)) = h;
+}
+/* GetDefaultDisplayResolutionChangeEvent(SystemEvent*): an event that is never signalled, because the output never
+   changes while the game runs. Left to the stub, the game's event was never made at all. */
+void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
+HLE(_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE) {
+    if (ARG(0)) hos_system_event_init(ARG(0), 0);
+}
 HLE(_ZN2nn2oe18GetPerformanceModeEv) { RET(handheld() ? 0 : 1); }   /* PerformanceMode_Normal / _Boost (docked) */
 HLE(_ZN2nn2oe20GetCurrentFocusStateEv) { RET(1); }    /* FocusState_InFocus */
 HLE(_ZN2nn2oe25GetProgramTotalActiveTimeEv) { RET(hos_now_ns() - boot_ns); }
@@ -181,6 +258,48 @@ HLE(_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE) {
 }
 HLE(_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE) {
     *(uint8_t *)GP(ARG(0)) = G64(ARG(1)) == user_uid[0] && G64(ARG(1) + 8) == user_uid[1];
+    RET(0);
+}
+/* (dkb) GetLastOpenedUser(Uid*) -> Result: the one user, the only one ever opened. Donkey Kong Bananza asks for it
+   after TryOpenPreselectedUser; the generic stub left the Uid zero, which names no user. (dkb-pc-recomp's
+   runtime/ov_system.c ov_last_opened_user found that the game asks: behaviour only, the code is this file's.) */
+HLE(_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE) {
+    G64(ARG(0)) = user_uid[0];
+    G64(ARG(0) + 8) = user_uid[1];
+    RET(0);
+}
+/* (dkb) LoadCachedNintendoAccountInfo(CachedNintendoAccountInfo*, UserHandle const&, void*, size_t) -> Result: no
+   Nintendo Account is linked here, so a failure; the generic stub's 0 said the outputs were filled, and nothing was.
+   The result is the account service's on a console, not the SDK's, and no console's answer for an unlinked user was
+   measured here. 0x1907c is account module 124, description 200. It is dkb-pc-recomp's choice for Donkey Kong
+   Bananza 3.2.0 (ACCOUNT_R_REGISTRATION_REQUIRED), and the game's own code agrees with it: its one call (main
+   0x8048f460 on 3.2.0) takes the offline path on any failure, and tests account results with descriptions 200 to 269
+   as a family of their own; 200 is the first of them. (The 280 this file answers for the network service account
+   token is outside that family, and means a different thing.) The outputs are left alone, as on any failure. */
+HLE(_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm) {
+    RET(0x1907C);
+}
+
+/* ---- (dkb) services a console has and this PC does not ------------------------------------------------------------
+   Each answers "not here", so the game takes its offline path, where the generic stub's 0 (success with empty
+   outputs) or the lifted SDK's IPC (a session whose replies are empty) said the thing was there. Found on Donkey Kong
+   Bananza 3.2.0; dkb-pc-recomp (github.com/Lucas-blip-png/dkb-pc-recomp, runtime/ov_system.c) reached the same
+   answers by running the game. Each comment says where its value comes from. */
+/* nn::bcat::MountDeliveryCacheStorage() -> Result: no delivery cache is installed: 0x47a, bcat module 122, description
+   2 (FailedOpenEntity), dkb-pc-recomp's answer; a console with no cache downloaded yet was not measured here */
+HLE(_ZN2nn4bcat25MountDeliveryCacheStorageEv) {
+    static volatile LONG told;
+    if (!InterlockedExchange(&told, 1)) hos_log("bcat: no delivery cache (offline): MountDeliveryCacheStorage -> 0x47a");
+    RET(0x47A);
+}
+/* nn::streamplay::GetRequiredMemorySize(StreamPlayType, StreamingMode, int) -> size_t: 0. A choice, not a console's
+   answer: GameShare (streaming the game to another console) is not available here, and with no streaming the game
+   needs no memory for it. Bananza goes on with 0, and asks the streamplay service nothing else. The lifted SDK opened
+   that service through sm: to ask, and aborted on the empty reply (svcBreak from
+   nn::streamplay::detail::CreateUserServiceByHipc). */
+HLE(_ZN2nn10streamplay21GetRequiredMemorySizeENS0_14StreamPlayTypeENS0_13StreamingModeEi) {
+    static volatile LONG told;
+    if (!InterlockedExchange(&told, 1)) hos_log("streamplay: GameShare is not available: GetRequiredMemorySize -> 0");
     RET(0);
 }
 
@@ -236,7 +355,7 @@ HLE(_ZN2nn3nsd24GetEnvironmentIdentifierEPNS0_21EnvironmentIdentifierE) {
 
 static void calendar(uint64_t out, uint64_t info, int64_t posix, int local) {
     time_t t = (time_t)posix;
-    struct tm tmv;
+    struct tm tmv = {0};   /* (hookshot: a time the C library cannot convert left it as the stack had it) */
     if (local) localtime_s(&tmv, &t); else gmtime_s(&tmv, &t);
     /* CalendarTime { s16 year; s8 month, day, hour, minute, second; pad } */
     uint8_t ct[8] = {0};

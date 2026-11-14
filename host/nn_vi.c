@@ -1,32 +1,17 @@
 /* nn::vi for MKW (TOTKPort's nn_vi.c is bound to its renderer and TOTK's frame pacing): the default display, one
-   layer, and the display's vsync event, signaled at 60 Hz by a host thread (HOS_VSYNC_HZ over it). HDR and VRR are reported unsupported,
+   layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
+#include "game_profile.h"   /* (the graphics module's offsets, below) */
+#include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*, HOS_OPT_CAMERA_SPEED: the Insert menu's HDR and Camera speed, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* (hookshot) Where the frame limiter, the nominal frame rate, the variable-refresh gate and the engine's adaptive
-   controller sit inside the game's graphics module. These are offsets into one game's engine object, found by
-   reading that game's code, so they belong to the game profile (game/game_profile.h, generated from
-   nx2/game_profile.py) and not to this file. A profile that does not know one of them says so, and the pacing that
-   needed it is simply off: gfx_have() below logs the missing field once and every reader checks it first. That is
-   deliberately not the same as guessing an offset, which would have this code write ints into the middle of some
-   other object every frame. */
-#include "game_profile.h"
-
-static int gfx_have(int have, const char *what) {
-    static const char *said[8];
-    static int n;
-    if (have) return 1;   /* (the ordinary case: no cost at all) */
-    for (int i = 0; i < n; i++)
-        if (!strcmp(said[i], what)) return 0;
-    if (n < (int)(sizeof said / sizeof said[0])) said[n++] = what;
-    hos_log("vi: the %s game profile has no %s offset in the graphics module: left alone", GAME_PROFILE_KEY, what);
-    return 0;
-}
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
 void hos_system_event_signal(uint64_t key);
@@ -36,41 +21,10 @@ static uint64_t vsync_events[8];
 static volatile LONG nvsync;
 static HANDLE vsync_thread;
 
-/* (hookshot) HOS_VSYNC_HZ=<hz>: the rate the display's vsync event is signalled at, 60 by default.
- *
- * This is what paces the game. It waits on the event, so a hardcoded 60 here is a hard 60 fps
- * however high the limiter is: on a 165 Hz monitor, with the limiter unlocked to 120 by
- * HOS_DISPLAY_VRR, 298 of 300 frames still landed in the 15.5-17.8 ms window with no variance.
- * Unset follows the display's own refresh rate, which is the right default: a hardcoded 60 paces a
- * 165 Hz screen at 60. 0 turns the pacing off. Clamped to 15..1000: below 15 the game's own frame
- * step treats a step as a hitch, and a rate the machine cannot render only spends the time sleeping
- * less. */
-static int64_t vsync_period_ns(void) {
-    int hos_sdl_refresh_hz(void);
-    const char *e = getenv("HOS_VSYNC_HZ");
-    const int asked = e && *e ? atoi(e) : -1;
-    int hz;
-    const char *why;
-    if (asked == 0) {   /* (off: as fast as the clamp allows, so the game is not paced by this) */
-        hz = 1000, why = "HOS_VSYNC_HZ=0, not paced";
-    } else if (asked > 0) {
-        hz = asked, why = "HOS_VSYNC_HZ";
-    } else {
-        /* The display's own rate, which is the right default: a hardcoded 60 paces a 165 Hz screen
-           at 60 however high the game's limiter is. 0 from SDL means it could not say. */
-        const int screen = hos_sdl_refresh_hz();
-        hz = screen > 0 ? screen : 60;
-        why = screen > 0 ? "the display's rate" : "no rate from the display, 60";
-    }
-    if (hz < 15) hz = 15;
-    if (hz > 1000) hz = 1000;
-    hos_log("vi: the display's vsync event at %d Hz (%s)", hz, why);
-    return 1000000000LL / hz;
-}
-
+static int fps_max(void);   /* (below: HOS_FPS_MAX) */
 static DWORD WINAPI vsync_main(void *p) {
     (void)p;
-    const int64_t period = vsync_period_ns();
+    const int64_t period = 1000000000LL / fps_max();
     int64_t next = hos_now_ns() + period;
     for (;;) {
         const int64_t now = hos_now_ns();
@@ -102,32 +56,41 @@ HLE(_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE) {
 /* nn::vi::GetDisplayVsyncEvent(nn::os::SystemEventType*, nn::vi::Display*) -> Result */
 HLE(_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE) {
     hos_system_event_init(ARG(0), 1);
-    if (nvsync < (LONG)(sizeof vsync_events / sizeof vsync_events[0])) {
-        vsync_events[nvsync] = ARG(0);
-        InterlockedIncrement(&nvsync);
+    {   /* (hookshot) under a lock: two threads checked the count at once and wrote past the table */
+        static SRWLOCK vsync_lock = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&vsync_lock);
+        if (nvsync < (LONG)(sizeof vsync_events / sizeof vsync_events[0])) {
+            vsync_events[nvsync] = ARG(0);
+            InterlockedIncrement(&nvsync);
+        }
+        ReleaseSRWLockExclusive(&vsync_lock);
     }
     if (!vsync_thread) vsync_thread = CreateThread(NULL, 0, vsync_main, NULL, 0, NULL);
     RET(0);
 }
 
 /* nn::vi::QueryDisplayHdrStatus(bool* on, HdrOutputFormat*, unsigned short* max nits, Display const*) -> Result */
+/* (hookshot) the Insert menu's HDR set to Native on an HDR10 swapchain: an HDR10 display (format 1, which makes the game present PQ
+   codes in 10 bits) of the menu's peak; otherwise SDR, as a desktop window is */
 HLE(_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE) {
-    *(uint8_t *)GP(ARG(0)) = 0;
-    if (ARG(1)) G32(ARG(1)) = 0;
-    if (ARG(2)) *(uint16_t *)GP(ARG(2)) = 0;
+    const int native = rx_option(HOS_OPT_HDR_NATIVE, 0);
+    *(uint8_t *)GP(ARG(0)) = (uint8_t)native;
+    if (ARG(1)) G32(ARG(1)) = native ? 1 : 0;
+    if (ARG(2)) *(uint16_t *)GP(ARG(2)) = native ? (uint16_t)rx_option(HOS_OPT_HDR_PEAK, 1000) : 0;
+    static int logged = -1;
+    if (logged != native) logged = native, hos_log("vi: QueryDisplayHdrStatus -> %s", native ? "HDR10 (the game's native HDR)" : "SDR");
     RET(0);
 }
 /* nn::vi::QueryDisplayHdrPaperWhite(unsigned short*, Display const*) -> Result */
 HLE(_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE) {
-    *(uint16_t *)GP(ARG(0)) = 203;
+    *(uint16_t *)GP(ARG(0)) = rx_option(HOS_OPT_HDR_NATIVE, 0) ? (uint16_t)rx_option(HOS_OPT_HDR_WHITE, 203) : 203;
     RET(0);
 }
 /* (hookshot) HOS_DISPLAY_VRR=1: tell the game the display does variable refresh.
  *
  * This is what holds the frame rate at 60, and it took three experiments to find. The game's
- * limiter (the profile's frame limiter; Ocarina's +0xfc) is written by f_804fc0f0, which stores a
- * rate only when a mode is 1, the rate is 40 or more, and the profile's variable-refresh gate byte
- * (Ocarina's +0x232) is set. That byte reads 0, and raising the limiter or the
+ * limiter at +0xfc is written by f_804fc0f0, which stores a rate only when a mode is 1, the rate is
+ * 40 or more, and the byte at +0x232 is set. That byte reads 0, and raising the limiter or the
  * engine's controller words from outside does not stick: the game writes them back every frame,
  * because it believes the display cannot do better. It believes that because this very function
  * answered no, and because SetDisplay120HzRefreshRateCapability and
@@ -172,6 +135,30 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    interval's vsyncs (1: 60 fps, 2: 30) after the last present, so the game runs at the display's rate.
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
+/* (hookshot) The frame rate cap, the Insert menu's Game frame rate cap (frame_rate_cap=): the display pacing's
+   interval, the game's own limiter (+0xfc) and the vsync event follow it, and the game's time step is the frames' own time
+   (realtime_step), so the game keeps real time. Uncapped is a cap of 1000 (fps_max's FPS_UNCAPPED), the pacing's 1 ms: the frames
+   come as fast as the PC makes them (a display that waits for its refresh, V-Sync On, still holds them to its rate).
+   HOS_FPS_MAX=30 or <61-1000> goes over the row for a run, with any number above 60 (a 75 or 100 Hz screen). Unset or 60:
+   60, as on the console */
+int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c) */
+static int fps_max(void) {
+    enum { FPS_UNCAPPED = 1000 };
+    static int v = -1;
+    if (v < 0) {
+        /* (the Insert menu's Frame rate cap, frame_rate_cap=: 0 the console's 60, then 90, 120, 144, 165, 240, 6 Uncapped, 7 30; a value
+           this build does not know is 60. HOS_FPS_MAX over it) */
+        static const int caps[] = {60, 90, 120, 144, 165, 240, FPS_UNCAPPED, 30};
+        enum { CAPS = sizeof caps / sizeof caps[0] };
+        const int i = hos_ini_option("frame_rate_cap", 0);
+        const char *e = getenv("HOS_FPS_MAX");
+        const int want = e ? atoi(e) : caps[i >= 0 && i < CAPS ? i : 0];
+        v = want == 30 ? 30 : want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60;
+        if (v == FPS_UNCAPPED) hos_log("vi: frame rate uncapped: pacing, the game's limiter and its time step follow the frames");
+        else if (v != 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
+    }
+    return v;
+}
 static int64_t next_frame_at, window_start, frames_in_window;
 static volatile LONG64 presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
@@ -180,12 +167,12 @@ int hos_vi_native_interval(Ctx *c, int requested) {
        in Kokiri): paced to them, frames snapped to 33, 50 and 67 ms, the stutter, and the frame rate sat far under what the
        PC managed. With game time following the clock (the Insert menu's Real time, realtime_step), a frame is shown as soon
        as it is ready, 60 at most; the game still reads back its own interval. HOS_GAME_INTERVAL=1, or Game speed Per frame:
-       paced to the game's interval, as before */
+       paced to the game's interval, as before (the Per frame row is honored only at a cap of 60) */
     static int game_interval = -1;
     if (game_interval < 0) game_interval = getenv("HOS_GAME_INTERVAL") && atoi(getenv("HOS_GAME_INTERVAL")) != 0;
     int rx_option(int id, int otherwise);
     const int clamped = requested < 1 ? 1 : requested > 4 ? 4 : requested;
-    present_interval = game_interval || !rx_option(0, 1) ? clamped : 1;
+    present_interval = game_interval || (!rx_option(0, 1) && fps_max() == 60) ? clamped : 1;
     return requested;
 }
 /* (hookshot) The window's textures as the console's display queue has them: each present is shown at its display
@@ -200,8 +187,8 @@ static int64_t shown_at[16];
 static volatile LONG64 shown_count;
 void hos_vi_native_acquire(int active) {
     static int no_pacing = -1, double_buffered = -1;
-    if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
-    if (double_buffered < 0) double_buffered = getenv("HOS_VI_DOUBLE") != NULL;
+    if (no_pacing < 0) no_pacing = env_on("HOS_NO_PACING");
+    if (double_buffered < 0) double_buffered = env_on("HOS_VI_DOUBLE");
     if (no_pacing || !next_frame_at) return;
     int64_t until = next_frame_at;
     if (!double_buffered && active >= 2) {
@@ -209,7 +196,12 @@ void hos_vi_native_acquire(int active) {
         until = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
     }
     const int64_t now = hos_now_ns();
-    if (until > now) hos_sleep_ns(until - now);
+    if (until > now) {
+        extern volatile int64_t hos_acquire_slept_ns;   /* (host/hos_thread.c: the FPS counter's Breakdown, its pacing) */
+        extern volatile int hos_fps_timing;
+        hos_sleep_ns(until - now);
+        if (hos_fps_timing) InterlockedAdd64(&hos_acquire_slept_ns, hos_now_ns() - now);
+    }
 }
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
@@ -253,8 +245,7 @@ static void scan_dt(long long presents) {
     hos_log("vi: scan %s: %zu floats", name, hits);
 }
 /* (hookshot) Game time follows the clock. The engine steps every frame by ratio = 60 / <the graphics module's nominal fps,
-   an int at the offset the game profile calls the nominal frame rate, Ocarina's +0x2c8> (main+0x6e6cc4, f_83b6e300
-   makes seconds = ratio / 60 and the rest), so at 50 fps the game ran at 83%
+   an int at +0x2c8> (main+0x6e6cc4, f_83b6e300 makes seconds = ratio / 60 and the rest), so at 50 fps the game ran at 83%
    speed: walking the same 8 s at 52 and 33 fps went as far as those rates. Each present writes the rate of the last 5
    display intervals there, the rounding error carried to the next frame so that no time is lost; a step is at most
    1/15 s, as TotK Recomp's frame_rate.c (slower frames slow the game down, as on the console), at least 1/60 s (the game's
@@ -270,11 +261,95 @@ static float text_scale(const char *env, int menu) {
     const int v = env && *env ? atoi(env) : menu;
     return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
 }
+volatile float hos_camera_scale = 1.0f;   /* (the right stick's camera turn speeds, f_80643f10 and three more: nx2/oot_patches.py) */
+/* The Insert menu's Camera speed, in percent of the game's own turn speed (50 to 400; anything else, as without the Vulkan
+   renderer's menu: the game's): what the turn speeds are multiplied by. Even the fastest of the game's own camera speeds turned
+   slowly for players; it still picks the speed this multiplies */
+static float camera_scale(int percent) {
+    return (percent >= 50 && percent <= 400 ? percent : 100) / 100.0f;
+}
+volatile int hos_scene_rgba16f = 0;   /* (the scene buffer RGBA16F, not R11G11B10F, f_80672260: nx2/oot_patches.py; HDR set to
+                                         Native with the PsychoV35 tone mapper: the temporal upscalers take only
+                                         R11G11B10F, so Vanilla keeps it) */
+volatile uint64_t hos_step_probe = 0;   /* (f_80706be0's object, set by the lifted code when the frame-time hook is in this build; its
+                                            +0xd58 is the game clock in 1/60 s: nx2/oot_patches.py) */
+volatile uint32_t hos_frame_seconds_bits = 0;   /* (the frame's seconds as a float's bits for that hook, 0: the game's own step) */
+/* A movie's frame count while the frames' time is given (a Frame rate cap other than 60): how many 60ths of a second this update of
+   that movie player is worth, the rest carried to its next one, so the count the cutscene's cues are placed by keeps the clock
+   as the movie's picture does (issue 1742: the narration ran ahead above 60 fps). 1, the game's own step, otherwise, and with
+   HOS_FPS_MOVIE=0 (for comparisons). Called by the lifted f_83b7c710 (nx2/oot_patches.py).
+   The step is more than 1 when a frame takes longer than a 60th (up to 4, realtime_step's longest), and the count then passes
+   values over. The timeline does not need each one: it fires the events whose time lies between its last frame and the new one,
+   walking a list sorted by time (f_8124cfc0, which the in-engine timelines run with a rate times the time step). Measured at 36
+   fps under a cap of 120, steps of 1 and 2 all the way: every narration line and the rumble as at 60. A step held at 1 would
+   lose that time instead, and the cues would come late, as they do at a cap of 60 under 60 fps. */
+uint32_t hos_movie_frames(uint64_t player) {
+    enum { PLACES = 16 };
+    const uint32_t bits = __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED);   /* (realtime_step writes it at each present) */
+    if (!bits) return 1;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static int timed = -1;   /* (these four under the lock) */
+    static struct { uint64_t player, used; double part; } carry[PLACES];
+    static uint64_t calls;
+    static unsigned made;
+    float secs;
+    uint32_t n = 1;
+    memcpy(&secs, &bits, 4);
+    AcquireSRWLockExclusive(&lock);
+    if (timed < 0) timed = !(getenv("HOS_FPS_MOVIE") && !atoi(getenv("HOS_FPS_MOVIE")));
+    if (timed) {
+        int i = 0;
+        while (i < PLACES && carry[i].player != player) i++;
+        if (i == PLACES) {
+            /* (a player not seen yet takes the place used longest ago, so a movie that plays keeps its own while others come
+               and go: its count is exact while no more than PLACES players, itself among them, update in turn. It starts at a part
+               of a 60th drawn from a hash of how many places were made: with that many players at once every update is a first
+               one, and each count then still grows by the frames' time on average, whatever the number of players, instead of
+               standing still. A sequence with a fixed step, the golden ratio's multiples, stood still for one player in 233) */
+            uint32_t x = made++;
+            x ^= x >> 16, x *= 0x85ebca6bu, x ^= x >> 13, x *= 0xc2b2ae35u, x ^= x >> 16;   /* (MurmurHash3's last step) */
+            i = 0;
+            for (int k = 1; k < PLACES; k++)
+                if (carry[k].used < carry[i].used) i = k;
+            carry[i].player = player, carry[i].part = x / 4294967296.0;
+        }
+        carry[i].used = ++calls;
+        carry[i].part += (double)secs * 60.0;
+        n = (uint32_t)carry[i].part;
+        carry[i].part -= n;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return n;
+}
+/* (nx2/oot_patches.py patch_whole_frames) the whole frames a game counter at `at` takes for an amount of the frame step (its
+   float's bits): with the frames' own time as the step, their fractions carried per counter; else cut as the game cuts it */
+#include "frame_whole.h"
+static FrameWhole frame_whole_state;
+static SRWLOCK frame_whole_lock = SRWLOCK_INIT;   /* (the game's update threads) */
+uint32_t hos_frame_whole(uint64_t at, uint32_t amount_bits) {
+    AcquireSRWLockExclusive(&frame_whole_lock);
+    const uint32_t whole = frame_whole(&frame_whole_state, at, amount_bits, __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED) != 0);
+    ReleaseSRWLockExclusive(&frame_whole_lock);
+    return whole;
+}
 volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
+/* Quantize the time step to the engine's integer nominal rate. Keep debt from a short frame even when the minimum
+   step is 1/60: discarding it made alternating short/long frames advance more game time than elapsed wall time.
+   Keep at most four nominal frames of debt so unpaced fast presents cannot leave a long recovery. Steps beyond
+   1/15 s are still dropped, rather than caught up after a long stall. */
+static int realtime_rate(double ratio, int maximum, double *carry) {
+    ratio += *carry;
+    if (ratio > 4.0) ratio = 4.0;
+    const double least = 60.0 / maximum;
+    const double bounded = ratio < least ? least : ratio;
+    int fps = (int)(60.0 / bounded + 0.5);
+    fps = fps < 15 ? 15 : fps > maximum ? maximum : fps;
+    *carry = ratio - 60.0 / fps;
+    if (*carry < -4.0) *carry = -4.0;
+    return fps;
+}
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
-    void hos_oot_camera_dump(void);   /* (host/hos_oot_camera.c: once, with HOS_CAMERA_DUMP=1) */
-    hos_oot_camera_dump();
     /* (Resolution 100% from the start: the fixed path skipped the dynamic block from the first frame, its fields stayed
        unset and the 3D came out black. The dynamic path runs a few frames first, as when the menu turns it on in game) */
     hos_fixed_resolution = !rx_option(2, 1) && hos_dynres_runs >= 30;
@@ -284,6 +359,8 @@ static void realtime_step(int64_t now) {
         if (!looked) looked = 1, env = getenv("HOS_TEXT_SPEED");
         hos_text_scale = text_scale(env, rx_option(5, 0));
     }
+    hos_camera_scale = camera_scale(rx_option(HOS_OPT_CAMERA_SPEED, 100));
+    hos_scene_rgba16f = rx_option(HOS_OPT_HDR_TONEMAP, 0) != 0;
     {   /* (the Insert menu's Resolution: the fixed path's scale in 1/10000, live; HOS_RES_SCALE
            below stays over it) */
         const int scale = rx_option(3, 0);
@@ -303,7 +380,7 @@ static void realtime_step(int64_t now) {
            +0xe2c bit 3: recompute asked, +0xe50/+0xe54/+0xe58: the sizes the scale is taken against, +0xe5c: the scale */
         static int on = -1;
         static long long n;
-        if (on < 0) on = getenv("HOS_RES_LOG") != NULL;
+        if (on < 0) on = env_on("HOS_RES_LOG");
         const uint64_t m = hos_res_module;
         if (on && m && !(n++ % 300)) {
             float f[4], s;
@@ -315,62 +392,68 @@ static void realtime_step(int64_t now) {
     }
     const uint64_t mod = hos_gfx_module;
     if (!mod) return;
-    {   /* (hookshot) The frame limiter (for Ocarina +0xfc, which f_8042cd20 sleeps to 1 / of; the offset itself is
-           the game profile's). The engine's adaptive controller writes it when variable refresh is on
-           (f_804fc0f0), any rate from 40 up. HOS_FPS_TARGET=<fps>: that rate kept, 0: left alone;
+    /* The offsets below are the game profile's (game/game_profile.h; Ocarina's +0xfc, +0x231, +0x232, +0x2c8
+       and +0x270). A module is only captured for a profile that names them all (host/hos_thread.c, and
+       host/game_profile_check.h stops a build that names the module and not its offsets), so they are used as they
+       are. */
+    static const unsigned ctl_words[] = GAME_GFX_CONTROLLER_WORDS, ctl_rate_words[] = GAME_GFX_CONTROLLER_RATE_WORDS;
+    {   /* (hookshot) The frame limiter (f_8042cd20 sleeps to 1 / +0xfc). The engine's adaptive controller writes +0xfc when
+           variable refresh is on (+0x231, f_804fc0f0), any rate from 40 up. HOS_FPS_TARGET=<fps>: that rate kept, 0: left alone;
            HOS_FPS_LOG=1: what the game asks for, every 300 presents */
         static int target = -1, log_on = -1;
         static long long n;
-        if (target < 0) target = getenv("HOS_FPS_TARGET") ? atoi(getenv("HOS_FPS_TARGET")) : 0, log_on = getenv("HOS_FPS_LOG") != NULL;
-        int *const limit = gfx_have(GAME_GFX_HAVE_FRAME_LIMITER, "frame limiter")
-                               ? (int *)GP(mod + GAME_GFX_FRAME_LIMITER) : NULL;
-        if (limit && log_on && !(n++ % 300)) {
-            /* (the controller's words in one line, however many of them the profile names) */
-            static const unsigned words[] = GAME_GFX_CONTROLLER_WORDS;
-            char tail[128] = "";
-            if (GAME_GFX_HAVE_CONTROLLER)
-                for (int i = 0, at = 0; i < GAME_GFX_CONTROLLER_WORD_COUNT && at < (int)sizeof tail - 16; i++)
-                    at += snprintf(tail + at, sizeof tail - at, " %d",
-                                   *(int *)GP(mod + GAME_GFX_CONTROLLER + words[i]));
-            hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller%s", *limit,
-                    GAME_GFX_HAVE_VRR_MODE ? *(uint8_t *)GP(mod + GAME_GFX_VRR_MODE) : 0,
-                    GAME_GFX_HAVE_VRR_GATE ? *(uint8_t *)GP(mod + GAME_GFX_VRR_GATE) : 0,
-                    GAME_GFX_HAVE_NOMINAL_FPS ? *(int *)GP(mod + GAME_GFX_NOMINAL_FPS) : 0, tail);
+        if (target < 0) target = getenv("HOS_FPS_TARGET") ? atoi(getenv("HOS_FPS_TARGET")) : 0, log_on = env_on("HOS_FPS_LOG");
+        int *limit = (int *)GP(mod + GAME_GFX_FRAME_LIMITER);
+        if (log_on && !(n++ % 300)) {
+            char ctl[96] = "";   /* (the controller's words, as many as the profile names) */
+            for (int i = 0, at = 0; i < GAME_GFX_CONTROLLER_WORD_COUNT && at < (int)sizeof ctl - 16; i++)
+                at += snprintf(ctl + at, sizeof ctl - at, " %d", *(int *)GP(mod + GAME_GFX_CONTROLLER + ctl_words[i]));
+            hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x%x..%s", *limit, *(uint8_t *)GP(mod + GAME_GFX_VRR_MODE),
+                    *(uint8_t *)GP(mod + GAME_GFX_VRR_GATE), *(int *)GP(mod + GAME_GFX_NOMINAL_FPS), ctl_words[0], ctl);
         }
-        if (limit && target && *limit > 0 && *limit < target) *limit = target;
-        /* (hookshot) EXPERIMENT, HOS_FPS_FORCE=1: raising the limiter alone does not hold. With variable
+        if (log_on && !((n - 1) % 300) && hos_step_probe) {   /* (game speed: the game clock's 1/60 s units a second of wall time, 60.0 at speed 1) */
+            static double clock_before;
+            static int64_t at_before;
+            double game_clock;
+            memcpy(&game_clock, GP(hos_step_probe + 0xd58), 8);
+            if (at_before && now > at_before) {
+                const double rate = (game_clock - clock_before) * 1e9 / (double)(now - at_before);
+                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps; now_ns=%lld", game_clock, rate, rate / 60.0,
+                        300e9 / (double)(now - at_before), (long long)now);
+            }
+            clock_before = game_clock, at_before = now;
+        }
+        if (target && *limit > 0 && *limit < target) *limit = target;
+        /* (hookshot) EXPERIMENT, HOS_FPS_FORCE=1: raising +0xfc alone does not hold. With variable
            refresh on the engine's adaptive controller writes it back every frame, so a run with
            HOS_FPS_TARGET=120 logs "frame limiter 60" at every sample and presents a locked 60. This
            also raises the three controller words that sample read as 60, and the nominal rate, to
            see whether the rate the controller settles on is what caps the frame. Unknown engine
            fields written every frame: opt-in, and off by default for that reason. */
-        if (limit && target && getenv("HOS_FPS_FORCE")) {
-            /* f_804fc0f0 is what stores a rate into the limiter, and it does so only when a mode is
-               1, the rate is 40 or more, and the profile's variable-refresh gate byte is set. The
-               sample prints that pair as "vrr %d %d": the mode is 1 here and the gate is 0, so the
-               store never runs and the limiter keeps the 60 it has, whatever the controller words
-               say. Setting it lets the game's own code take a higher rate. */
-            if (gfx_have(GAME_GFX_HAVE_VRR_GATE, "variable-refresh gate")) {
-                uint8_t *const gate = (uint8_t *)GP(mod + GAME_GFX_VRR_GATE);
-                if (!*gate) *gate = 1;
-            }
-            /* NOT the nominal rate. The real-time frame step below owns that word, and the engine
-               steps game time by 60 / it: forcing it to 165 while the game renders at 57 steps time
-               by 0.36 a frame, which is slow motion on screen. Reported from a real run, and the
-               commit that added this block had already warned it changed two things at once. That
-               is why the profile keeps the controller's rate words apart from the ones it only
-               logs, rather than raising everything it knows about. */
-            if (gfx_have(GAME_GFX_HAVE_CONTROLLER, "adaptive controller")) {
-                static const unsigned rate_words[] = GAME_GFX_CONTROLLER_RATE_WORDS;
-                for (int i = 0; i < GAME_GFX_CONTROLLER_RATE_WORD_COUNT; i++) {
-                    int *const word = (int *)GP(mod + GAME_GFX_CONTROLLER + rate_words[i]);
-                    if (*word > 0 && *word < target) *word = target;
-                }
+        if (target && env_on("HOS_FPS_FORCE")) {
+            /* f_804fc0f0 is what stores a rate into +0xfc, and it does so only when a mode is 1,
+               the rate is 40 or more, and the byte at +0x232 is set. The sample prints that pair as
+               "vrr %d %d": +0x231 is 1 here and +0x232 is 0, so the store never runs and +0xfc
+               keeps the 60 it has, whatever the controller words say. Setting it lets the game's
+               own code take a higher rate. */
+            uint8_t *const gate = (uint8_t *)GP(mod + GAME_GFX_VRR_GATE);
+            if (!*gate) *gate = 1;
+            /* NOT +0x2c8. The real-time frame step above owns that word, and the engine steps
+               game time by 60 / it: forcing it to 165 while the game renders at 57 steps time by
+               0.36 a frame, which is slow motion on screen. Reported from a real run, and the
+               commit that added this block had already warned it changed two things at once. */
+            /* (the profile keeps these apart from the words it only logs: Ocarina's +0x58, +0x28, +0x2c) */
+            for (int i = 0; i < GAME_GFX_CONTROLLER_RATE_WORD_COUNT; i++) {
+                int *const word = (int *)GP(mod + GAME_GFX_CONTROLLER + ctl_rate_words[i]);
+                if (*word > 0 && *word < target) *word = target;
             }
         }
+        if (fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
+        if (fps_max() == 30 && *limit > 30) *limit = 30;
     }
-    if (!gfx_have(GAME_GFX_HAVE_NOMINAL_FPS, "nominal frame rate")) return;   /* (no real-time step without it) */
-    if (!rx_option(0, 1)) {   /* (the Insert menu: per frame) */
+    /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time. Only at a cap of 60: other caps
+       keep the real-time step whatever that row says, so 30 fps does not run at half speed) */
+    if (!rx_option(0, 1) && fps_max() == 60) {
         int *slot = (int *)GP(mod + GAME_GFX_NOMINAL_FPS);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         return;
@@ -392,24 +475,51 @@ static void realtime_step(int64_t now) {
     if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
-    double ratio = sum / count * 60.0 + carry;
-    ratio = ratio < 1.0 ? 1.0 : ratio > 4.0 ? 4.0 : ratio;
-    int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > 60 ? 60 : fps;
+    /* (hookshot) A cap other than 60: the engine's own rate is 60 / <whole display intervals>, and its controller puts 60 back over a
+       higher +0x2c8 before the step is made from it, so every frame still stepped 1/60 s and the game ran fps / 60 times too fast.
+       The step is then the frames' own time at the two places the engine makes it (nx2/oot_patches.py, hos_frame_seconds_bits):
+       this same average, at most 1/15 s as below and at least 1/240 s (a 1000th uncapped: a shorter frame stepped a 240th ran the
+       game fast), and the rate under it stays the engine's, 60 at most.
+       At 30 the same hook gives two 60ths per frame to the game, sound, movie cues and counters.
+       HOS_FPS_STEP=0, or a lift without the hook (hos_step_probe unset): the rate up to the cap, as before */
+    static int timed_step = -1;
+    if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
+    const int timed = fps_max() != 60 && timed_step && hos_step_probe;
+    if (timed) {
+        const double secs = sum / count, shortest = 1.0 / (fps_max() > 240 ? fps_max() : 240);
+        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < shortest ? shortest : secs);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        __atomic_store_n(&hos_frame_seconds_bits, bits, __ATOMIC_RELAXED);   /* (read by the game's threads) */
+    } else {
+        __atomic_store_n(&hos_frame_seconds_bits, 0, __ATOMIC_RELAXED);
+    }
+    const int top = timed ? 60 : fps_max();
+    const double ratio = sum / count * 60.0;
     int *slot = (int *)GP(mod + GAME_GFX_NOMINAL_FPS);
-    if (*slot < 15 || *slot > 60) {
+    if (*slot < 15 || *slot > (fps_max() < 60 ? 60 : fps_max())) {
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;
     }
-    carry = ratio - 60.0 / fps;
-    carry = carry > 0.5 ? 0.5 : carry < -0.5 ? -0.5 : carry;
+    /* The timed hook already supplies the actual frame time. Its nominal rate tracks this frame without debt. */
+    double frame_carry = timed ? 0 : carry;
+    const int fps = realtime_rate(ratio, top, &frame_carry);
+    carry = timed ? 0 : frame_carry;
     *slot = fps;
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
 }
 /* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
    Uses the existing frame ID/clock; a forced stop can lose the last second of buffered present records. */
-static void present_trace(int64_t frame, int64_t now) {
+int hos_vi_present_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *path = getenv("HOS_PRESENT_TRACE");
+        enabled = path && *path;
+    }
+    return enabled;
+}
+static void present_trace(int64_t frame, int64_t now, const int64_t phases[4]) {
     static FILE *file;
     static char buffer[64 * 1024];
     static int looked;
@@ -423,19 +533,21 @@ static void present_trace(int64_t frame, int64_t now) {
         }
         if (file) {
             setvbuf(file, buffer, _IOFBF, sizeof buffer);
-            fputs("frame,return_ns,interval_ns\n", file);
+            fputs("frame,return_ns,interval_ns,present_begin_ns,renderer_begin_ns,renderer_end_ns,vcore_back_ns\n", file);
             flushed = now;
         }
     }
     if (!file) return;
-    fprintf(file, "%lld,%lld,%lld\n", (long long)frame, (long long)now, (long long)(frame > 1 ? now - last : 0));
+    fprintf(file, "%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)frame, (long long)now,
+            (long long)(frame > 1 ? now - last : 0), (long long)phases[0], (long long)phases[1],
+            (long long)phases[2], (long long)phases[3]);
     last = now;
     if (now - flushed >= 1000000000LL) {
         fflush(file);
         flushed = now;
     }
 }
-void hos_vi_native_presented(void) {
+void hos_vi_native_presented(const int64_t phases[4]) {
     static long long scan_n;
     scan_dt(++scan_n);
     {   /* HOS_FRAME_SLEEP_MS (diagnostic): slower frames, for game speed against frame rate */
@@ -443,7 +555,7 @@ void hos_vi_native_presented(void) {
         if (ms < 0) ms = getenv("HOS_FRAME_SLEEP_MS") ? atoi(getenv("HOS_FRAME_SLEEP_MS")) : 0;
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
-    const int64_t period = 1000000000LL / 60 * present_interval, now = hos_now_ns();
+    const int64_t period = 1000000000LL / fps_max() * present_interval, now = hos_now_ns();
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
     next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;
@@ -453,7 +565,7 @@ void hos_vi_native_presented(void) {
         shown_count = n + 1;
     }
     const int64_t n = InterlockedIncrement64(&presents);
-    present_trace(n, now);
+    present_trace(n, now, phases);
     {   /* HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any
            non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice,
            which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts

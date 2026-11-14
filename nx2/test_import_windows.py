@@ -8,6 +8,8 @@ import argparse,os
 from pathlib import Path
 import subprocess,tempfile
 
+RUN_ALL_ARGS = ["--cxx", "g++"]
+
 ROOT=Path(__file__).resolve().parents[1]
 def block(text,marker):
     start=text.index(marker);end=text.index('{',start)+1;depth=1
@@ -20,6 +22,7 @@ def main():
     source=(ROOT/'gpu/vk/vk_memory.cpp').read_text(encoding='utf-8')
     guard=source[source.index('bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {'):source.index('    p.lo = lo;',source.index('bool import_pool('))]
     lookup=block(source,'Pool* pool_lookup(uint64_t guest, uint64_t size) {')
+    chunking=source[source.index('uint64_t import_chunk() {'):source.index('Pool* pool_lookup(uint64_t guest, uint64_t size) {')]
     cache=block(source,'Pool* pool_of(uint64_t guest, uint64_t size) {')
     prefetch=block(source,'void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {')
     fixture='''#include <algorithm>
@@ -33,7 +36,7 @@ def main():
 #include <mutex>
 #include <vector>
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"FAIL:%d %s\\n",__LINE__,#x);std::exit(1);} }while(0)
-struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false; };
+struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false,gpu_only=false,gpu_written=false; uint8_t trims=0; uint64_t trim_epoch=0; };
 struct GuestPool { uint64_t lo,hi; };
 std::vector<GuestPool> guest_pools;
 std::map<uint64_t,Pool> imported;
@@ -53,10 +56,11 @@ thread_local bool import_cooling = false;
 thread_local int import_result = 0;
 bool import_on_hold(uint64_t, uint64_t) { import_cooling = false; return false; }
 void import_remember_failure(uint64_t, uint64_t) {}
+bool mirror_on() { return true; } // (import_chunk's default: 4 MB with VRAM mirrors, 16 without)
 '''+guard+'''
     p.lo=lo;p.hi=hi;imports++;return true;
 }
-'''+prefetch+'\n'+lookup+'\n'+cache+'''
+'''+prefetch+'\n'+chunking+'\n'+lookup+'\n'+cache+'''
 int check_prefetch(int mode) {
     const uint64_t base=0x1000000000ull,chunk=16ull<<20;
     guest_pools.push_back({base,base+8*chunk});
@@ -96,6 +100,18 @@ int main(int argc,char **argv) {
         CHECK(pool_lookup(address+100,64)==p && imports==1);
         p=pool_lookup(expected+4*chunk+123,64);CHECK(p && p->lo==expected+4*chunk && p->hi==expected+5*chunk && imports==2);
         p=pool_lookup(expected+chunk-16,64);CHECK(p && p->lo==expected && p->hi==expected+2*chunk && retires==1);
+        if(chunk==(16ull<<20)) {
+            // a game pool across a chunk's end: its first binding imports both chunks (span_game_pools)
+            const uint64_t far=base+0x40000000ull,far2=base+0x50000000ull;
+            guest_pools.push_back({far+chunk-4096,far+chunk+4096});
+            guest_pools.push_back({far2+chunk-4096,far2+chunk+4096});
+            p=pool_lookup(far+chunk-64,32);CHECK(p && p->lo==far && p->hi==far+2*chunk);
+            CHECK(pool_lookup(far+chunk+64,32)==p);   // (the binding across the end: no import again)
+            // a spanned import that fails (past the device's limit here) is made again without the span
+            const uint64_t limit=max_import_size;max_import_size=chunk;
+            p=pool_lookup(far2+chunk-64,32);CHECK(p && p->lo==far2 && p->hi==far2+chunk);
+            max_import_size=limit;
+        }
     }
     const int before=imports;
     CHECK(!pool_lookup(base+extent+1,1));

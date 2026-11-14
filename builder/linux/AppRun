@@ -4,6 +4,7 @@
 #   Hookshot.AppImage                  the builder window (Play is in the window, once a game is built)
 #   Hookshot.AppImage --play           start the game the builder saved, without opening the window
 #   Hookshot.AppImage --play <folder>  start the game in that folder
+#   Hookshot.AppImage --play <folder> --game <key>   that game's own folder (<folder>-<key>, the default game's <folder>)
 #   Hookshot.AppImage <folder>         the same
 #   Hookshot.AppImage --cli <args>     nx2/make_game.py itself, e.g. --cli --nup game.nup --out ~/Games/Hookshot
 #   Hookshot.AppImage --launch <dir>  the game folder's launcher: Play, and Update when a newer release is out

@@ -4,10 +4,6 @@
 #include <windows.h>
 #include <mmsystem.h>
 
-/* (the project's name, for the message boxes below: game/game_profile.h, generated from nx2/game_profile.py.
-   This file is a Win32 shim and does not take host/hos.h, so it reads the profile directly.) */
-#include "game_profile.h"
-
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -195,6 +191,29 @@ static HThread *thread_new(void) {
     monitor_init(&t->mu, &t->cv);
     return t;
 }
+/* The process's affinity as the process started: Windows keeps a process mask apart from its threads' masks, Linux has
+   only the threads'. Read from the asking thread each time, it was that thread's own mask, which shrank once hos_thread_pin
+   pinned it off the reserved core: the Presentation Thread's pin, asked for from a game thread kept off that core, then
+   saw no reserved core in the "process" mask and kept the Presentation Thread off it too, against render_thread_on_reserved
+   (host/hos_thread.c; Ryzen 9 9950X3D, 2026-11-09). Taken once, before main, when no thread is pinned yet.
+   Also applied when a thread first registers here (CreateThread's thread_entry, or a std::thread in thread_self on its
+   first GetCurrentThread call in SetThreadDescription / SetThreadPriority), so a thread made inside a pinned replay
+   (ReplayPin in gpu/vk/vk_replay.cpp) starts with the process's affinity as on Windows rather than inheriting the pin. */
+static DWORD_PTR process_affinity;
+__attribute__((constructor)) static void init_process_affinity(void) {
+    cpu_set_t s;
+    CPU_ZERO(&s);
+    if (sched_getaffinity(0, sizeof s, &s) == 0)
+        for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &s)) process_affinity |= (DWORD_PTR)1 << i;
+}
+static void apply_process_affinity(pthread_t th) {
+    if (!process_affinity) init_process_affinity();
+    if (!process_affinity) return;
+    cpu_set_t want;
+    CPU_ZERO(&want);
+    for (int i = 0; i < 64; i++) if (process_affinity >> i & 1) CPU_SET(i, &want);
+    pthread_setaffinity_np(th, sizeof want, &want);
+}
 static HThread *thread_self(void) {
     if (!self_thread) {   /* (a thread this file did not start: the main thread, a library's) */
         HThread *t = thread_new();
@@ -202,6 +221,7 @@ static HThread *thread_self(void) {
         t->tid = (pid_t)syscall(SYS_gettid);
         t->refs = 1;   /* (kept for the thread's life) */
         self_thread = t;
+        apply_process_affinity(t->th);
     }
     return self_thread;
 }
@@ -224,6 +244,7 @@ static void *thread_entry(void *p) {
     HThread *t = (HThread *)p;
     self_thread = t;
     t->tid = (pid_t)syscall(SYS_gettid);
+    apply_process_affinity(t->th);
     thread_finish(t->fn(t->arg));
     return NULL;
 }
@@ -300,13 +321,9 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
 }
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     (void)p;
-    cpu_set_t s;
-    CPU_ZERO(&s);
-    sched_getaffinity(0, sizeof s, &s);
-    DWORD_PTR m = 0;
-    for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &s)) m |= (DWORD_PTR)1 << i;
+    if (!process_affinity) init_process_affinity();   /* (the constructor did not run, or the call failed then) */
     long n = sysconf(_SC_NPROCESSORS_CONF);
-    *proc = m;
+    *proc = process_affinity;
     *sys = n >= 64 ? ~(DWORD_PTR)0 : (((DWORD_PTR)1 << n) - 1);
     return TRUE;
 }
@@ -750,7 +767,9 @@ static const char *linux_name(const char *base) {
         if (!strcasecmp(base, map[i][0])) return map[i][1];
     return NULL;
 }
+static __thread char load_error[512];   /* (dlerror()'s text for the last failure: hos_load_error) */
 HMODULE LoadLibraryA(LPCSTR name) {
+    load_error[0] = 0;
     if (!name) return NULL;
     char path[PATH_MAX];
     snprintf(path, sizeof path, "%s", name);
@@ -768,9 +787,14 @@ HMODULE LoadLibraryA(LPCSTR name) {
         }
     }
     HMODULE m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!m) last_error = ERROR_FILE_NOT_FOUND;
+    if (!m) {
+        last_error = ERROR_FILE_NOT_FOUND;
+        const char *why = dlerror();
+        snprintf(load_error, sizeof load_error, "%s", why ? why : "");
+    }
     return m;
 }
+const char *hos_load_error(void) { return load_error; }
 BOOL FreeLibrary(HMODULE m) { return m && dlclose(m) == 0; }
 FARPROC GetProcAddress(HMODULE m, LPCSTR name) { return m ? (FARPROC)dlsym(m, name) : NULL; }
 HMODULE GetModuleHandleA(LPCSTR name) {
@@ -949,7 +973,10 @@ DWORD GetFileAttributesA(LPCSTR name) {
         fail_errno();
         return INVALID_FILE_ATTRIBUTES;
     }
-    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    DWORD at = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    struct stat link;   /* (hookshot: a symbolic link is marked as Windows marks one, a reparse point; find_next too) */
+    if (lstat(path, &link) == 0 && S_ISLNK(link.st_mode)) at |= FILE_ATTRIBUTE_REPARSE_POINT;
+    return at;
 }
 BOOL CreateDirectoryA(LPCSTR name, void *attr) {
     (void)attr;
@@ -1010,6 +1037,8 @@ static BOOL find_next(HFind *f, WIN32_FIND_DATAA *fd) {
         } else {
             fd->dwFileAttributes = e->d_type == DT_DIR ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         }
+        struct stat link;   /* (hookshot: a symbolic link is marked as Windows marks one, a reparse point) */
+        if (lstat(full, &link) == 0 && S_ISLNK(link.st_mode)) fd->dwFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
         return TRUE;
     }
     last_error = ERROR_NO_MORE_FILES;
@@ -1234,24 +1263,26 @@ DWORD GetWindowThreadProcessId(HWND w, DWORD *pid) {
 }
 int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
     (void)w, (void)type;
-    fprintf(stderr, "%s: %s\n", caption ? caption : GAME_PROJECT, text ? text : "");
+    fprintf(stderr, "%s: %s\n", caption ? caption : "Hookshot", text ? text : "");
     typedef int (*ShowFn)(uint32_t, const char *, const char *, void *);   /* (SDL3's and SDL2's alike; its result unread) */
     void *sdl = dlopen("libSDL3.so.0", RTLD_NOW | RTLD_NOLOAD);
     if (!sdl) sdl = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_NOLOAD);
     ShowFn show = sdl ? (ShowFn)dlsym(sdl, "SDL_ShowSimpleMessageBox") : NULL;
-    if (show) show(0x10, caption ? caption : GAME_PROJECT, text ? text : "", NULL);
+    if (show) show(0x10, caption ? caption : "Hookshot", text ? text : "", NULL);
     return 1;
 }
 
 /* ---- waveOut on SDL's audio (host/hos_sdl.c): a callback takes the written blocks in order and marks them done ---- */
 /* (the executable's: this file is in the Vulkan back end too, which plays no sound and has no hos_sdl.c) */
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
+void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
     __attribute__((weak));
+void hos_sdl_audio_close(void *out) __attribute__((weak));
 typedef struct {
     pthread_mutex_t mu;
     WAVEHDR *q[64];
     int head, count;
     DWORD pos;
+    void *sdl;   /* (what hos_sdl_audio_open opened) */
 } WaveOut;
 static void wave_pull(void *user, uint8_t *out, int len) {
     WaveOut *w = (WaveOut *)user;
@@ -1276,7 +1307,8 @@ MMRESULT waveOutOpen(HWAVEOUT *out, UINT device, const WAVEFORMATEX *f, DWORD_PT
     if (!hos_sdl_audio_open) return MMSYSERR_ERROR;
     WaveOut *w = (WaveOut *)calloc(1, sizeof *w);
     pthread_mutex_init(&w->mu, NULL);
-    if (!hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w)) {
+    w->sdl = hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w);
+    if (!w->sdl) {
         pthread_mutex_destroy(&w->mu);
         free(w);
         return MMSYSERR_ERROR;
@@ -1290,7 +1322,13 @@ MMRESULT waveOutWrite(HWAVEOUT hw, WAVEHDR *h, UINT size) {
     (void)size;
     WaveOut *w = (WaveOut *)hw;
     pthread_mutex_lock(&w->mu);
-    if (w->count == 64) { pthread_mutex_unlock(&w->mu); return MMSYSERR_ERROR; }
+    if (w->count >= 60) {
+        WAVEHDR *old = w->q[w->head];
+        __atomic_store_n(&old->dwFlags, (old->dwFlags & ~(DWORD)WHDR_INQUEUE) | WHDR_DONE, __ATOMIC_RELEASE);
+        w->head = (w->head + 1) % 64;
+        w->count--;
+        w->pos = 0;
+    }
     h->dwFlags = (h->dwFlags & ~(DWORD)WHDR_DONE) | WHDR_INQUEUE;
     w->q[(w->head + w->count) % 64] = h;
     w->count++;
@@ -1308,4 +1346,14 @@ MMRESULT waveOutReset(HWAVEOUT hw) {
     pthread_mutex_unlock(&w->mu);
     return 0;
 }
-MMRESULT waveOutClose(HWAVEOUT hw) { waveOutReset(hw); return 0; }
+/* (the device closed first, so wave_pull has stopped: a reset only emptied the queue, and the device stayed open. Opened
+   again after a stall, the default output then refused a second open and the sound stayed off) */
+MMRESULT waveOutClose(HWAVEOUT hw) {
+    WaveOut *w = (WaveOut *)hw;
+    if (!w) return MMSYSERR_ERROR;
+    if (hos_sdl_audio_close) hos_sdl_audio_close(w->sdl);
+    waveOutReset(hw);
+    pthread_mutex_destroy(&w->mu);
+    free(w);
+    return MMSYSERR_NOERROR;
+}

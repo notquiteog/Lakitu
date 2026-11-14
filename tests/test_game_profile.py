@@ -1,39 +1,45 @@
-"""The game profile seam holds: a patch site is only patched when the game has the instruction it was written for,
-the lift driver names no game, and the committed C view of the profile is the one the profile emits.
+"""The game profile seam holds: a second game is described in nx2/game_profile.py and nowhere else, a dump is matched
+to its profile by main's build id, an unknown or unmeasured game is patched and hooked by nothing, and the committed C
+view of the profile is the one the profile emits.
 
 What this guards, and why each check is here rather than left to review:
 
-1. **A site whose instruction word differs is skipped, not patched.** This is the whole safety story of a game
-   profile. The profile may be wrong about an address -- aimed at the wrong build, or at another game entirely --
-   and the result has to be a feature that is off, never C written after an instruction that is not the one the
-   patch was written for. The check runs each profile's real patch modules against a fake image, so it exercises
-   the skip path itself; it does not read the source and hope.
-2. **nx2/lift.py imports no game's modules by name.** The driver asks the profile which modules to install. If
-   someone puts `import oot_wide` back, adding a second game means editing the driver again, which is the thing
-   the seam exists to stop.
-3. **game/game_profile.h is what nx2/game_profile.py emits.** The header is generated and committed so a build
-   needs no generation step; that only works while the two cannot drift.
-4. **The Mario Kart World profile holds no invented numbers**, and a profile that claims patch sites also says
-   which build it is for.
+1. **The profile is chosen by main's build id.** Ocarina's build gets Ocarina's profile, a second game's build (a
+   profile made up for this check) gets its own, and a build no profile knows gets NONE -- never Ocarina's by default,
+   because Ocarina's patches and return addresses on another game are C after the wrong instruction and a module
+   captured from a random call.
+2. **A profile with no patches installs none, and Ocarina's patch modules leave out every site whose word differs.**
+   The modules run for real against a fake image, so the skip path itself is exercised.
+3. **No game is named outside the profile.** nx2/lift.py imports no game's module; host/nn_vi.c, host/hos_thread.c,
+   host/nvn_native.c, the renderer and make_game.py carry none of Ocarina's offsets, return addresses, program keys or
+   build id as literals.
+6. **game/ travels with the sources**: the AppImage's tools, the Windows package and the source stamp (Lakitu 029287fa).
+4. **A profile is whole or empty where half would be unsafe:** one that names the graphics module's return address
+   names every offset the runtime reads in it.
+5. **game/game_profile.h is what nx2/game_profile.py emits**, and every profile's header compiles with the guard the
+   runtime puts on it.
 
-This test has to be able to fail. Every check below asserts first that it is looking at something: that the
-fixture image really does hold the expected words, that a module really does install sites when they match, that
-the files it reads are non-empty and contain the markers it searches for. A source scan that passes because it
-found nothing is worse than no test.
+Every check asserts first that it is looking at something (the files are read and hold the markers searched for, the
+fake image really holds the words), so it cannot pass by finding nothing.
 
-python -I -B tests/test_game_profile.py
+python -I -B tests/test_game_profile.py [--cc gcc]
 """
+import argparse
 import contextlib
 import importlib
 import io
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "nx2"))
 import game_profile  # noqa: E402
 
+RUN_ALL_ARGS = ["--cc", "gcc"]
 FAILURES = []
 
 
@@ -44,232 +50,203 @@ def check(cond, what):
 
 
 class FakeLifter(object):
-    """Only what install_sites touches: the dict of C to run after a guest instruction."""
+    """What a patch module touches: the dict of C to run after a guest instruction."""
 
     def __init__(self):
         self.after = {}
 
 
 class FakeImage(object):
-    """A guest image that holds exactly the words it is given, and nothing at any other address."""
+    """A guest image whose every word is `word`: none of the instructions a patch was written for."""
 
-    class _Main(object):
-        name = "main"
-
-        def __init__(self, base):
-            self.base = base
-
-    def __init__(self, base, words):
-        self.modules = [FakeImage._Main(base)]
-        self.words = dict(words)
-        self.asked = []
+    def __init__(self, word=0):
+        self.value = word
+        self.asked = 0
 
     def word(self, pc):
-        self.asked.append(pc)
-        if pc not in self.words:
-            raise IndexError("%#x is not in this image" % pc)
-        return self.words[pc]
+        self.asked += 1
+        return self.value
 
 
-def sites_of(module, main_base):
-    """A patch module's sites as (offset, word) pairs, however it spells its table.
-
-    A module may hold its sites as a tuple or build them from main's base (one of Ocarina's writes absolute
-    vtable addresses into its C). Both shapes are accepted; a module with neither is a failure, because then
-    this test would have nothing to check and would pass by looking at nothing.
-    """
-    table = None
-    if callable(getattr(module, "sites", None)):
-        table = module.sites(main_base)
-    elif isinstance(getattr(module, "SITES", None), tuple):
-        table = module.SITES
-    if not table:
-        return None
-    out = []
-    for site in table:
-        if len(site) < 2 or not isinstance(site[0], int) or not isinstance(site[1], int):
-            return None
-        out.append((site[0], site[1]))
-    return out
-
-
-def check_patch_modules(profile):
-    """Each of the profile's patch modules, against an image that holds the words and one that does not."""
-    if not profile.patch_modules:
-        return 0
-    checked = 0
-    for name in profile.patch_modules:
-        module = importlib.import_module(name)
-        pairs = sites_of(module, profile.main_base)
-        if not check(pairs, "%s: %s has no readable site table, so nothing about it could be checked"
-                            % (profile.key, name)):
-            continue
-        if not check(all(0 <= w <= 0xffffffff for _, w in pairs),
-                     "%s: %s has a site whose expected value is not a 32-bit instruction word" % (profile.key, name)):
-            continue
-
-        # (1a) the image holds every word the module expects: every site goes in
-        good = FakeImage(profile.main_base, {profile.main_base + off: word for off, word in pairs})
-        lifter = FakeLifter()
-        with contextlib.redirect_stdout(io.StringIO()):
-            n = module.install(lifter, good, profile)
-        if not check(n == len(pairs) and len(lifter.after) > 0,
-                     "%s: %s installed %d of %d sites on an image that holds every expected word"
-                     % (profile.key, name, n, len(pairs))):
-            continue
-        # the fixture really did exercise the word check (otherwise 1b below proves nothing)
-        if not check(good.asked, "%s: %s never read an instruction word: its sites are not checked at all"
-                                 % (profile.key, name)):
-            continue
-
-        # (1b) every word differs: nothing is patched, and each skipped site is said out loud
-        flipped = FakeImage(profile.main_base,
-                            {profile.main_base + off: word ^ 0xffffffff for off, word in pairs})
-        lifter = FakeLifter()
-        said = io.StringIO()
-        with contextlib.redirect_stdout(said):
-            n = module.install(lifter, flipped, profile)
-        check(n == 0 and not lifter.after,
-              "%s: %s patched %d sites on an image where every word differs: a profile aimed at the wrong build "
-              "would corrupt the game" % (profile.key, name, n))
-        check(said.getvalue().count("left out") == len(pairs),
-              "%s: %s did not log every site it left out (%d of %d said)"
-              % (profile.key, name, said.getvalue().count("left out"), len(pairs)))
-
-        # (1c) one word differs: that site alone is left out, the rest still go in
-        if len(pairs) > 1:
-            words = {profile.main_base + off: word for off, word in pairs}
-            first = profile.main_base + pairs[0][0]
-            words[first] ^= 0xffffffff
-            lifter = FakeLifter()
-            with contextlib.redirect_stdout(io.StringIO()):
-                n = module.install(lifter, FakeImage(profile.main_base, words), profile)
-            check(n == len(pairs) - 1 and first not in lifter.after,
-                  "%s: %s did not leave out the one site whose word differs (installed %d of %d)"
-                  % (profile.key, name, n, len(pairs)))
-
-        # (1d) an address that is not in the image at all is left out, not raised through
-        lifter = FakeLifter()
-        with contextlib.redirect_stdout(io.StringIO()):
-            n = module.install(lifter, FakeImage(profile.main_base, {}), profile)
-        check(n == 0 and not lifter.after,
-              "%s: %s patched %d sites on an image that holds no instruction at any of them"
-              % (profile.key, name, n))
-        checked += 1
-    return checked
+def check_choice():
+    oot, none = game_profile.GAMES["oot"], game_profile.GAMES["none"]
+    # (a second game, made up here: the engine has one profile, Ocarina's, and the choice must already tell games apart)
+    other = game_profile.Profile("other", "a second game", build_id="9ede03836568bcd34434dfc29bc61e0451dbbe3e",
+                                 main_base=0x80020000)
+    game_profile.GAMES["other"] = other
+    try:
+        check(game_profile.for_build(oot.build_id) is oot, "Ocarina's build id does not choose Ocarina's profile")
+        check(game_profile.for_build(oot.build_id[:8]) is oot, "the 8-digit prefix the docs quote does not choose Ocarina")
+        check(game_profile.for_build(other.build_id) is other, "a second game's build id does not choose its profile")
+        check(game_profile.for_build("0123456789abcdef0123456789abcdef01234567") is none,
+              "a build no profile knows does not get the empty profile")
+        check(game_profile.for_build("e0f3") is none, "four digits are taken as a build id")
+        check(game_profile.active({}, build_id=other.build_id) is other, "a lift of another dump does not get its profile")
+        check(game_profile.active({}, build_id="ffffffff") is none, "a lift of an unknown dump gets a profile with patches")
+        check(game_profile.active({}) is game_profile.GAMES[game_profile.DEFAULT], "no dump does not mean the default")
+        check(game_profile.active({"HOOKSHOT_GAME": "other"}, build_id=oot.build_id) is other,
+              "HOOKSHOT_GAME does not override")
+    finally:
+        del game_profile.GAMES["other"]
+    try:
+        game_profile.active({"HOOKSHOT_GAME": "nope"})
+        check(False, "an unknown HOOKSHOT_GAME is accepted")
+    except SystemExit:
+        pass
+    ids = [p.build_id for p in game_profile.GAMES.values() if p.build_id]
+    check(len(ids) == len(set(ids)) and all(re.fullmatch(r"[0-9a-f]{40}", b) for b in ids),
+          "a profile's build id is not main's whole 40-digit build id, or two profiles share one")
+    check([p.key for p, _ in game_profile.known_builds()] == ["oot", "mkw"], "make_game.py's known builds are not Ocarina's and Mario Kart World 1.0.0's (Lakitu)")
 
 
-def check_no_main_base_patches_nothing():
-    """A profile with no main base cannot place an offset, so it patches nothing rather than patching from 0."""
-    nowhere = game_profile.Profile(key="test", game="a game with no addresses known")
+def check_wholeness():
+    for p in game_profile.GAMES.values():
+        if p.hooks.gfx_clock is not None:
+            check(all(v is not None for v in p.gfx[:5]) and p.gfx.controller_words and p.gfx.controller_rate_words,
+                  "%s: names the graphics module's return address but not every offset read in it" % p.key)
+        if p.patch_modules or p.code_patch_module or p.hooks != game_profile.EMPTY_HOOKS:
+            check(p.build_id and p.main_base is not None,
+                  "%s: patches or hooks a game without saying which build and where main is" % p.key)
+        check(isinstance(p.account_users, int) and 1 <= p.account_users <= 8, "%s: account_users is not 1..8" % p.key)
+        check(p.npad_players == "auto" or (isinstance(p.npad_players, int) and 1 <= p.npad_players <= 8),
+              "%s: npad_players is not 1..8 or auto" % p.key)
+    none = game_profile.GAMES["none"]
+    check(not none.patch_modules and none.code_patch_module is None and none.hooks == game_profile.EMPTY_HOOKS and
+          none.gfx == game_profile.EMPTY_GFX and none.upscale == game_profile.EMPTY_UPSCALE and not none.build_id,
+          "the empty profile claims a patch, an offset, a hook, a key or a build")
+
+
+def check_patches():
+    none = game_profile.GAMES["none"]
     lifter = FakeLifter()
-    n = game_profile.install_sites(lifter, FakeImage(0, {}), nowhere,
-                                   ((0x10, 0xd503201f, "/* would be wrong */"),), "test", log=lambda *a: None)
-    check(n == 0 and not lifter.after,
-          "install_sites patched a site for a profile with no main base, which would place it at an offset from 0")
+    with contextlib.redirect_stdout(io.StringIO()):
+        n = game_profile.install_patches(lifter, FakeImage(), none, "")
+    check(n == 0 and not lifter.after, "a profile with no patch modules installed C")
+    oot = game_profile.GAMES["oot"]
+    check(oot.patch_modules, "Ocarina's profile has no patch modules to check")
+    for p in game_profile.GAMES.values():
+        for name in p.patch_modules + ((p.code_patch_module,) if p.code_patch_module else ()):
+            check(game_profile.load_module(name).__name__ == name, "%s: %s does not load as itself" % (p.key, name))
+    for name in oot.patch_modules:
+        module = importlib.import_module(name)
+        check(callable(getattr(module, "install", None)), "%s has no install()" % name)
+    image, lifter, out = FakeImage(0), FakeLifter(), io.StringIO()
+    with contextlib.redirect_stdout(out):
+        n = game_profile.install_patches(lifter, image, oot, oot.build_id)
+    check(image.asked > 0, "Ocarina's patch modules never looked at the image, so the word check was not exercised")
+    check(n == 0 and not lifter.after, "Ocarina's patch modules wrote C after instructions that are not theirs")
+    module = importlib.import_module(oot.code_patch_module)
+    check(callable(getattr(module, "patch_file", None)) and getattr(module, "LIFE_BUILD_ID", "") == oot.build_id,
+          "Ocarina's code patch module is not the one chunks.edit_c applies, or its build is not the profile's")
 
 
-def check_lift_names_no_game():
-    """nx2/lift.py goes through the profile and imports no game's modules by name."""
-    text = (ROOT / "nx2" / "lift.py").read_text(encoding="utf-8")
-    if not check(len(text) > 2000, "nx2/lift.py is missing or far too short to be the lift driver"):
-        return
-    # the positive marker first: without it this check could pass on a file that does nothing at all
-    check("game_profile" in text, "nx2/lift.py does not mention game_profile: it is not going through the seam")
-    check(re.search(r"game_profile\.install_patches\(", text),
-          "nx2/lift.py does not call game_profile.install_patches()")
-    check(re.search(r"game_profile\.apply_code_patches\(", text),
-          "nx2/lift.py does not call game_profile.apply_code_patches()")
-
-    # every module any profile names, plus anything that looks like a game module, must not be imported here
-    named = {m for p in game_profile.GAMES.values() for m in p.patch_modules}
-    named |= {p.code_patch_module for p in game_profile.GAMES.values() if p.code_patch_module}
-    if not check(named, "no profile names a patch module, so this check would scan for nothing"):
-        return
-    for module in sorted(named):
-        check(not re.search(r"^\s*(?:import|from)\s+%s\b" % re.escape(module), text, re.M),
-              "nx2/lift.py imports %s by name: the game's modules come from the profile" % module)
-    # and the general shape, for a game whose prefix no profile lists yet
-    stray = re.findall(r"^\s*import\s+([a-z0-9]+_(?:wide|camera|occlusion|patches))\b", text, re.M)
-    check(not stray, "nx2/lift.py imports game patch modules by name: %s" % ", ".join(stray))
+def read(rel, *markers):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    for m in markers:
+        check(m in text, "%s: no %r, so the check below would look at nothing" % (rel, m))
+    return text
 
 
-def check_header_matches():
-    """game/game_profile.h is what nx2/game_profile.py emits for the active profile."""
-    path = Path(game_profile.header_path())
-    if not check(path.is_file(), "game/game_profile.h is missing: run python -I nx2/game_profile.py --emit-header"):
-        return
-    have = path.read_text(encoding="utf-8")
-    want = game_profile.emit_header(game_profile.active())
-    if not check(len(want) > 500 and "GAME_PROFILE_H" in want, "emit_header() produced no usable header"):
-        return
-    check(have == want,
-          "game/game_profile.h is not what nx2/game_profile.py emits: run python -I nx2/game_profile.py --emit-header")
+def code_only(text):
+    """C or Python without its comments, for the literal checks: a comment may say what Ocarina's value was."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return re.sub(r"(?m)^\s*#(?!include|define|if|endif|else|elif|error|ifdef|ifndef).*$", "", text)
 
 
-def check_profiles_are_honest():
-    """No profile holds a value it cannot have measured, and one with patch sites says which build it is for."""
-    if not check(len(game_profile.GAMES) >= 2, "there is only one game profile, so the seam has nothing to prove"):
-        return
-    for key, p in game_profile.GAMES.items():
-        claims = bool(p.patch_modules or p.code_patch_module or p.gfx.frame_limiter is not None
-                      or p.gfx.nominal_fps is not None or p.upscale.taau or p.upscale.gameplay)
-        if claims:
-            # a profile that patches or paces a game has to say which game build it was measured on, or there is
-            # no way to tell whether its addresses apply to the dump in front of it
-            check(p.main_base is not None, "the %s profile claims game-specific values but has no main base" % key)
-            check(p.build_id, "the %s profile claims game-specific values but does not say which build" % key)
-            check(p.program_id, "the %s profile claims game-specific values but no program id" % key)
-        else:
-            # an empty profile must be empty all the way: a half-filled one is the dangerous state
-            check(p.main_base is None, "the %s profile names no patches but has a main base" % key)
-            check(p.gfx == game_profile.EMPTY_GFX,
-                  "the %s profile names no patches but has graphics-module offsets" % key)
-            check(p.upscale == game_profile.EMPTY_UPSCALE,
-                  "the %s profile names no patches but has upscale program keys" % key)
-    check("mkw" in game_profile.GAMES, "there is no mkw profile")
-    mkw = game_profile.GAMES.get("mkw")
-    if mkw:
-        check(mkw.main_base is None and not mkw.patch_modules and mkw.gfx == game_profile.EMPTY_GFX
-              and mkw.upscale == game_profile.EMPTY_UPSCALE,
-              "the mkw profile holds values, and nothing of Mario Kart World has been measured here")
+def check_no_literals():
+    lift = read("nx2/lift.py", "game_profile")
+    check(not re.search(r"^\s*(import|from)\s+oot_\w+", lift, re.M), "nx2/lift.py imports a game's module by name")
+    chunks = code_only(read("nx2/chunks.py", "def edit_c("))
+    check("import oot_patches" not in chunks, "nx2/chunks.py imports Ocarina's code patches by name")
+    vi = code_only(read("host/nn_vi.c", "GAME_GFX_FRAME_LIMITER"))
+    for lit in ("0xfc)", "0x2c8)", "0x231)", "0x232)", "0x270 +"):
+        check("mod + " + lit not in vi, "host/nn_vi.c reads the graphics module at Ocarina's %s again" % lit)
+    thread = code_only(read("host/hos_thread.c", "GAME_LR_GFX_CLOCK"))
+    for lit in ("0x8348c770", "0x80590520"):
+        check(lit not in thread, "host/hos_thread.c recognises Ocarina's %s again" % lit)
+    nvn = code_only(read("host/nvn_native.c", "GAME_LR_PRESENT_EVENTS"))
+    for lit in ("0x805904a0", "0x80590530"):
+        check(lit not in nvn, "host/nvn_native.c recognises Ocarina's %s again" % lit)
+    for rel in ("gpu/vk/vk_draw.cpp", "gpu/vk/vk_shader.cpp"):
+        src = code_only(read(rel, "game_profile.h"))
+        for lit in ("fd029a317a9a4b94", "9dc98871eb7fc101"):
+            check(lit not in src, "%s names Ocarina's program %s outside a comment" % (rel, lit))
+    main_c = code_only(read("host/hos_main.c", "GAME_SAVES_DIR"))
+    saves = main_c[main_c.index("static const char *saves_dir(const char *beside) {"):]
+    check('"/" GAME_SAVES_DIR' in saves[:saves.index("\n}\n")],
+          "host/hos_main.c's saves folder is not the game profile's: two games would share one")
+    make = read("nx2/make_game.py", "game_profile")
+    check(not re.search(r"""^BUILD_ID\s*=\s*["']""", make, re.M), "nx2/make_game.py has its own supported build again")
 
 
-def check_c_reads_the_profile():
-    """The runtime and the renderer take these from the profile, not from literals of their own."""
-    cases = [
-        (Path("host") / "nn_vi.c", ("GAME_GFX_FRAME_LIMITER", "GAME_GFX_NOMINAL_FPS", "GAME_GFX_VRR_GATE"),
-         (r"mod \+ 0xfc\b", r"mod \+ 0x2c8\b", r"mod \+ 0x231\b", r"mod \+ 0x232\b", r"mod \+ 0x270 \+")),
-        (Path("gpu") / "vk" / "vk_draw.cpp", ("GAME_UPSCALE_TAAU_KEYS", "GAME_GAMEPLAY_NETWORK_KEYS"),
-         (r'"fd029a317a9a4b94"', r"0xfd029a317a9a4b94ull")),
-        (Path("gpu") / "vk" / "vk_shader.cpp", ("GAME_NETWORK_KEEP_KEYS",),
-         (r'"fd029a317a9a4b94,9dc98871eb7fc101"',)),
-    ]
-    for rel, wanted, forbidden in cases:
-        text = (ROOT / rel).read_text(encoding="utf-8")
-        if not check(len(text) > 1000, "%s is missing or too short to be the real file" % rel):
-            continue
-        for macro in wanted:
-            check(macro in text, "%s does not read %s from the game profile" % (rel, macro))
-        for pattern in forbidden:
-            hits = [line.strip() for line in text.splitlines()
-                    if re.search(pattern, line) and not line.lstrip().startswith(("//", "*", "/*", "#"))]
-            check(not hits, "%s still has the game's value as a literal: %s" % (rel, hits[:2]))
+def check_headers(cc):
+    proc = subprocess.run([sys.executable, "-I", str(ROOT / "nx2" / "game_profile.py"), "--check-header"],
+                          capture_output=True, text=True)
+    check(proc.returncode == 0, "game/game_profile.h is not what nx2/game_profile.py emits: " + proc.stdout.strip())
+    guard = read("host/game_profile_check.h", "#error")
+    with tempfile.TemporaryDirectory(prefix="game-profile-") as tmp:
+        for key, p in game_profile.GAMES.items():
+            folder = os.path.join(tmp, key)
+            game_profile.write_header(folder, p)
+            text = Path(folder, "game_profile.h").read_text(encoding="utf-8")
+            check(("#define GAME_PROFILE_KEY \"%s\"" % key) in text, "%s's header does not name its profile" % key)
+            src = Path(tmp, key + ".c")
+            src.write_text('#include "game_profile.h"\n' + guard + "\n"
+                           "static const unsigned long long ev[] = GAME_LR_PRESENT_EVENTS;\n"
+                           "static const unsigned long long gk[] = GAME_GAMEPLAY_NETWORK_KEYS;\n"
+                           "static const unsigned cw[] = GAME_GFX_CONTROLLER_WORDS, rw[] = GAME_GFX_CONTROLLER_RATE_WORDS;\n"
+                           "int main(void) { return (int)(sizeof ev + sizeof gk + sizeof cw + sizeof rw) * 0 + "
+                           "GAME_NPAD_PLAYERS * 0 + GAME_ACCOUNT_USERS * 0; }\n", encoding="utf-8")
+            r = subprocess.run([cc, "-std=c11", "-Wall", "-Werror", "-fsyntax-only", "-I" + folder, str(src)],
+                               capture_output=True, text=True)
+            check(r.returncode == 0, "%s's header does not compile with the runtime's guard: %s" % (key, r.stderr[-400:]))
+            check(('#define GAME_SAVES_DIR "%s"' % ("hookshot" if key == "oot" else "hookshot-" + key)) in text,
+                  "%s's saves would not be in a folder of their own" % key)
+            if key == "none":
+                check("#define GAME_HAVE_LR_GFX_CLOCK 0" in text and "#define GAME_HAVE_BUILD_ID 0" in text and
+                      "#define GAME_NPAD_PLAYERS 1" in text and "#define GAME_ACCOUNT_USERS 1" in text,
+                      "the empty profile's header hooks a graphics module, names a build or changes the defaults")
+        # the guard has to be able to fail: a profile with the module's address and none of its offsets
+        bad = game_profile.Profile("bad", "half", build_id="0" * 40, main_base=0x80020000,
+                                   hooks=game_profile.Hooks(gfx_clock=0x80000004, present_poll=None, present_events=()))
+        folder = os.path.join(tmp, "bad")
+        game_profile.write_header(folder, bad)
+        src = Path(tmp, "bad.c")
+        src.write_text('#include "game_profile.h"\n' + guard + "\nint main(void) { return 0; }\n", encoding="utf-8")
+        r = subprocess.run([cc, "-std=c11", "-fsyntax-only", "-I" + folder, str(src)], capture_output=True, text=True)
+        check(r.returncode != 0, "the runtime's guard compiles a profile that has the module's address but no offsets")
+
+
+def check_game_folder_travels():
+    """game/ goes wherever the runtime's sources go: into the AppImage's tools, the Windows release package and the
+    source stamp (nx2/version.py). Each of the three once left it out in a fork, so a player's build could not find
+    game_profile.h, or a profile change did not change the build's source id (Lakitu 029287fa)."""
+    appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
+    check(re.search(r"^cp -a [^\n]*\bnx2\b[^\n]*\bgame\b[^\n]*\"\$T/\"$", appimage, re.M),
+          "scripts/linux/appimage.sh does not copy game/ into the AppImage's tools")
+    parts = (ROOT / "scripts" / "release_parts.py").read_text(encoding="utf-8")
+    check(re.search(r'tracked\("game", "gpu", "host", "nx2"', parts),
+          "scripts/release_parts.py does not package game/ with the Windows tools")
+    import version
+    check("game" in version.SOURCES, "nx2/version.py's source stamp does not read game/")
 
 
 def main():
-    checked = sum(check_patch_modules(p) for p in game_profile.GAMES.values())
-    check(checked > 0, "no profile's patch modules were checked, so check 1 proved nothing")
-    check_no_main_base_patches_nothing()
-    check_lift_names_no_game()
-    check_header_matches()
-    check_profiles_are_honest()
-    check_c_reads_the_profile()
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--cc", default="gcc")
+    a = p.parse_args()
+    check_choice()
+    check_wholeness()
+    check_patches()
+    check_no_literals()
+    check_headers(a.cc)
+    check_game_folder_travels()
+    for f in FAILURES:
+        print("FAIL: " + f)
     if FAILURES:
-        for f in FAILURES:
-            print("FAIL: %s" % f)
-        raise SystemExit(1)
-    print("game profile: %d patch module(s) checked, the seam holds" % checked)
+        sys.exit(1)
+    print("PASS: game profiles: chosen by build id, whole or empty, no game named outside them, header in step")
 
 
 if __name__ == "__main__":

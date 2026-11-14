@@ -4,6 +4,8 @@
 #
 #   hookshot-launch                      the out= folder in ~/.config/hookshot/builder.ini
 #   hookshot-launch /path/to/the/game    that folder
+#   hookshot-launch <folder> --game <key>  that game's own folder: <folder> for the default game, <folder>-<key> for
+#                                        another (nx2/game_folders.py; the launcher's games[] adds --game <key>)
 #   HOOKSHOT_LAUNCH_CONFIG=<file>        read that ini instead (a test)
 set -eu
 
@@ -31,12 +33,54 @@ ready() {
     [ -n "${1:-}" ] && [ -f "$1/image.bin" ] && { [ -x "$1/bin/hookshot" ] || [ -f "$1/hookshot" ]; }
 }
 
-folder=${1:-}
+# (the default game's key: the committed profile header's, the game whose folder never takes a suffix)
+default_game() {
+    for root in "${HOOKSHOT_TOOLS:-}" "$(dirname "$0")/../.."; do
+        [ -n "$root" ] && [ -f "$root/game/game_profile.h" ] || continue
+        sed -n 's/^#define GAME_PROFILE_KEY "\([a-z0-9]*\)"$/\1/p' "$root/game/game_profile.h" | head -n 1
+        return
+    done
+}
+
+folder= game=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --game)
+            game=${2:-}
+            shift
+            [ $# -gt 0 ] && shift
+            ;;
+        *)
+            [ -n "$folder" ] || folder=$1
+            shift
+            ;;
+    esac
+done
+case $game in
+    '') ;;
+    *[!a-z0-9]* | ?????????????????*)
+        echo "Hookshot: --game takes a game's key (a to z, 0 to 9, up to 16): $game" >&2
+        exit 2
+        ;;
+esac
 if [ -z "$folder" ]; then
     ini=$(ini_path)
     if [ -f "$ini" ]; then
         folder=$(out_of "$ini") || folder=
     fi
+fi
+
+# (another game than the default one: its own folder beside the default game's)
+if [ -n "$game" ] && [ -n "$folder" ]; then
+    default=$(default_game)
+    if [ -z "$default" ]; then
+        echo "Hookshot: the default game's key was not found (game/game_profile.h): --game cannot pick a folder" >&2
+        exit 2
+    fi
+fi
+if [ -n "$game" ] && [ -n "$folder" ] && [ "$game" != "$default" ]; then
+    while [ "${folder%/}" != "$folder" ]; do folder=${folder%/}; done
+    folder="$folder-$game"
 fi
 
 if ! ready "$folder"; then
@@ -60,7 +104,7 @@ for name in $names; do
 done
 
 cd "$folder"
-# (--play already chose Play. The game's own update question stays for a bin/hookshot the player started themselves)
+# (--play already chose Play: a game built when it asked about updates itself does not ask again)
 export HOOKSHOT_NO_UPDATE_CHECK=1
 if [ -x ./bin/hookshot ]; then
     exec ./bin/hookshot

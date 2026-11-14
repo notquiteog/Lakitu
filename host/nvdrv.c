@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -55,7 +58,7 @@ static uint8_t ctrl_early[64];     /* a fence on that event passed before the ga
 /* event waits that had not passed: signal the slot's event when the sync point reaches the value */
 static struct { int used; uint32_t slot, id, value; } pending[512];
 static int sync_trace = -1;   /* HOS_SYNC_TRACE=1: log fences and sync point waits */
-#define SYNC_LOG(...) do { if (sync_trace < 0) sync_trace = getenv("HOS_SYNC_TRACE") != NULL;                            if (sync_trace) hos_log(__VA_ARGS__); } while (0)
+#define SYNC_LOG(...) do { if (sync_trace < 0) sync_trace = env_on("HOS_SYNC_TRACE");                            if (sync_trace) hos_log(__VA_ARGS__); } while (0)
 static int next_syncpt = 24;   /* low ids belong to the system */
 
 /* ---- nvmap handles ---------------------------------------------------------------------------------------------- */
@@ -74,7 +77,7 @@ static int nmaps, capmaps;
 static uint64_t va_next = 0x400000000ULL, va_end = 1ULL << 40;   /* 40-bit GPU VA, as GM20B reports */
 
 static int map_trace = -1;   /* HOS_MAP_TRACE=1: log every GPU mapping change */
-#define MAP_LOG(...) do { if (map_trace < 0) map_trace = getenv("HOS_MAP_TRACE") != NULL;                           if (map_trace) hos_log(__VA_ARGS__); } while (0)
+#define MAP_LOG(...) do { if (map_trace < 0) map_trace = env_on("HOS_MAP_TRACE");                           if (map_trace) hos_log(__VA_ARGS__); } while (0)
 
 /* index of the last mapping starting at or below va, or -1 */
 static int map_floor(uint64_t va) {
@@ -465,7 +468,10 @@ static uint32_t ioctl_gpu(int fd, uint32_t group, uint32_t nr, uint64_t p, uint6
         return NV_OK;
     case 0x18: case 0x1A: {   /* ALLOC_GPFIFO_EX(2) {u32 entries, jobs, flags; NvFence out; reserved} */
         LOCK();
-        if (!fds[fd].syncpt) fds[fd].syncpt = next_syncpt++;
+        if (!fds[fd].syncpt) {   /* (hookshot: ids are used again after the last one; they index syncpt[] and syncpt_max[]) */
+            fds[fd].syncpt = next_syncpt++;
+            if (next_syncpt >= SYNCPTS) next_syncpt = 24;
+        }
         UNLOCK();
         G32(p + 12) = (uint32_t)fds[fd].syncpt;
         if ((int32_t)(syncpt_max[fds[fd].syncpt] - syncpt[fds[fd].syncpt]) < 0)
@@ -478,6 +484,7 @@ static uint32_t ioctl_gpu(int fd, uint32_t group, uint32_t nr, uint64_t p, uint6
         uint32_t n = G32(p + 8), flags = G32(p + 12);
         uint64_t entries = in2 && in2size >= (uint64_t)n * 8 ? in2 : p + 24;   /* Ioctl2: inline; else after it */
         (void)size;
+        if (!hos_guest_range(entries, (uint64_t)n * 8)) return NV_BAD_PARAMETER;   /* (hookshot) */
         int sp = fds[fd].syncpt;
         /* add_increment (bit 1): the kernel appends two sync point increments after the work (suyu's
            BuildIncrementCommandList): the fence is the value they reach */
@@ -598,6 +605,8 @@ static uint32_t ioctl(Ctx *c, int fd, uint32_t cmd, uint64_t buf, uint64_t x2, u
     uint32_t nr = cmd & 0xFF, group = (cmd >> 8) & 0xFF;
     uint64_t size = (cmd >> 16) & 0x3FFF;
     uint32_t r;
+    /* (hookshot) the argument buffers lie in guest memory (the handlers read fixed fields up to 0x100 past the start) */
+    if (!hos_guest_range(buf, size + 0x100) || (x2 && !hos_guest_range(x2, x2size))) return NV_BAD_PARAMETER;
     switch (fds[fd].type) {
     case DEV_NVMAP: r = ioctl_nvmap(nr, buf); break;
     case DEV_AS_GPU: r = ioctl_as_gpu(nr, buf, size); break;

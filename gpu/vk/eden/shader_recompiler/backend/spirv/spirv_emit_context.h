@@ -19,8 +19,6 @@
 
 namespace Shader::Backend::SPIRV {
 
-static std::bitset<8> clip_distance_written;
-
 using Sirit::Id;
 
 class VectorTypes {
@@ -336,6 +334,7 @@ public:
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
     Id f32_add_cas{};
+    bool native_f32_add{};   // (hookshot) the float adds are OpAtomicFAddEXT, not f32_add_cas (DefineStorageBuffers)
     Id f16x2_add_cas{};
     Id f16x2_min_cas{};
     Id f16x2_max_cas{};
@@ -364,11 +363,15 @@ public:
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
     Id write_global_cas_loop_func{};
+    Id write_global_u8_func{};    // (hookshot) (address, value): the byte written directly
+    Id write_global_u16_func{};   // (hookshot) (address, value): the half written directly
     Id atomic_global_add_f32_func{};   // (hookshot) (address, value) -> the old value
 
     bool need_input_position_indirect{};
     Id input_position{};
     std::array<InputGenericInfo, 32> input_generics{};
+    /// Screen-linear fragment inputs read through perspective interpolation, times FragCoord.w.
+    std::array<bool, 32> noperspective_as_smooth_inputs{};
 
     Id output_point_size{};
     Id output_position{};
@@ -399,6 +402,9 @@ public:
     Id mesh_attributes{};
     Id mesh_map{};
     Id mesh_primitive_count{};
+    /// (hookshot) a fallback mesh workgroup's slot (task workgroup * threads + its index), read from the task's map in the
+    /// entry block (EmitMeshPrologue); invalid without a task program, where the slot is the workgroup id
+    Id mesh_fallback_slot{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};
@@ -415,6 +421,7 @@ public:
     std::vector<MeshDefault> mesh_vertex_defaults;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
+    bool mesh_zero_outputs_marker{};   ///< (hookshot) OpStore(zero, zero): OpSetMeshOutputsEXT 0 0 where a branch has no target
     std::array<Id, 4> mesh_tasks_marker{};
 
     // (hookshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to
@@ -424,6 +431,7 @@ public:
     Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
     u32 mesh_fallback_payload_member_index{};
     u32 mesh_fallback_records_member_index{};
+    u32 mesh_fallback_indirect_input_member_index{};
     /// A pointer to the u32 at a PhysicalStorageBuffer device address
     Id MeshFallbackWord(Id address);
 

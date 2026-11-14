@@ -9,18 +9,11 @@ import argparse
 import subprocess
 import tempfile
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # (tests/srccut.py: python -I leaves this folder off the path)
+from srccut import block   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def block(text, marker):
-    start = text.index(marker)
-    end = text.index("{", start) + 1
-    depth = 1
-    while depth:
-        depth += (text[end] == "{") - (text[end] == "}")
-        end += 1
-    return text[start:end]
 
 
 def main():
@@ -39,11 +32,11 @@ def main():
 ''' + fn + r'''
 int main() {
     CHECK(!framegen_wanted(0, 1));   /* menu Off: no copy, no luma */
-    CHECK(!framegen_wanted(1, 1));   /* the blank step between Off and 2x */
+    CHECK(framegen_wanted(1, 1));    /* Auto: as many as fill the display (tests/test_framegen_auto.py) */
     CHECK(framegen_wanted(2, 1));
     CHECK(framegen_wanted(8, 1));
     CHECK(!framegen_wanted(2, 0));   /* RX_VK_FRAMEGEN=0 */
-    std::printf("PASS: interpolation runs only from 2x up\n");
+    std::printf("PASS: interpolation runs only when the menu asks for it (Auto, 2x up)\n");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="framegen-gate-") as tmp:

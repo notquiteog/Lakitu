@@ -88,6 +88,12 @@ struct RuntimeInfo {
     VaryingState previous_stage_stores;
     /// Fragment stage after a mesh program: generic inputs it writes per primitive.
     std::bitset<32> per_primitive_generics{};
+    /// Last pre-rasterization stage: generic outputs the fragment stage reads screen-linear.
+    /// They are written times Position.w and the fragment stage reads them perspective-correct
+    /// times FragCoord.w, so clipping a primitive close to the camera interpolates them right.
+    std::bitset<32> noperspective_outputs{};
+    /// Fragment stage: the previous stage writes noperspective_outputs (not a mesh program).
+    bool scaled_noperspective_inputs{};
     /// Fragment stage after a mesh program that draws points: generic inputs the hardware's point sprite
     /// replaces with the coordinate within the point (s, t, 0, 1), as NVN's do with the generics the mesh
     /// program leaves unwritten.
@@ -96,6 +102,8 @@ struct RuntimeInfo {
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// Work around drivers that mix up results across calls to the 128-bit global-load helper.
+    bool inline_global_128_loads{};
     /// (hookshot) a mesh stage with no task stage before it: its workgroups start at the draw's first, as a task stage's do
     bool mesh_without_task{};
     /// (hookshot) a GPU without VK_EXT_mesh_shader: task and mesh programs are compute shaders that write their stage
@@ -105,6 +113,8 @@ struct RuntimeInfo {
     bool mesh_fallback_vertex{};
     /// (hookshot) a mesh program with a task program before it: the task's count in its payload bounds the mesh workgroups
     bool mesh_fallback_task{};
+    /// (hookshot) that task program's threads: task workgroup w starts its meshlets at slots w * threads + i
+    u32 mesh_fallback_task_threads{};
     /// (hookshot) the fallback's record slots: mesh workgroups past this one write nothing
     u32 mesh_fallback_capacity{};
 

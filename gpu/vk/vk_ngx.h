@@ -1,20 +1,20 @@
 // (hookshot) The one NGX session the DLSS backends share.
 //
 // NGX initializes once per process and hands back one capability-parameter block for every feature
-// it knows, so three backends that each loaded and initialized it would be three bugs: a second
+// it knows, so backends that each loaded and initialized it would each be a bug: a second
 // NVSDK_NGX_VULKAN_Init over a live session, a second set of parameters, and a shutdown by whichever
-// one finished first. Super Resolution (gpu/vk/vk_dlss.h), Frame Generation (gpu/vk/vk_dlssg.h) and
-// Ray Reconstruction all come through here instead, and each one owns nothing but its own feature
-// handle.
+// one finished first. The session is gpu/vk/vk_dlss.cpp's (super resolution and frame generation, both
+// upstream's, are made there); DLSS 5 neural rendering through NGX (gpu/vk/vk_dlssnr_ngx.h) comes
+// through here and owns nothing but its own feature handle.
 //
 // Nothing of NVIDIA's is in this repository and nothing of NVIDIA's is needed to build it: this
-// whole file is inside the build-time gate `RX_VK_DLSS_SDK`, which names the builder's own copy of
+// whole file is inside the build-time gate `HOOKSHOT_NGX`, which names the builder's own copy of
 // an NGX SDK. A tree without it does not compile this file at all, and the backends' public headers
 // stay free of NGX types so that the renderer can call them either way. docs/upscaling.md has the
 // licensing decision in full.
 #pragma once
 
-#if defined(RX_VK_DLSS_SDK)
+#if defined(HOOKSHOT_NGX)
 
 #include <cstdint>
 
@@ -26,6 +26,25 @@
 #include <nvsdk_ngx_vk.h>
 
 namespace mkwvk::ngx {
+
+/// NGX's parameters through its C functions, never NVSDK_NGX_Parameter's virtual Set/Get. The object comes from NVIDIA's
+/// MSVC-built library, and its vtable is laid out by Microsoft's ABI, which llvm-mingw's Itanium-ABI calls do not follow:
+/// on a Windows build the overloads line up by luck, if at all (gpu/vk/vk_dlss.cpp says the same). One overload per type
+/// NGX takes, so a call site reads as it did and the value's type picks the function; any other type does not compile.
+inline void set(NVSDK_NGX_Parameter* p, const char* key, unsigned v) { NVSDK_NGX_Parameter_SetUI(p, key, v); }
+inline void set(NVSDK_NGX_Parameter* p, const char* key, int v) { NVSDK_NGX_Parameter_SetI(p, key, v); }
+inline void set(NVSDK_NGX_Parameter* p, const char* key, float v) { NVSDK_NGX_Parameter_SetF(p, key, v); }
+inline void set(NVSDK_NGX_Parameter* p, const char* key, double v) { NVSDK_NGX_Parameter_SetD(p, key, v); }
+inline void set(NVSDK_NGX_Parameter* p, const char* key, void* v) { NVSDK_NGX_Parameter_SetVoidPointer(p, key, v); }
+/// (a Vulkan resource is handed over by its address, as NGX's own helpers in nvsdk_ngx_helpers_vk.h do)
+inline void set(NVSDK_NGX_Parameter* p, const char* key, NVSDK_NGX_Resource_VK* v) {
+    NVSDK_NGX_Parameter_SetVoidPointer(p, key, v);
+}
+template <typename T> void set(NVSDK_NGX_Parameter*, const char*, T) = delete;
+inline NVSDK_NGX_Result get(NVSDK_NGX_Parameter* p, const char* key, int* v) { return NVSDK_NGX_Parameter_GetI(p, key, v); }
+inline NVSDK_NGX_Result get(NVSDK_NGX_Parameter* p, const char* key, unsigned* v) {
+    return NVSDK_NGX_Parameter_GetUI(p, key, v);
+}
 
 /// Loads the NGX core the driver ships and resolves what the backends call. False, with one line
 /// logged, where there is no NGX runtime here or it is missing an entry point. Asked more than once
@@ -81,4 +100,4 @@ void shutdown();
 
 } // namespace mkwvk::ngx
 
-#endif // RX_VK_DLSS_SDK
+#endif // HOOKSHOT_NGX

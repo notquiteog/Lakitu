@@ -12,8 +12,12 @@
    free registered buffer (host memory: the pool's guest memory is not used). The video service itself (nn::gsv) is
    not emulated: nn::codec::video::Initialize does nothing. */
 #include "hos.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifdef _WIN32
@@ -21,6 +25,9 @@
 #endif
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 #define RESULT_NO_OUTPUT 0x2a1ca   /* (a failure: "no picture yet"; the library polls again) */
 #define POOL_MAGIC 0x4c4f4f50u     /* 'POOL' */
@@ -31,7 +38,7 @@
 
 static int video_log(void) {   /* HOS_VIDEO_LOG=1: submissions and acquisitions */
     static int on = -1;
-    if (on < 0) on = getenv("HOS_VIDEO_LOG") != NULL;
+    if (on < 0) on = env_on("HOS_VIDEO_LOG");
     return on;
 }
 
@@ -49,6 +56,14 @@ typedef struct {
 } Pool;
 /* the preference MakeDecodeImagePreference returns (the caller's buffer is larger: only these fields are ours) */
 typedef struct { uint32_t magic; uint16_t w, h; uint32_t format, tiling; } Pref;
+/* (dkb) the preference of SDK 20's MakeDecodeImagePreference(w, h, OutputFormat, CodecMode), as Donkey Kong Bananza
+   3.2.0 asks for it. The SDK's own (sdk 0x82b0aa50 on that build) fills 64 bytes at x8: a word from its format table,
+   u16 width - 1 and height - 1 at +8 and +10, zeros to +0x40; so the callers' buffers hold 64 (Bananza's two are 72 and
+   64 bytes on the stack, main 0x80e3be7c and 0x80e3bef8). This writes 20 of them, with width - 1 and height - 1 where
+   the SDK keeps them in case the game reads them, and ours around them. */
+#define PREF20_MAGIC 0x32465250u   /* 'PRF2' */
+typedef struct { uint32_t magic; uint16_t w, h; uint16_t w_minus_1, h_minus_1; uint32_t format, mode; } Pref20;
+_Static_assert(sizeof(Pref20) <= 64, "SDK 20's preference is 64 bytes: the callers' buffers hold no more");
 
 /* (rgba NULL: a picture decoded as NV12 is kept as that alone; its pool makes the RGBA if a reader wants it) */
 typedef struct { uint8_t *rgba, *nv12; int w, h; int64_t pts; int last; } Picture;
@@ -61,7 +76,7 @@ static DWORD WINAPI av1_notice(LPVOID unused) {
     (void)unused;
     if (MessageBoxA(NULL, "The game's movies need Microsoft's free \"AV1 Video Extension\", which this PC doesn't have, so they "
                           "show black (the sound plays).\n\nOpen its page in the Microsoft Store now? Install it, then start the game again.",
-                    HOS_GAME_TITLE, MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES)
+                    "Hookshot", MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES)
         ShellExecuteA(NULL, "open", "ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V", NULL, NULL, SW_SHOWNORMAL);
     return 0;
 }
@@ -72,10 +87,34 @@ void *mf_av1_open(int w, int h);
 void mf_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
 void mf_av1_flush(void *m);
 void mf_av1_close(void *m);
+/* (hookshot) an AV1 decoder of our own, when FFmpeg has none: dav1d (host/dav1d_av1.c, when the build has it, issue 2316), else
+   Media Foundation. The same calls for both */
+typedef struct {
+    const char *name;
+    void *(*open)(int w, int h);
+    void (*decode)(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
+    void (*flush)(void *m);
+    void (*close)(void *m);
+} Av1Decoder;
+#ifdef HOOKSHOT_DAV1D
+void *dav1d_av1_open(int w, int h);
+void dav1d_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
+void dav1d_av1_flush(void *m);
+void dav1d_av1_close(void *m);
+#endif
+static const Av1Decoder av1_decoders[] = {
+#ifdef HOOKSHOT_DAV1D
+    {"dav1d", dav1d_av1_open, dav1d_av1_decode, dav1d_av1_flush, dav1d_av1_close},
+#endif
+    {"Media Foundation", mf_av1_open, mf_av1_decode, mf_av1_flush, mf_av1_close},
+};
 
 typedef struct {
     AVCodecContext *ctx;
-    void *mf;                        /* (hookshot) an AV1 decoder on Media Foundation instead of ctx */
+    void *mf;                        /* (hookshot) an AV1 decoder of our own instead of ctx (av1: which one) */
+    const Av1Decoder *av1;
+    int64_t decode_ns, decode_worst_ns, decoded, skipped;   /* (hookshot) the movie's decoding, logged when it stops */
+    int64_t first_pts, end_pts;
     AVPacket *pkt;
     AVFrame *frame;
     struct SwsContext *sws;
@@ -87,6 +126,7 @@ typedef struct {
     Picture queue[MAX_QUEUE];
     int qhead, qn;
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
+    int stopped;                     /* (hookshot) Stop or Flush since the last submission: no picture is coming (dec_acquire) */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
@@ -96,13 +136,40 @@ typedef struct {
     SRWLOCK lock;
 } Dec;
 
+/* (hookshot) the host objects of the game's pool and decoder objects, by the guest object's address: kept here, not in
+   the guest object (guest memory). Few at a time (a movie's decoder and its pools). */
+typedef struct { uint64_t obj; uint32_t magic; void *p; } HostObj;
+static HostObj *host_objs;
+static size_t nhost_objs, cap_host_objs;
+static SRWLOCK host_objs_lock = SRWLOCK_INIT;
 static void *host_of(uint64_t obj, uint32_t magic) {
-    if (!obj || G32(obj + 8) != magic) return NULL;
-    return (void *)(uintptr_t)G64(obj);
+    void *p = NULL;
+    if (!obj) return NULL;
+    AcquireSRWLockShared(&host_objs_lock);
+    for (size_t i = 0; i < nhost_objs; i++)
+        if (host_objs[i].obj == obj && host_objs[i].magic == magic) p = host_objs[i].p;
+    ReleaseSRWLockShared(&host_objs_lock);
+    return p;
 }
 static void set_host(uint64_t obj, uint32_t magic, void *p) {
-    G64(obj) = (uint64_t)(uintptr_t)p;
-    G32(obj + 8) = p ? magic : 0;
+    if (!obj) return;
+    AcquireSRWLockExclusive(&host_objs_lock);
+    size_t i = 0;
+    while (i < nhost_objs && host_objs[i].obj != obj) i++;
+    if (!p) {
+        if (i < nhost_objs) host_objs[i] = host_objs[--nhost_objs];
+    } else {
+        if (i == nhost_objs) {
+            if (nhost_objs == cap_host_objs) {
+                cap_host_objs = cap_host_objs ? cap_host_objs * 2 : 16;
+                host_objs = (HostObj *)realloc(host_objs, cap_host_objs * sizeof *host_objs);
+                if (!host_objs) hos_fatal(NULL, "video: out of memory");
+            }
+            nhost_objs++;
+        }
+        host_objs[i] = (HostObj){obj, magic, p};
+    }
+    ReleaseSRWLockExclusive(&host_objs_lock);
 }
 
 /* ---- the service ---- */
@@ -124,17 +191,20 @@ HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0
 /* CalculateDecoderImagePoolBuffer(u64* size, u64* alignment, Preference const&, u32 count) */
 HLE(_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImagePreferenceEj) {
     const Pref *p = (const Pref *)GP(ARG(2));
-    const uint64_t one = p->magic == PREF_MAGIC ? (uint64_t)p->w * p->h * 4 : 0x400000;
+    const Pref20 *p20 = (const Pref20 *)GP(ARG(2));   /* (dkb: SDK 20's preference) */
+    const uint64_t one = p->magic == PREF_MAGIC ? (uint64_t)p->w * p->h * 4 :
+                         p20->magic == PREF20_MAGIC ? (uint64_t)p20->w * p20->h * 4 : 0x400000;
     if (ARG(0)) G64(ARG(0)) = ((one * (uint32_t)ARG(3)) + 0xFFF) & ~0xFFFull;
     if (ARG(1)) G64(ARG(1)) = 0x1000;
     RET(0);
 }
-/* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count) */
-HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) {
-    const Pref *p = (const Pref *)GP(ARG(3));
+/* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count): pool_init, for a preference of
+   either layout (0 x 0: the default 1280 x 720, format 2) */
+static void pool_init(Ctx *c, int pw, int ph, int format) {
     Pool *o = (Pool *)calloc(1, sizeof *o);
-    o->w = p->magic == PREF_MAGIC && p->w ? p->w : 1280, o->h = p->magic == PREF_MAGIC && p->h ? p->h : 720;
-    o->format = p->magic == PREF_MAGIC ? (int)p->format : 2;
+    if (!o) hos_fatal(NULL, "video: out of memory for an image pool");
+    o->w = pw ? pw : 1280, o->h = ph ? ph : 720;
+    o->format = format;
     o->count = (int)ARG(4) > 0 ? (int)ARG(4) : 1;
     o->rgba = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 4);
     /* (hookshot, issue 342: an allocation that failed went on as a NULL picture, and the movie thread read address 0) */
@@ -159,6 +229,37 @@ HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPv
     set_host(ARG(0), POOL_MAGIC, o);
     RET(0);
 }
+HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) {
+    const Pref *p = (const Pref *)GP(ARG(3));
+    const int ok = p->magic == PREF_MAGIC;
+    pool_init(c, ok ? p->w : 0, ok ? p->h : 0, ok ? (int)p->format : 2);
+}
+/* (dkb) SDK 20's forms, as Donkey Kong Bananza 3.2.0 calls them for its guide movies (Movie/Guide*.webm, VP9): the
+   preference takes a CodecMode, and InitializeDecoderImagePool(pool, memory, size, preference, u32 count, CodecMode).
+   The SDK's pool is 24 bytes (its initialiser zeroes and fills +0..+0x18, sdk 0x82b0ac20); nothing past that is the
+   pool's. The game's movie player keeps the size it asked for right after it, at +0x20 / +0x22, and format and mode
+   at +0x24 / +0x28, and writes them itself once the call succeeds (main 0x80e3bf40), so they are left alone here. */
+HLE(_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) {
+    const uint64_t out = c->x[8];
+    const uint16_t w = (uint16_t)ARG(0), h = (uint16_t)ARG(1);
+    Pref20 p = {PREF20_MAGIC, w, h, (uint16_t)(w - 1), (uint16_t)(h - 1), (uint32_t)ARG(2), (uint32_t)ARG(3)};
+    if (out) memcpy(GP(out), &p, sizeof p);
+    RET(out);
+}
+/* (hookshot) the same preference's "ForCompat" twin, which Mario Kart World 1.0.0 (SDK 21.4) calls; mkw-recomp answers
+   both names with one function (adriadam10/mkw-recomp@5ff4fbb, runtime/sdk/ov/ov_codec.c, MIT, Copyright (c) 2026 Adria) */
+HLE(_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE) {
+    imp__ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE(c);
+}
+HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEjNS0_9CodecModeE) {
+    const Pref20 *p = (const Pref20 *)GP(ARG(3));
+    const int ok = p->magic == PREF20_MAGIC;
+    const uint16_t w = ok && p->w ? p->w : 1280, h = ok && p->h ? p->h : 720;
+    pool_init(c, w, h, ok ? (int)p->format : 2);
+}
+/* (dkb) GetDecoderImagePoolNativeImageHandle(pool, u32 index) -> NativeImageHandle: no GPU image (the movie player's
+   other path; it reads the NV12 through ReadDecoderOutputImageNv12 when there is none) */
+HLE(_ZN2nn5codec36GetDecoderImagePoolNativeImageHandleEPKNS0_25VideoDecoderImagePoolTypeEj) { RET(0); }
 HLE(_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeE) {
     Pool *o = (Pool *)host_of(ARG(0), POOL_MAGIC);
     if (o && o->sws) sws_freeContext(o->sws);
@@ -199,8 +300,10 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoolTypeEj
     if (i == 0 && o->rgba_stale) pool_rgba(o);
     const uint8_t *src = o->rgba + (size_t)i * o->w * o->h * 4;
     const uint32_t cw = x + w <= (uint32_t)o->w ? w : o->w - x;
-    for (uint32_t r = 0; r < h && y + r < (uint32_t)o->h; r++)
-        memcpy(GP(dst + r * stride), src + ((size_t)(y + r) * o->w + x) * 4, (size_t)cw * 4);
+    for (uint32_t r = 0; r < h && y + r < (uint32_t)o->h; r++) {
+        void *row = hos_guest_range(dst + r * stride, (size_t)cw * 4);   /* (hookshot: only into guest memory) */
+        if (row) memcpy(row, src + ((size_t)(y + r) * o->w + x) * 4, (size_t)cw * 4);
+    }
     HOS_WRITTEN(GP(dst), (size_t)(h ? h - 1 : 0) * stride + (size_t)cw * 4);   /* (the game may give it to the GPU) */
     RET(0);
 }
@@ -224,14 +327,19 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
                     (unsigned long long)c->x[30]);
         }
     }
-    if (!o || i >= (uint32_t)o->count || x >= (uint32_t)o->w) { RET(0); return; }
+    /* (hookshot) and no NV12 when its allocation failed: o->nv12 + offset was then any host address, copied to the game */
+    if (!o || !o->nv12 || i >= (uint32_t)o->count || x >= (uint32_t)o->w) { RET(0); return; }
     o->read_by_api = 1;
     const uint8_t *yp = o->nv12 + (size_t)i * o->w * o->h * 3 / 2, *uvp = yp + (size_t)o->w * o->h;
     const uint32_t cw = x + w <= (uint32_t)o->w ? w : o->w - x;
-    for (uint32_t r = 0; ydst && r < h && y + r < (uint32_t)o->h; r++)
-        memcpy(GP(ydst + r * ystride), yp + (size_t)(y + r) * o->w + x, cw);
-    for (uint32_t r = 0; uvdst && r < h / 2 && y / 2 + r < (uint32_t)o->h / 2; r++)
-        memcpy(GP(uvdst + r * uvstride), uvp + (size_t)(y / 2 + r) * o->w + (x & ~1u), cw);
+    for (uint32_t r = 0; ydst && r < h && y + r < (uint32_t)o->h; r++) {
+        void *row = hos_guest_range(ydst + r * ystride, cw);   /* (hookshot: only into guest memory) */
+        if (row) memcpy(row, yp + (size_t)(y + r) * o->w + x, cw);
+    }
+    for (uint32_t r = 0; uvdst && r < h / 2 && y / 2 + r < (uint32_t)o->h / 2; r++) {
+        void *row = hos_guest_range(uvdst + r * uvstride, cw);
+        if (row) memcpy(row, uvp + (size_t)(y / 2 + r) * o->w + (x & ~1u), cw);
+    }
     if (ydst) HOS_WRITTEN(GP(ydst), (size_t)(h ? h - 1 : 0) * ystride + cw);
     if (uvdst) HOS_WRITTEN(GP(uvdst), (size_t)(h / 2 ? h / 2 - 1 : 0) * uvstride + cw);
     RET(0);
@@ -252,16 +360,17 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     InitializeSRWLock(&d->lock);
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
-        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 4 : 2;   /* (1080p AV1 in software) */
+        d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 8 : 4;   /* (1080p AV1 in software) */
         if (avcodec_open2(d->ctx, codec, NULL) < 0) avcodec_free_context(&d->ctx);
     }
-    if (!d->ctx && id == AV_CODEC_ID_AV1) d->mf = mf_av1_open(w, h);
+    for (size_t i = 0; !d->ctx && !d->mf && id == AV_CODEC_ID_AV1 && i < sizeof av1_decoders / sizeof av1_decoders[0]; i++)
+        if ((d->mf = av1_decoders[i].open(w, h))) d->av1 = &av1_decoders[i];
 #ifdef _WIN32
     if (!d->ctx && !d->mf && id == AV_CODEC_ID_AV1) {   /* (issue 380: no AV1 decoder in Windows: the movies were black, with sound) */
         static volatile LONG told;
         if (!InterlockedExchange(&told, 1)) {
             hos_log("video: no AV1 decoder: install Microsoft's free AV1 Video Extension for the movies");
-            if (!getenv("HOS_HEADLESS") && !getenv("HOOKSHOT_NO_AV1_NOTICE"))
+            if (!env_on("HOS_HEADLESS") && !env_on("HOOKSHOT_NO_AV1_NOTICE"))
                 CreateThread(NULL, 0, av1_notice, NULL, 0, NULL);
         }
     }
@@ -271,8 +380,8 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     set_host(ARG(0), DEC_MAGIC, d);
     static int logged;
     if (logged++ < 4)
-        hos_log("video: %s decoder %s (%dx%d)", what, d->ctx ? "ready" : d->mf ? "ready on Media Foundation" :
-                "not available in this FFmpeg", w, h);
+        hos_log("video: %s decoder %s%s (%dx%d)", what, d->ctx || d->mf ? "ready on " : "not available in this FFmpeg",
+                d->ctx ? d->ctx->codec->name : d->mf ? d->av1->name : "", w, h);
     RET(0);
 }
 static void picture_free(Picture *p) {
@@ -288,54 +397,79 @@ static void pending_free(Dec *d) {
     }
     d->ptail = NULL;
 }
+static void movie_report(Dec *d);
 static void dec_finalize(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (!d) return;
+    movie_report(d);
     pending_free(d);
     for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
     if (d->sws) sws_freeContext(d->sws);
     avcodec_free_context(&d->ctx);
-    mf_av1_close(d->mf);
+    if (d->mf) d->av1->close(d->mf);
     av_packet_free(&d->pkt);
     av_frame_free(&d->frame);
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
 }
-/* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind) */
+/* a decoded frame into the queue as NV12, deferring RGBA to pool_rgba() unless eager conversion is forced */
 static void queue_frame(Dec *d, const AVFrame *f) {
     const int w = f->width, h = f->height;
     if (w <= 0 || h <= 0) return;
-    if (f->format != AV_PIX_FMT_NV12 && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
+    const int nv12_src = f->format == AV_PIX_FMT_NV12;
+    const int yuv420 = f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P;
+    const char *rgba_env = getenv("HOS_VIDEO_RGBA");
+    const int force_rgba = rgba_env && atoi(rgba_env) != 0;
+    const int lazy_rgba = !force_rgba && (nv12_src || yuv420);
+    if (!lazy_rgba && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
         d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         d->sws_w = w, d->sws_h = h, d->sws_fmt = f->format;
     }
     Picture p = {0};
     p.w = w, p.h = h, p.pts = f->pts;
-    const int nv12 = f->format == AV_PIX_FMT_NV12;   /* (hookshot: Media Foundation's pictures, kept as NV12 alone) */
-    p.rgba = nv12 ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
-    p.nv12 = nv12 ? (uint8_t *)malloc((size_t)w * h * 3 / 2) : (uint8_t *)calloc(1, (size_t)w * h * 3 / 2);
-    if (!p.nv12 || (!nv12 && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
+    const size_t nv12_size = (size_t)w * h * 3 / 2;
+    p.rgba = lazy_rgba ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
+    p.nv12 = (uint8_t *)malloc(nv12_size);
+    if (!p.nv12 || (!lazy_rgba && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
         static volatile LONG told;
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);
         free(p.rgba), free(p.nv12);
         return;
     }
+    if ((w | h) & 1) memset(p.nv12, 0, nv12_size);
     uint8_t *dst[4] = {p.rgba, NULL, NULL, NULL};
     int dst_stride[4] = {w * 4, 0, 0, 0};
     if (d->sws && p.rgba) sws_scale(d->sws, (const uint8_t *const *)f->data, f->linesize, 0, h, dst, dst_stride);
-    if (nv12) {
+    if (nv12_src) {   /* (hookshot: Media Foundation's pictures) */
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         for (int y = 0; y < h / 2; y++)
             memcpy(p.nv12 + (size_t)w * h + (size_t)y * w, f->data[1] + (size_t)y * f->linesize[1], (size_t)w);
-    } else if (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P) {   /* (planar 4:2:0 -> NV12) */
+    } else if (yuv420) {   /* (planar 4:2:0 -> NV12) */
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         uint8_t *uv = p.nv12 + (size_t)w * h;
-        for (int y = 0; y < h / 2; y++)
-            for (int x = 0; x < w / 2; x++) {
-                uv[(size_t)y * w + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
-                uv[(size_t)y * w + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
+        const uint8_t *u_src = f->data[1], *v_src = f->data[2];
+        const int u_stride = f->linesize[1], v_stride = f->linesize[2];
+        for (int y = 0; y < h / 2; y++) {
+            const uint8_t *u_row = u_src + (size_t)y * u_stride;
+            const uint8_t *v_row = v_src + (size_t)y * v_stride;
+            uint8_t *uv_row = uv + (size_t)y * w;
+            int x = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+            for (; x + 16 <= w / 2; x += 16) {
+                __m128i u16 = _mm_loadu_si128((const __m128i *)(u_row + x));
+                __m128i v16 = _mm_loadu_si128((const __m128i *)(v_row + x));
+                _mm_storeu_si128((__m128i *)(uv_row + 2 * x), _mm_unpacklo_epi8(u16, v16));
+                _mm_storeu_si128((__m128i *)(uv_row + 2 * x + 16), _mm_unpackhi_epi8(u16, v16));
             }
+#endif
+            for (; x < w / 2; x++) {
+                uv_row[2 * x] = u_row[x];
+                uv_row[2 * x + 1] = v_row[x];
+            }
+        }
+    } else {
+        memset(p.nv12, 0, nv12_size);
     }
     if (d->qn == MAX_QUEUE) {
         picture_free(&d->queue[d->qhead]);
@@ -372,13 +506,18 @@ static void decode_next(Dec *d) {
         Pending *n = d->phead;
         d->phead = n->next;
         if (!d->phead) d->ptail = NULL;
+        const int64_t t0 = hos_now_ns();
+        if (n->pkt) {
+            if (!d->decoded++) d->first_pts = n->pkt->pts;
+            d->end_pts = n->pkt->pts;
+        }
         if (d->mf) {   /* (hookshot) */
             if (n->pkt) {
                 d->eos = 0;
-                mf_av1_decode(d->mf, n->pkt->data, (size_t)n->pkt->size, n->pkt->pts, mf_picture, d);
+                d->av1->decode(d->mf, n->pkt->data, (size_t)n->pkt->size, n->pkt->pts, mf_picture, d);
                 av_packet_free(&n->pkt);
             } else {
-                mf_av1_decode(d->mf, NULL, 0, 0, mf_picture, d);
+                d->av1->decode(d->mf, NULL, 0, 0, mf_picture, d);
                 d->eos = 1;
                 d->log_submits = 8;   /* (data after the end: a restart, worth seeing) */
                 if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
@@ -399,8 +538,25 @@ static void decode_next(Dec *d) {
             if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
             avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
         }
+        const int64_t ns = hos_now_ns() - t0;
+        d->decode_ns += ns;
+        if (ns > d->decode_worst_ns) d->decode_worst_ns = ns;
         free(n);
     }
+}
+/* (hookshot, issue 2316) one line when a movie stops: its decoder, the time it took for each submission against the time
+   between the movie's pictures, and the pictures the catch-up skipped. A decoder slower than the movie leaves the picture
+   behind the sound, whatever the catch-up does: the line says which it was in a report's hookshot_log.txt */
+static void movie_report(Dec *d) {
+    if (d->decoded > 1) {
+        const double each = (double)d->decode_ns / d->decoded / 1e6,
+                     every = (double)(d->end_pts - d->first_pts) / (d->decoded - 1) / 1e6;   /* (pts in ns) */
+        hos_log("video: a movie of %lld pictures on %s: %.1f ms to decode each (worst %.1f), one shown every %.1f ms%s; "
+                "%lld skipped to keep up with its sound", (long long)d->decoded,
+                d->ctx ? d->ctx->codec->name : d->mf ? d->av1->name : "no decoder", each, (double)d->decode_worst_ns / 1e6,
+                every, each > every ? " (slower than it plays)" : "", (long long)d->skipped);
+    }
+    d->decode_ns = d->decode_worst_ns = d->decoded = d->skipped = 0;
 }
 static void pending_push(Dec *d, AVPacket *pkt) {
     Pending *n = (Pending *)calloc(1, sizeof *n);
@@ -482,10 +638,15 @@ static void dec_submit(Ctx *c) {
     if (ARG(0)) G64(ARG(0)) = id;
     if (!d || (!d->ctx && !d->mf)) { RET(0); return; }
     AcquireSRWLockExclusive(&d->lock);
-    if (ARG(2) && ARG(3)) {
+    /* (hookshot) the size is 64-bit: one past what an AVPacket holds was cut to a small packet and copied in whole; and
+       the data must lie in guest memory */
+    const void *data = ARG(2) && ARG(3) && ARG(3) <= INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE ? hos_guest_range(ARG(2), ARG(3)) : NULL;
+    if (ARG(2) && ARG(3) && !data) hos_log("video: submit of %#llx bytes at %#llx left out", (unsigned long long)ARG(3),
+                                          (unsigned long long)ARG(2));
+    if (data) {
         AVPacket *pkt = av_packet_alloc();
         if (pkt && av_new_packet(pkt, (int)ARG(3)) == 0) {
-            memcpy(pkt->data, GP(ARG(2)), (size_t)ARG(3));
+            memcpy(pkt->data, data, (size_t)ARG(3));
             pkt->pts = (int64_t)ARG(4);
             pending_push(d, pkt);
         } else {
@@ -493,6 +654,7 @@ static void dec_submit(Ctx *c) {
         }
     }
     d->submits++;
+    d->stopped = 0;   /* (hookshot: pictures are coming again: dec_acquire waits for one as before) */
     if (ARG(5) & 1) pending_push(d, NULL);
     const int logged_one = d->log_submits > 0;
     if (logged_one) d->log_submits--;
@@ -511,13 +673,15 @@ static void dec_flush(Ctx *c, const char *what) {
                     (long long)d->acquires, d->qn, d->eos ? "at the end" : d->phead ? "submissions left" : "none left",
                     (unsigned long long)c->x[30]);
         d->log_submits = 8;
+        movie_report(d);
         if (d->ctx) avcodec_flush_buffers(d->ctx);
-        else mf_av1_flush(d->mf);
+        else d->av1->flush(d->mf);
         pending_free(d);
         for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
         d->qhead = d->qn = 0;
         d->eos = 0;
         d->clock_set = 0;
+        d->stopped = 1;   /* (hookshot: until the next submission, dec_acquire has nothing to wait for) */
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
         ReleaseSRWLockExclusive(&d->lock);
     }
@@ -541,9 +705,21 @@ static void dec_acquire(Ctx *c) {
     if (!d) { RET(RESULT_NO_OUTPUT); return; }
     /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
        by another thread's submission; then a free buffer as it was, so the caller is never refused) */
+    /* (hookshot, #1929) and no virtual core held through it: the decoding blocks (dav1d waits for its own frame
+       threads), and with the core held the movie thread kept it 100-270 ms on Linux while a thread waiting for that core
+       ran without one. It is taken again only once d->lock is let go, as in hos_cv_sleep: waiting for a core while
+       holding the lock could stall a thread that holds a core and waits for the lock (dec_submit) */
+    const int away = hos_vcore_away();
     AcquireSRWLockExclusive(&d->lock);
     decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+    /* (hookshot) The wait is for a picture another thread's submission is about to bring, ~100 ms of it. It was 50 tries of a
+       2 ms sleep, and such a sleep takes 4-5 ms: 245-257 ms, on the thread a movie's end joins (title to game: the game's main
+       thread in hos_thread_join for a frame of ~250 ms, every start). Now by the clock, and none after a Stop or a Flush with
+       nothing submitted since: no picture is coming then. HOS_VIDEO_ACQUIRE_TRIES=1: 50 tries, as before */
+    static int by_tries = -1;
+    if (by_tries < 0) by_tries = env_on("HOS_VIDEO_ACQUIRE_TRIES");
+    const int64_t wait_until = hos_now_ns() + 100000000;
+    for (int tries = 0; !d->qn && !d->eos && (by_tries ? tries < 50 : !d->stopped && hos_now_ns() < wait_until); tries++) {
         ReleaseSRWLockExclusive(&d->lock);
         hos_sleep_ns(2000000);
         AcquireSRWLockExclusive(&d->lock);
@@ -554,6 +730,7 @@ static void dec_acquire(Ctx *c) {
         if (d->slots[i] && !d->busy[i] && host_of(d->slots[i], POOL_MAGIC)) slot = i;
     if (slot < 0) {
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         RET(RESULT_NO_OUTPUT);
         return;
     }
@@ -569,6 +746,7 @@ static void dec_acquire(Ctx *c) {
         else if (d->acquires == 1 && !d->eos)   /* (the start: the frame shows the buffer as it was, black since the pool's fill) */
             hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);
         return;
@@ -577,7 +755,7 @@ static void dec_acquire(Ctx *c) {
            sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures behind the movie's clock are skipped:
            the next ones decoded, as the whole movie is submitted at once. HOS_VIDEO_NO_CATCHUP=1: as before */
         static int off = -1;
-        if (off < 0) off = getenv("HOS_VIDEO_NO_CATCHUP") != NULL;
+        if (off < 0) off = env_on("HOS_VIDEO_NO_CATCHUP");
         const int64_t now = hos_now_ns(), late = 25000000;   /* (a frame and a half at 60 fps) */
         Picture *h = &d->queue[d->qhead];
         if (!d->clock_set || h->pts < d->clock_pts) d->clock_set = 1, d->clock_ns = now, d->clock_pts = h->pts;   /* (a start, a loop) */
@@ -594,6 +772,7 @@ static void dec_acquire(Ctx *c) {
             d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
             skipped++;
         }
+        d->skipped += skipped;
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
     Picture *p = &d->queue[d->qhead];
@@ -617,10 +796,11 @@ static void dec_acquire(Ctx *c) {
         const size_t nv12_size = (size_t)o->w * o->h * 3 / 2, rgba_size = (size_t)o->w * o->h * 4;
         const int rgba = o->format != 0 && o->mem_size >= rgba_size;   /* (VideoDecoderOutputFormat 0: NV12) */
         const size_t need = rgba ? rgba_size : nv12_size;
-        if (o->mem_size >= need && ok && (rgba ? o->rgba != NULL : 1)) {
+        void *to = hos_guest_range(o->mem, need);   /* (hookshot: only into guest memory) */
+        if (o->mem_size >= need && ok && to && (rgba ? o->rgba != NULL : 1)) {
             if (rgba && o->rgba_stale) pool_rgba(o);
-            memcpy(GP(o->mem), rgba ? o->rgba : o->nv12, need);
-            HOS_WRITTEN(GP(o->mem), need);
+            memcpy(to, rgba ? o->rgba : o->nv12, need);
+            HOS_WRITTEN(to, need);
         }
     }
     d->slot_pts[slot] = d->last_pts = p->pts;
@@ -650,6 +830,7 @@ static void dec_acquire(Ctx *c) {
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
     ReleaseSRWLockExclusive(&d->lock);
+    if (away) hos_vcore_back();
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
     RET(0);
 }
@@ -659,19 +840,24 @@ static void dec_release(Ctx *c) {
     if (d && (uint32_t)ARG(1) < MAX_SLOTS) d->busy[(uint32_t)ARG(1)] = 0;
     RET(0);
 }
-/* GetXDecoderOutputBufferProperties(u16* w, u16* h, u16* display w, u16* display h, TimeSpan* pts, bool* last,
-   decoder, u32 index) */
-static void dec_properties(Ctx *c) {
-    Dec *d = (Dec *)host_of(ARG(6), DEC_MAGIC);
-    const uint32_t i = (uint32_t)ARG(7);
+/* GetXDecoderOutputBufferProperties(u16* w, u16* h, u16* display w, u16* display h[, ColorSpace*], TimeSpan* pts,
+   bool* last, decoder, u32 index). colour_space is the ColorSpace pointer's argument (the older SDK's form, Mario Kart
+   World 1.0.0), or -1 where the call has none; with it the index is the ninth argument, on the guest stack */
+static void dec_properties_cs(Ctx *c, int colour_space);
+static void dec_properties(Ctx *c) { dec_properties_cs(c, -1); }
+static void dec_properties_cs(Ctx *c, int colour_space) {
+    const int k = colour_space < 0 ? 0 : 1;
+    Dec *d = (Dec *)host_of(ARG(6 + k), DEC_MAGIC);
+    const uint32_t i = k ? G32(c->x[31]) : (uint32_t)ARG(7);
+    if (k && ARG(colour_space)) G32(ARG(colour_space)) = 0;   /* (the default colour space, as mkw-recomp answers) */
     const Pool *o = d && i < MAX_SLOTS ? (const Pool *)host_of(d->slots[i], POOL_MAGIC) : NULL;
     const uint16_t w = o ? (uint16_t)o->w : 0, h = o ? (uint16_t)o->h : 0;
     if (ARG(0)) *(uint16_t *)GP(ARG(0)) = w;
     if (ARG(1)) *(uint16_t *)GP(ARG(1)) = h;
     if (ARG(2)) *(uint16_t *)GP(ARG(2)) = w;
     if (ARG(3)) *(uint16_t *)GP(ARG(3)) = h;
-    if (ARG(4)) G64(ARG(4)) = d && i < MAX_SLOTS ? (uint64_t)d->slot_pts[i] : 0;
-    if (ARG(5)) *(uint8_t *)GP(ARG(5)) = d && i < MAX_SLOTS ? (uint8_t)d->slot_last[i] : 0;
+    if (ARG(4 + k)) G64(ARG(4 + k)) = d && i < MAX_SLOTS ? (uint64_t)d->slot_pts[i] : 0;
+    if (ARG(5 + k)) *(uint8_t *)GP(ARG(5 + k)) = d && i < MAX_SLOTS ? (uint8_t)d->slot_last[i] : 0;
     {   /* (HOS_VIDEO_LOG) the first times the game is told a picture is the last */
         static volatile LONG n;
         if (video_log() && d && i < MAX_SLOTS && d->slot_last[i] && InterlockedIncrement(&n) <= 8)
@@ -693,6 +879,28 @@ static uint64_t ready_event(void) {
 /* VP9 */
 HLE(_ZN2nn5codec36InitializeVp9DecoderByTransferMemoryEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
 HLE(_ZN2nn5codec34InitializeVp9DecoderByRemoteMemoryEPNS0_14Vp9DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP9, "VP9"); }
+/* (dkb) SDK 20's forms (Donkey Kong Bananza 3.2.0): InitializeVp9Decoder(decoder, void* work, size_t, size_t, u16 width,
+   u16 height, u32, InputFormat, OutputFormat) and the forms without work memory, (decoder, size_t, size_t, u16, u16, ...)
+   and (decoder, size_t, u16, u16, ...); the work buffer's size (size_t* size, size_t* alignment, size_t, u16, u16):
+   one page, the pictures being host memory; the submission-ready event through an out pointer, with a Result. */
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(4), (int)(uint16_t)ARG(5));
+}
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(3), (int)(uint16_t)ARG(4));
+}
+HLE(_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP9, "VP9", (int)(uint16_t)ARG(2), (int)(uint16_t)ARG(3));
+}
+HLE(_ZN2nn5codec29CalculateVp9DecoderWorkBufferEPmS1_mtt) {
+    if (ARG(0)) G64(ARG(0)) = 0x1000;
+    if (ARG(1)) G64(ARG(1)) = 0x1000;
+    RET(0);
+}
+HLE(_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPPNS_2os15SystemEventTypeEPNS0_14Vp9DecoderTypeE) {
+    if (ARG(0)) G64(ARG(0)) = ready_event();
+    RET(0);
+}
 HLE(_ZN2nn5codec18FinalizeVp9DecoderEPNS0_14Vp9DecoderTypeE) { dec_finalize(c); }
 HLE(_ZN2nn5codec24RegisterVp9DecoderBufferEPNS0_14Vp9DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj) { dec_register(c); }
 HLE(_ZN2nn5codec26UnregisterVp9DecoderBufferEPNS0_14Vp9DecoderTypeEj) { dec_unregister(c); }
@@ -709,8 +917,11 @@ HLE(_ZN2nn5codec36SubmitEncryptedVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEP
 HLE(_ZN2nn5codec29AcquireVp9DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Vp9DecoderTypeE) { dec_acquire(c); }
 HLE(_ZN2nn5codec29ReleaseVp9DecoderOutputBufferEPNS0_14Vp9DecoderTypeEjNS_2gs16NativeSyncHandleE) { dec_release(c); }
 HLE(_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj) { dec_properties(c); }
+/* (hookshot) the older SDK's, with a ColorSpace pointer after the sizes (Mario Kart World 1.0.0; mkw-recomp's signature) */
+HLE(_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj) { dec_properties_cs(c, 4); }
 
-/* (hookshot) AV1: OoT's movies. FFmpeg's AV1 decoder if the build has one, else Media Foundation (host/mf_av1.c).
+/* (hookshot) AV1: OoT's movies. FFmpeg's AV1 decoder if the build has one, else dav1d (host/dav1d_av1.c) when the build has
+   it, else Media Foundation (host/mf_av1.c).
    Initialize...ByTransferMemory(decoder, memory, size, ?, u16 width, u16 height, ...), ...ByRemoteMemory(decoder,
    size, u16 width, u16 height, ...) */
 HLE(_ZN2nn5codec36InitializeAv1DecoderByTransferMemoryEPNS0_14Av1DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) {
@@ -733,6 +944,14 @@ HLE(_ZN2nn5codec35GetAv1DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEP
 /* VP8 */
 HLE(_ZN2nn5codec36InitializeVp8DecoderByTransferMemoryEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
 HLE(_ZN2nn5codec34InitializeVp8DecoderByRemoteMemoryEPNS0_14Vp8DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE) { dec_init(c, AV_CODEC_ID_VP8, "VP8"); }
+/* (hookshot) the older SDK's forms, as for VP9 above: with work memory (decoder, void*, size_t, size_t, u16 w, u16 h, ...)
+   or without (decoder, size_t, size_t, u16 w, u16 h, ...). Mario Kart World 1.0.0 imports both; mkw-recomp's signatures */
+HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP8, "VP8", (int)(uint16_t)ARG(4), (int)(uint16_t)ARG(5));
+}
+HLE(_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE) {
+    dec_init_sized(c, AV_CODEC_ID_VP8, "VP8", (int)(uint16_t)ARG(3), (int)(uint16_t)ARG(4));
+}
 HLE(_ZN2nn5codec18FinalizeVp8DecoderEPNS0_14Vp8DecoderTypeE) { dec_finalize(c); }
 HLE(_ZN2nn5codec24RegisterVp8DecoderBufferEPNS0_14Vp8DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj) { dec_register(c); }
 HLE(_ZN2nn5codec26UnregisterVp8DecoderBufferEPNS0_14Vp8DecoderTypeEj) { dec_unregister(c); }

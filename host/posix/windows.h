@@ -1,7 +1,7 @@
 /* (linux) The part of the Win32 API Hookshot's runtime and Vulkan back end use, on POSIX: host/posix is on the include
    path of Linux builds only (nx2/build.py), so `#include <windows.h>` finds this file and the Windows code paths stay
-   as they are. Implemented in win32_posix.c (threads, events, fibers, files, memory, modules, exceptions, waveOut),
-   gdi_posix.c (the bit of GDI the Insert menu draws its text with) and display_sdl.c (the window, keyboard, mouse).
+   as they are. Implemented in win32_posix.c (threads, events, fibers, files, memory, modules, exceptions, waveOut) and
+   display_sdl.c (the window, keyboard, mouse).
 
    Not a general emulation: what is here is what the code calls, with the behaviour it relies on. Handles are
    pointers to objects of this file's own (threads, events, timers, files, find searches); the guest window is one
@@ -338,6 +338,9 @@ static inline SIZE_T GetLargePageMinimum(void) { return 0; }
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x4
 HMODULE LoadLibraryA(LPCSTR name);
 #define LoadLibrary LoadLibraryA
+/* (hookshot) why this thread's last LoadLibraryA failed, as dlerror() said (a missing file, or a symbol the library needs
+   and nothing loaded has); "" when it did not. GetLastError() is ERROR_FILE_NOT_FOUND for every failure */
+const char *hos_load_error(void);
 BOOL FreeLibrary(HMODULE m);
 FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 HMODULE GetModuleHandleA(LPCSTR name);
@@ -361,6 +364,7 @@ DWORD GetCurrentDirectoryA(DWORD cap, LPSTR out);
 #define FILE_ATTRIBUTE_HIDDEN 0x2
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
 #define FILE_ATTRIBUTE_NORMAL 0x80
+#define FILE_ATTRIBUTE_REPARSE_POINT 0x400   /* (a symbolic link: find_next sets it) */
 #define FILE_FLAG_SEQUENTIAL_SCAN 0x08000000
 #define FILE_FLAG_RANDOM_ACCESS 0x10000000
 #define FILE_FLAG_OVERLAPPED 0x40000000
@@ -469,6 +473,8 @@ static inline void *RtlVirtualUnwind(DWORD type, DWORD64 base, DWORD64 pc, PRUNT
 #define VK_LBUTTON 0x01
 #define VK_RBUTTON 0x02
 #define VK_MBUTTON 0x04
+#define VK_XBUTTON1 0x05   /* (Mouse 4 and Mouse 5, the side buttons) */
+#define VK_XBUTTON2 0x06
 #define VK_BACK 0x08
 #define VK_TAB 0x09
 #define VK_RETURN 0x0D
@@ -490,6 +496,10 @@ static inline void *RtlVirtualUnwind(DWORD type, DWORD64 base, DWORD64 pc, PRUNT
 #define VK_INSERT 0x2D
 #define VK_DELETE 0x2E
 #define VK_NUMPAD0 0x60
+#define VK_NUMPAD2 0x62
+#define VK_NUMPAD4 0x64
+#define VK_NUMPAD6 0x66
+#define VK_NUMPAD8 0x68
 #define VK_MULTIPLY 0x6A
 #define VK_ADD 0x6B
 #define VK_SUBTRACT 0x6D
@@ -537,6 +547,7 @@ HWND GetForegroundWindow(void);
 #define WS_EX_NOACTIVATE 0x08000000
 static inline LONG_PTR GetWindowLongPtrA(HWND w, int i) { (void)w, (void)i; return 0; }
 /* (the Insert menu's Fullscreen row, gpu/vk/vk_menu.cpp: WM_APP + 7 to the window sets it, GWL_STYLE without WS_CAPTION reads it) */
+#define WM_CLOSE 0x0010
 #define WM_APP 0x8000
 #define WS_CAPTION 0x00C00000L
 BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp);
@@ -553,56 +564,6 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #ifndef MB_ICONWARNING
 #define MB_ICONWARNING 0x00000030L
 #endif
-
-/* ---- GDI: the Insert menu's text into a 32-bit bitmap (gdi_posix.c) ---- */
-#define BI_RGB 0
-#define DIB_RGB_COLORS 0
-#define TRANSPARENT 1
-#define OPAQUE 2
-#define TA_LEFT 0
-#define TA_RIGHT 2
-#define TA_CENTER 6
-#define TA_TOP 0
-#define TA_BOTTOM 8
-#define TA_BASELINE 24
-#define FW_NORMAL 400
-#define FW_MEDIUM 500
-#define FW_SEMIBOLD 600
-#define FW_BOLD 700
-#define DEFAULT_CHARSET 1
-#define OUT_DEFAULT_PRECIS 0
-#define CLIP_DEFAULT_PRECIS 0
-#define DEFAULT_QUALITY 0
-#define NONANTIALIASED_QUALITY 3
-#define ANTIALIASED_QUALITY 4
-#define CLEARTYPE_QUALITY 5
-#define DEFAULT_PITCH 0
-typedef struct {
-    DWORD biSize;
-    LONG biWidth, biHeight;
-    WORD biPlanes, biBitCount;
-    DWORD biCompression, biSizeImage;
-    LONG biXPelsPerMeter, biYPelsPerMeter;
-    DWORD biClrUsed, biClrImportant;
-} BITMAPINFOHEADER;
-typedef struct { BYTE rgbBlue, rgbGreen, rgbRed, rgbReserved; } RGBQUAD;
-typedef struct { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[1]; } BITMAPINFO;
-HDC CreateCompatibleDC(HDC dc);
-BOOL DeleteDC(HDC dc);
-HBITMAP CreateDIBSection(HDC dc, const BITMAPINFO *bi, UINT usage, void **bits, HANDLE section, DWORD offset);
-HGDIOBJ SelectObject(HDC dc, HGDIOBJ obj);
-BOOL DeleteObject(HGDIOBJ obj);
-BOOL GdiFlush(void);
-HFONT CreateFontA(int height, int width, int escapement, int orientation, int weight, DWORD italic, DWORD underline,
-                  DWORD strikeout, DWORD charset, DWORD out_precision, DWORD clip_precision, DWORD quality, DWORD pitch,
-                  LPCSTR face);
-HBRUSH CreateSolidBrush(COLORREF c);
-int FillRect(HDC dc, const RECT *r, HBRUSH b);
-int SetBkMode(HDC dc, int mode);
-COLORREF SetTextColor(HDC dc, COLORREF c);
-UINT SetTextAlign(HDC dc, UINT align);
-BOOL TextOutA(HDC dc, int x, int y, LPCSTR s, int n);
-BOOL GetTextExtentPoint32A(HDC dc, LPCSTR s, int n, SIZE *size);
 
 #ifdef __cplusplus
 }

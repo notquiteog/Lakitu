@@ -16,9 +16,13 @@
 #include <string>
 #include <vector>
 
+#include <utility>
+
 #include "vk_fsr3fi.h"
-#include "vk_menu.h"   // (the Insert menu's "Made frames by" row)
+#include "vk_menu.h"    // (the Frame generation row)
+#include "framegen_methods.h"   // (hookshot fork: the Frame generation by row's AMD FSR 3.1)
 #include "vk_gprof.h"   // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
+#include "vk_texture.h"
 
 #include "shaders/fsr3_fi_disocclusion_mask_comp_spv.h"
 #include "shaders/fsr3_fi_game_motion_vector_field_comp_spv.h"
@@ -37,6 +41,7 @@
 #include "shaders/fsr3_of_luminance_pyramid_comp_spv.h"
 #include "shaders/fsr3_of_prepare_luma_comp_spv.h"
 #include "shaders/fsr3_of_scale_optical_flow_v5_comp_spv.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk::fsr3fi {
 namespace {
@@ -226,13 +231,12 @@ static_assert(sizeof(OfSpdConstants) == 32, "cbOF_SPD must match the SDK's layou
 
 // ---- state ----
 
-constexpr uint32_t kMaxMade = 3;        ///< as dlssg: up to three frames between two of the game's
+constexpr uint32_t kMaxMade = 1;        ///< one midpoint frame between two of the game's (vk_fsr3fi.h)
 constexpr uint32_t kOfLevels = 7;       ///< advancedAlgorithmIterations in ffx_opticalflow.cpp
 constexpr uint32_t kOfBlockSize = 8;    ///< opticalFlowBlockSize, likewise
 constexpr uint32_t kPyramidMips = 13;   ///< the mip UAVs the two inpainting pyramid passes declare
 constexpr uint32_t kScdHistogramWidth = 256 * (3 * 3);   ///< HistogramBins * HistogramsPerDim^2
 constexpr uint32_t kCountersBytes = 16;  ///< two uints, rounded up: COUNTER_SPD and the reset index
-constexpr uint32_t kUniformFrames = 4;   ///< (more than the swapchain's images in flight)
 
 struct Pipeline {
     VkDescriptorSetLayout set = VK_NULL_HANDLE;
@@ -295,17 +299,13 @@ struct State {
     uint32_t ready = 0;                  ///< how many of `made` exist
     uint32_t flow_width[kOfLevels]{}, flow_height[kOfLevels]{};
 
-    // The uniform buffer the four constant blocks are written into, with a set of slots per frame in
-    // flight so writing one frame cannot disturb a frame still being read.
-    VkBuffer uniforms = VK_NULL_HANDLE;
-    VmaAllocation uniforms_memory = nullptr;
-    void* uniforms_mapped = nullptr;
+    // Constant block layout; storage belongs to each recording, not a fixed frame ring.
     VkDeviceSize slot_fi = 0, slot_pyramid = 0, slot_of = 0, slot_of_spd = 0, frame_stride = 0;
-    uint32_t uniform_frame = 0;
 
     uint32_t parity = 0;
     int32_t of_frame_index = 0;
     bool first_frame = true;
+    uint64_t sequence = 0;               ///< Inputs::sequence of the frame kept as the previous source
     bool in_general = false;             ///< the UNDEFINED -> GENERAL barriers have been recorded
 };
 
@@ -314,23 +314,20 @@ State g;
 constexpr VkImageSubresourceRange ALL_LEVELS{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS,
                                              0, 1};
 
-/// `RX_VK_FSR_FG=<1-3>` asks for this backend and says how many frames to make between two of the
-/// game's. Off is the default and costs nothing: nothing below runs and nothing is logged.
+/// The made frame of Frame generation at 2x by this backend: RX_VK_FSR_FG=1 (opt-in). Without it the renderer's own blend
+/// makes it, as at 3x and more. FSR 3.1's interpolation has no HUD-less colour here (the game draws its HUD into the same
+/// picture), so it moved the HUD with the scene: smeared HUD, a ghost trail behind Link, a see-through rectangle, at 2x only
+/// (#1635 and seven duplicates, 2026-11-10). RX_VK_FSR_FG=1 asks for it over the row, =0 never.
 uint32_t asked() {
-    static const uint32_t n = []() -> uint32_t {
-        if (const char* e = getenv("RX_VK_FSR_FG"); e && *e) {
-            const int v = atoi(e);
-            return v <= 0 ? 0u : (uint32_t)std::min(v, (int)kMaxMade);
-        }
-        // Otherwise the Insert menu: "Made frames by" picks FSR, and "Frame generation" says how
-        // many frames there are to make -- one fewer than the multiplier, since the last of each
-        // set is the game's own frame. The same shape dlssg uses, so the two rows mean one thing.
-        // The native "Frame generation" row is the whole setting: a player says how many frames
-        // to make, not which library makes them. Both backends are asked, and vk_framegen.cpp
-        // tries DLSS first, this second, and keeps its own blend for what neither takes.
-        return (uint32_t)std::clamp(opts.framegen - 1, 0, (int)kMaxMade);
+    static const int env = []() {
+        const char* e = getenv("RX_VK_FSR_FG");
+        return e && *e ? std::max(0, atoi(e)) : -1;
     }();
-    return n;
+    if (env >= 0) return env ? 1u : 0u;
+    // (opt-in: the renderer's own blend at 2x, see above. hookshot fork: the Frame generation by row's AMD FSR 3.1 is that
+    // choice made in the menu, framegen_methods.h. Only at 2x, the one set it makes: at Off, Auto and 3x and up the scene's
+    // inputs are not kept for nothing)
+    return opts.framegen_by == framegen_methods::FSR3 && opts.framegen == 2 ? 1u : 0u;
 }
 
 /// A memory dependency over the whole queue, in the synchronization2 form this renderer loads.
@@ -344,12 +341,33 @@ void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAcce
     vkCmdPipelineBarrier2(cmd, &di);
 }
 
-void drop_image(Image& t) {
+// Images of an earlier size, released only after their GPU uses complete.
+std::vector<std::pair<uint64_t, Image>> dead;
+
+void destroy_now(Image& t) {
     for (VkImageView v : t.levels) vkDestroyImageView(dev.device, v, nullptr);
-    t.levels.clear();
     if (t.view) vkDestroyImageView(dev.device, t.view, nullptr);
     if (t.image) mkwvk::destroy_image(t.image, t.memory);
     t = Image{};
+}
+
+/// Retain every view and its image until a later submission covers the old recordings.
+void drop_image(Image& t) {
+    if (t.image) dead.push_back({vk_retirement_value(), std::move(t)});
+    t = Image{};
+}
+
+void free_dead() {
+    const uint64_t now = vk_timeline_completed();
+    for (size_t i = 0; i < dead.size();) {
+        if (dead[i].first && now >= dead[i].first) {
+            destroy_now(dead[i].second);
+            dead[i] = std::move(dead.back());
+            dead.pop_back();
+        } else {
+            i++;
+        }
+    }
 }
 
 /// One of the SDK's internal images: storage and sampled, GENERAL throughout, with a view per level
@@ -438,13 +456,6 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
     return true;
 }
 
-void drop_pipeline(Pipeline& p) {
-    if (p.pipeline) vkDestroyPipeline(dev.device, p.pipeline, nullptr);
-    if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr);
-    if (p.set) vkDestroyDescriptorSetLayout(dev.device, p.set, nullptr);
-    p = Pipeline{};
-}
-
 /// The one sampler the interpolation passes declare: linear, clamped to the edge. It is the only
 /// filtered read in the whole chain (the colour sources and the disocclusion mask are sampled in UV
 /// space); every other load is a texelFetch and needs no sampler at all.
@@ -522,11 +533,9 @@ bool features_supported() {
     return true;
 }
 
-/// The uniform buffer the four constant blocks are written into: host visible and mapped, with a set
-/// of slots per frame in flight. cbOF gets one slot per pyramid level plus one for the passes before
-/// the pyramid, because the flow walks its levels from the top down and each level's dispatches read
-/// a block that names the level they are on.
-bool make_uniforms() {
+/// Aligned constant block offsets; the recording supplies storage for each evaluation.
+/// Optical flow keeps a distinct block per pyramid level, plus the block for passes before the pyramid.
+void make_uniform_layout() {
     const VkDeviceSize align =
         std::max<VkDeviceSize>(dev.props.limits.minUniformBufferOffsetAlignment, 16);
     const auto round_up = [align](VkDeviceSize n) { return (n + align - 1) / align * align; };
@@ -535,8 +544,6 @@ bool make_uniforms() {
     g.slot_of = round_up(sizeof(OfConstants));
     g.slot_of_spd = round_up(sizeof(OfSpdConstants));
     g.frame_stride = g.slot_fi + 2 * g.slot_pyramid + (kOfLevels + 1) * g.slot_of + g.slot_of_spd;
-    return create_buffer(g.frame_stride * kUniformFrames, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true,
-                         g.uniforms, g.uniforms_memory, &g.uniforms_mapped);
 }
 
 /// Records one pass: its descriptors pushed at the binding numbers its GLSL fixes them to, then the
@@ -606,22 +613,8 @@ void spd_setup(uint32_t width, uint32_t height, uint32_t* groups, uint32_t* offs
     *mips = (uint32_t)std::min(std::floor(std::log2(resolution)), 12.0f);
 }
 
-/// setupDeviceDepthToViewSpaceDepthParams for reversed infinite depth, which is the depth this
-/// renderer's scene is drawn with and the permutation the vendored passes were compiled under
-/// (FFX_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH=1). vk_fsr3.cpp computes the same four factors for
-/// the upscaler; they are kept apart because the two constant blocks are not the same block.
-void device_to_view_depth(float* out, float near_plane, float fov_y, int32_t render_width,
-                         int32_t render_height) {
-    const float aspect = (float)render_width / (float)std::max(1, render_height);
-    const float cot_half_fov = std::cos(0.5f * fov_y) / std::sin(0.5f * fov_y);
-    out[0] = -1.0f * FLT_EPSILON;
-    out[1] = near_plane;
-    out[2] = 1.0f / (cot_half_fov / aspect);
-    out[3] = 1.0f / cot_half_fov;
-}
-
 /// Every image this backend owns, in one list, so the one-time layout transition, the reset clears
-/// and shutdown all walk the same set and none of them can forget one.
+/// and a failed make all walk the same set and none of them can forget one.
 std::vector<Image*> all_images() {
     std::vector<Image*> all{&g.of_luma[0],
                             &g.of_luma[1],
@@ -659,32 +652,29 @@ void clear_images(VkCommandBuffer cmd, std::initializer_list<const Image*> image
 
 } // namespace
 
-bool supported() {
+/// What this device can do, which cannot change while it runs: asked once and kept.
+bool capable() {
+    if (!dev.device) return false;   // (asked before the device is made, by the menu: not an answer to keep)
     static const bool yes = []() {
-        if (!asked()) return false;   // (RX_VK_FSR_FG: nothing below runs unless it is asked for)
         if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) {
             logf("vk: fsr3fi: no push descriptors");
             return false;
         }
         if (!formats_supported() || !features_supported()) return false;
-        logf("vk: fsr3fi: FSR frame interpolation is available, %u made frame(s) asked for",
-             asked());
-        if (asked() > 1)
-            logf("vk: fsr3fi: FSR 3.1's interpolation has no phase input, so the %u frames of a set "
-                 "are the same midpoint frame; only the pacing differs",
-                 asked());
+        logf("vk: fsr3fi: AMD FSR 3.1 frame interpolation can run on this GPU");
         return true;
     }();
     return yes;
 }
 
 uint32_t frames_wanted() {
-    return supported() ? asked() : 0;
+    // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x)
+    return asked() && capable() ? 1u : 0u;
 }
 
 bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t render_height,
              VkFormat present_format) {
-    if (!supported() || g.failed) return false;
+    if (!capable() || g.failed) return false;
     if (!width || !height || !render_width || !render_height) return false;
     if (present_format == VK_FORMAT_UNDEFINED) return false;
     // The frame this backend writes is in the format it is presented in, because it is shown as a
@@ -704,7 +694,8 @@ bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t re
     if (!g.tried) {
         g.tried = true;
         // (TRANSFER_DST: the counters are zeroed with vkCmdFillBuffer before the first frame)
-        g.ok = make_sampler() && make_uniforms() &&
+        make_uniform_layout();
+        g.ok = make_sampler() &&
                create_buffer(kCountersBytes,
                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              false, g.counters, g.counters_memory, nullptr);
@@ -712,7 +703,7 @@ bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t re
         if (g.ok) logf("vk: fsr3fi: %d pass pipelines ready", (int)P_COUNT);
     }
     if (!g.ok) return false;
-    const uint32_t n = asked();
+    const uint32_t n = kMaxMade;
     if (g.ready == n && g.width == width && g.height == height &&
         g.render_width == render_width && g.render_height == render_height &&
         g.present_format == present_format)
@@ -795,17 +786,20 @@ bool prepare(uint32_t width, uint32_t height, uint32_t render_width, uint32_t re
 }
 
 bool generate(VkCommandBuffer cmd, const Inputs& in) {
-    if (!supported()) return false;
+    free_dead();
+    if (!frames_wanted()) return false;
     if (!in.color || !in.color_image || !in.depth || !in.motion) return false;
     if (in.color_format == VK_FORMAT_UNDEFINED) return false;
     if (!in.width || !in.height || !in.render_width || !in.render_height) return false;
-    if (!in.frame_index || in.frame_index > asked()) return false;
-    if (!(in.near_plane > 0.0f) || !(in.fov_y > 0.0f)) return false;   // (Inputs defaults them)
+    if (!(in.camera.device_to_view_depth[1] > 0.0f)) return false;   // (no camera: vk_fsr3_inputs.cpp)
     if (!prepare(in.width, in.height, in.render_width, in.render_height, in.color_format))
         return false;
 
-    Image& out = g.made[in.frame_index - 1];
+    Image& out = g.made[0];
     if (!out.image) return false;
+
+    const UniformUpload uniforms = uniform_upload(g.frame_stride);
+    if (!uniforms.binding) return false;
 
     // Everything this backend owns starts UNDEFINED and lives in GENERAL from here on, as the rest
     // of this renderer's compute resources do.
@@ -841,30 +835,9 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
                        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
     }
 
-    // FSR 3.1 interpolates the midpoint of the interval and nothing else: there is no phase anywhere
-    // in cbFI and ffx_frameinterpolation.h fixes t at 0.5. A set of more than one made frame is
-    // therefore that one frame shown more than once, and recording the chain again per index would
-    // cost seventeen dispatches to produce the same picture. The later indices copy instead, and
-    // RX_VK_FSR_FG=1 is the setting that is worth anything.
-    if (in.frame_index > 1) {
-        const Image& midpoint = g.made[0];
-        if (!midpoint.image) return false;
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                       VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                               {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                               {g.width, g.height, 1}};
-        vkCmdCopyImage(cmd, midpoint.image, VK_IMAGE_LAYOUT_GENERAL, out.image,
-                       VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-        memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
-        return true;
-    }
-
-    const bool reset = in.reset || g.first_frame;
+    const bool reset = in.reset || g.first_frame || in.sequence != g.sequence + 1;
     g.first_frame = false;
+    g.sequence = in.sequence;   // (this frame becomes the next one's previous source below, whatever else happens)
     const int32_t rw = (int32_t)g.render_width, rh = (int32_t)g.render_height;
     const int32_t uw = (int32_t)g.width, uh = (int32_t)g.height;
 
@@ -874,12 +847,12 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     k.render_size[0] = rw, k.render_size[1] = rh;
     k.display_size[0] = uw, k.display_size[1] = uh;
     k.display_size_rcp[0] = 1.0f / (float)uw, k.display_size_rcp[1] = 1.0f / (float)uh;
-    k.camera_near = in.near_plane;
-    k.camera_far = in.far_plane;
+    k.camera_near = in.camera.near_plane;   // (not read by the passes: set as the SDK sets them)
+    k.camera_far = in.camera.far_plane;
     k.upscaler_target_size[0] = uw, k.upscaler_target_size[1] = uh;
     k.mode = 0;
     k.reset = reset ? 1 : 0;
-    device_to_view_depth(k.device_to_view_depth, in.near_plane, in.fov_y, rw, rh);
+    memcpy(k.device_to_view_depth, in.camera.device_to_view_depth, sizeof k.device_to_view_depth);
     k.delta_time = in.frame_time_ms;
     k.hudless_attached_factor = 0;   // (one colour, with whatever the game drew on it)
     k.distortion_field_size[0] = 1, k.distortion_field_size[1] = 1;
@@ -899,12 +872,9 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     // luminance pair the other two functions would need is left at the SDR range.
     k.back_buffer_transfer_function = 0;
     k.min_max_luminance[0] = 0.0f, k.min_max_luminance[1] = 1.0f;
-    {   // fTanHalfFOV is the *horizontal* half angle's tangent, as ffxFrameInterpolationDispatch
-        // builds it from the vertical field of view and the render aspect.
-        const float aspect = (float)rw / (float)std::max(1, rh);
-        const float horizontal = 2.0f * std::atan(std::tan(in.fov_y * 0.5f) * aspect);
-        k.tan_half_fov = std::tan(horizontal * 0.5f);
-    }
+    // fTanHalfFOV is the *horizontal* half angle's tangent, as ffxFrameInterpolationDispatch builds it from the vertical
+    // field of view and the render aspect: 1 / p[0][0] of the scene's projection (fsr3_math.h)
+    k.tan_half_fov = in.camera.tan_half_fov_x;
     k.jitter[0] = in.jitter[0], k.jitter[1] = in.jitter[1];
     k.motion_vector_scale[0] = in.motion_scale[0] / (float)rw;
     k.motion_vector_scale[1] = in.motion_scale[1] / (float)rh;
@@ -947,10 +917,9 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     of_spd.work_group_offset[1] = luma_offset[1];
     of_spd.num_work_groups_pyramid = of_spd.num_work_groups;
 
-    // This frame's slots, written through the mapped buffer.
-    const VkDeviceSize base = (VkDeviceSize)(g.uniform_frame % kUniformFrames) * g.frame_stride;
-    g.uniform_frame++;
-    uint8_t* const mapped = (uint8_t*)g.uniforms_mapped + base;
+    // This evaluation owns its constants until its recording has completed.
+    const VkDeviceSize base = uniforms.binding.offset;
+    uint8_t* const mapped = uniforms.mapped;
     const VkDeviceSize at_fi = 0;
     const VkDeviceSize at_game_pyramid = at_fi + g.slot_fi;
     const VkDeviceSize at_frame_pyramid = at_game_pyramid + g.slot_pyramid;
@@ -966,16 +935,16 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
         memcpy(mapped + at_of + (VkDeviceSize)(l + 1) * g.slot_of, &level, sizeof level);
     }
     memcpy(mapped + at_of_spd, &of_spd, sizeof of_spd);
-    flush_mapped(g.uniforms_memory, g.frame_stride * kUniformFrames);
+    flush_mapped_range(uniforms.memory, uniforms.binding.offset, uniforms.binding.size);
 
-    const Resource cb_fi{VK_NULL_HANDLE, g.uniforms, base + at_fi, g.slot_fi};
-    const Resource cb_game_pyramid{VK_NULL_HANDLE, g.uniforms, base + at_game_pyramid,
+    const Resource cb_fi{VK_NULL_HANDLE, uniforms.binding.buffer, base + at_fi, g.slot_fi};
+    const Resource cb_game_pyramid{VK_NULL_HANDLE, uniforms.binding.buffer, base + at_game_pyramid,
                                    g.slot_pyramid};
-    const Resource cb_frame_pyramid{VK_NULL_HANDLE, g.uniforms, base + at_frame_pyramid,
+    const Resource cb_frame_pyramid{VK_NULL_HANDLE, uniforms.binding.buffer, base + at_frame_pyramid,
                                     g.slot_pyramid};
-    const Resource cb_of_spd{VK_NULL_HANDLE, g.uniforms, base + at_of_spd, g.slot_of_spd};
+    const Resource cb_of_spd{VK_NULL_HANDLE, uniforms.binding.buffer, base + at_of_spd, g.slot_of_spd};
     const auto cb_of = [&](uint32_t slot) {
-        return Resource{VK_NULL_HANDLE, g.uniforms, base + at_of + (VkDeviceSize)slot * g.slot_of,
+        return Resource{VK_NULL_HANDLE, uniforms.binding.buffer, base + at_of + (VkDeviceSize)slot * g.slot_of,
                         g.slot_of};
     };
     const Resource counters{VK_NULL_HANDLE, g.counters, 0, kCountersBytes};
@@ -1192,28 +1161,8 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     return !reset;
 }
 
-VkImage made_image(uint32_t index) {
-    if (!index || index > g.ready) return VK_NULL_HANDLE;
-    return g.made[index - 1].image;
-}
+VkImage made_image() { return g.ready ? g.made[0].image : VK_NULL_HANDLE; }
 
-VkImageView made_view(uint32_t index) {
-    if (!index || index > g.ready) return VK_NULL_HANDLE;
-    return g.made[index - 1].view;
-}
-
-void reset() {
-    g.first_frame = true;
-}
-
-void shutdown() {
-    for (Image* t : all_images()) drop_image(*t);
-    for (Image& t : g.made) drop_image(t);
-    for (Pipeline& p : g.passes) drop_pipeline(p);
-    if (g.linear) vkDestroySampler(dev.device, g.linear, nullptr);
-    if (g.uniforms) destroy_buffer(g.uniforms, g.uniforms_memory);
-    if (g.counters) destroy_buffer(g.counters, g.counters_memory);
-    g = State{};
-}
+void reset() { g.first_frame = true; }
 
 } // namespace mkwvk::fsr3fi

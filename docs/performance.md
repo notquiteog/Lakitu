@@ -99,6 +99,37 @@ So the fix is not "split the lock" in the abstract. It is two specific questions
 `texture_touch_quick` misses, and whether the `pools_mu` path can resolve a pool without holding the
 shared-recording lock. Both are measurable with the harness that produced this table.
 
+### It is not the lock, and tuning does not rescue it
+
+Swept against serial, same scene:
+
+| arm | fps | `submit` |
+|---|---|---|
+| **serial** | **31.1 / 30.9 / 29.3** | **31.65 ms** |
+| `RX_VK_PARALLEL=2` | 24.7 / 25.4 / 26.4 | 34.86 ms |
+| `RX_VK_PARALLEL=4` | 23.2 / 23.2 / 24.4 | 38.02 ms |
+| `RX_VK_PARALLEL=8` | 16.4 / 16.4 / 14.7 | 63.41 ms |
+| `=4`, `_SEG=480` | 7.3 / 18.9 / 18.6 | 50.25 ms |
+
+Serial wins at every setting, it gets monotonically worse with more threads, and larger segments are
+worse still (that 7.3 is one sample of three, so it stutters as well as being slow).
+
+**Two threads already lose by 5 fps**, and two threads can barely contend. So the cost is not the
+lock after all: it is the fixed work per command buffer -- the dry pass, the segment list, a
+recording and command buffer per segment, and the ordered submission -- and fixing the two lock
+sites above could not have recovered it. That is worth saying plainly, because the lock numbers
+(739 acquisitions, 3.65 ms) invite exactly that conclusion and it is wrong.
+
+**Why it was written, and where it probably does pay.** The design note says Mario Kart World hands
+over nearly a frame's draws in *one* command buffer, 6-10 ms of replay on the critical path. Ocarina
+submits about six command buffers a frame, so each one is small and the per-buffer overhead is paid
+six times for proportionally less work. The feature is likely right for the game it was written for
+and wrong for this one -- which makes it worth measuring again in the Mario Kart World fork rather
+than deleting.
+
+The frame rate is still waiting on the serial path: ~15 ms of `submit` that no sub-counter names,
+and the ~30% of CPU in `memmove` that needs call graphs to attribute.
+
 So the parallel path is not slow because parallelism does not suit this game. It is serialised on
 one lock, and then pays the coordination on top. Splitting that lock by what it protects is the
 work that would make it pay, and it is delicate: the mutex is recursive and taken reentrantly, so
