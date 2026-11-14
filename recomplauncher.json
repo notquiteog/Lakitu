@@ -45,6 +45,32 @@
       ]
     }
   ],
+  "games": [
+    {
+      "id": "oot",
+      "name": "The Legend of Zelda: Ocarina of Time",
+      "args": [
+        "--game",
+        "oot"
+      ],
+      "saves": [
+        "{local}/hookshot",
+        "{home}/Games/Hookshot/user"
+      ]
+    },
+    {
+      "id": "mkw",
+      "name": "Mario Kart World",
+      "args": [
+        "--game",
+        "mkw"
+      ],
+      "saves": [
+        "{local}/hookshot-mkw",
+        "{home}/Games/Hookshot-mkw/user"
+      ]
+    }
+  ],
   "saves": [
     "{local}/hookshot",
     "{home}/Games/Hookshot/user"
