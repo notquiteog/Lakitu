@@ -1347,12 +1347,17 @@ class Lifter:
             if not img.in_code(pc):
                 R.clear()
                 bounds.clear()
+                bound = None
                 continue
             w = img.word(pc)
             if (w & 0xFC000000) == 0x14000000 or (w & 0xFFFFFC1F) in (0xD65F0000, 0xD61F0000):
-                # ret / b / br: what follows is reached from elsewhere, so nothing above is known there
+                # ret / b / br: what follows is reached from elsewhere, so nothing above is known there.
+                # (hookshot) That holds for the CMP + B.HI bound as well: kept, a compare above a `b` bounded the table
+                # of the next block's br by an unrelated value (Mario Kart World 1.0.0, br 0x81e0f0c0: cmp w8, #1 of
+                # other code gave 2 of the table's 5 entries, and the race stopped at the missing 0x81e0f200)
                 R.clear()
                 bounds.clear()
+                bound = None
                 continue
             d = w & 31
             n = (w >> 5) & 31
