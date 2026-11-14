@@ -119,6 +119,21 @@ static void hold() {
     g_hold_until_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
                       (int64_t)g_hold_ms * 1000000;
 }
+// (a hold that ends at the call it is for: hold_until_call(op), made before the commands op must come after are put in flight,
+// holds the recorder as hold() does, and the producer's call of op reaching the fake ends it (call_reached). A producer that makes
+// op without waiting for the recorder finds those commands still in flight however it is scheduled within the cap, not only when
+// the 1 us a call happened to keep the recorder behind (a vkDestroyBuffer added to unordered() passed a windows-2022 run,
+// 43540357589, with no hold at all); one that waits is let through when the cap passes)
+static std::atomic<const char*> g_release_at{nullptr};
+static void hold_until_call(const char* op, int cap_ms = 250) {
+    g_release_at = op;
+    g_hold_until_ns = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+                      (int64_t)cap_ms * 1000000;
+}
+static void call_reached(const char* op) {
+    const char* at = g_release_at.load();
+    if (at && !std::strcmp(at, op)) g_release_at = nullptr, g_hold_until_ns = 0;
+}
 static bool g_hash_only = false;         // (stress: each call folded into g_hash and dropped)
 static uint64_t g_hash = 0xcbf29ce484222325ull;
 static std::thread::id g_main_id;
@@ -496,12 +511,14 @@ static VkResult VKAPI_CALL fake_vkGetQueryPoolResults(VkDevice d, VkQueryPool p,
         const uint64_t v = it == g_query.end() ? 0 : it->second;
         std::memcpy(static_cast<uint8_t*>(data) + i * stride, &v, 8), put(v);
     }
+    call_reached("vkGetQueryPoolResults");
     return VK_SUCCESS;
 }
 static void VKAPI_CALL fake_vkDestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks*) {
     Guard g_(nullptr, "vkDestroyBuffer", false);
     begin("vkDestroyBuffer"), handle(d), handle(b);
     g_destroyed.insert((uint64_t)(uintptr_t)b);
+    call_reached("vkDestroyBuffer");
 }
 static void VKAPI_CALL fake_vkDestroyDevice(VkDevice d, const VkAllocationCallbacks*) {
     Guard g_(nullptr, "vkDestroyDevice", false);
@@ -1054,6 +1071,7 @@ static void status_reads() {
         recording_begin();
         vkCmdFillBuffer(kCmd, H<VkBuffer>(0xE400), 0, 16, 0x100 + k);
         vkCmdSetCheckpointNV(kCmd, (void*)(uintptr_t)(0x200 + k));
+        hold_until_call("vkGetQueryPoolResults");   // (from before the frame's commands go in flight, until the read)
         frame();
         {   // (a query read mid-recording, the frame's commands in flight: kept ordered, so in the stream after them)
             uint64_t q[2];
@@ -1075,6 +1093,7 @@ static void status_reads() {
 static void destroy_recorded() {
     recording_begin();
     frame();
+    hold_until_call("vkDestroyBuffer");   // (from before they go in flight: a producer delayed before the call finds them there too)
     copy_runs(kUp, 0);   // (names 0xE001: in flight behind the frame when it is destroyed)
     vkDestroyBuffer(kDev, H<VkBuffer>(0xE001), nullptr);
     vkResetCommandPool(kDev, kUpPool, 0);

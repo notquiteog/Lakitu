@@ -239,6 +239,48 @@ HLE(_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE) {
     *(uint8_t *)GP(ARG(0)) = G64(ARG(1)) == user_uid[0] && G64(ARG(1) + 8) == user_uid[1];
     RET(0);
 }
+/* (dkb) GetLastOpenedUser(Uid*) -> Result: the one user, the only one ever opened. Donkey Kong Bananza asks for it
+   after TryOpenPreselectedUser; the generic stub left the Uid zero, which names no user. (dkb-pc-recomp's
+   runtime/ov_system.c ov_last_opened_user found that the game asks: behaviour only, the code is this file's.) */
+HLE(_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE) {
+    G64(ARG(0)) = user_uid[0];
+    G64(ARG(0) + 8) = user_uid[1];
+    RET(0);
+}
+/* (dkb) LoadCachedNintendoAccountInfo(CachedNintendoAccountInfo*, UserHandle const&, void*, size_t) -> Result: no
+   Nintendo Account is linked here, so a failure; the generic stub's 0 said the outputs were filled, and nothing was.
+   The result is the account service's on a console, not the SDK's, and no console's answer for an unlinked user was
+   measured here. 0x1907c is account module 124, description 200. It is dkb-pc-recomp's choice for Donkey Kong
+   Bananza 3.2.0 (ACCOUNT_R_REGISTRATION_REQUIRED), and the game's own code agrees with it: its one call (main
+   0x8048f460 on 3.2.0) takes the offline path on any failure, and tests account results with descriptions 200 to 269
+   as a family of their own; 200 is the first of them. (The 280 this file answers for the network service account
+   token is outside that family, and means a different thing.) The outputs are left alone, as on any failure. */
+HLE(_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm) {
+    RET(0x1907C);
+}
+
+/* ---- (dkb) services a console has and this PC does not ------------------------------------------------------------
+   Each answers "not here", so the game takes its offline path, where the generic stub's 0 (success with empty
+   outputs) or the lifted SDK's IPC (a session whose replies are empty) said the thing was there. Found on Donkey Kong
+   Bananza 3.2.0; dkb-pc-recomp (github.com/Lucas-blip-png/dkb-pc-recomp, runtime/ov_system.c) reached the same
+   answers by running the game. Each comment says where its value comes from. */
+/* nn::bcat::MountDeliveryCacheStorage() -> Result: no delivery cache is installed: 0x47a, bcat module 122, description
+   2 (FailedOpenEntity), dkb-pc-recomp's answer; a console with no cache downloaded yet was not measured here */
+HLE(_ZN2nn4bcat25MountDeliveryCacheStorageEv) {
+    static volatile LONG told;
+    if (!InterlockedExchange(&told, 1)) hos_log("bcat: no delivery cache (offline): MountDeliveryCacheStorage -> 0x47a");
+    RET(0x47A);
+}
+/* nn::streamplay::GetRequiredMemorySize(StreamPlayType, StreamingMode, int) -> size_t: 0. A choice, not a console's
+   answer: GameShare (streaming the game to another console) is not available here, and with no streaming the game
+   needs no memory for it. Bananza goes on with 0, and asks the streamplay service nothing else. The lifted SDK opened
+   that service through sm: to ask, and aborted on the empty reply (svcBreak from
+   nn::streamplay::detail::CreateUserServiceByHipc). */
+HLE(_ZN2nn10streamplay21GetRequiredMemorySizeENS0_14StreamPlayTypeENS0_13StreamingModeEi) {
+    static volatile LONG told;
+    if (!InterlockedExchange(&told, 1)) hos_log("streamplay: GameShare is not available: GetRequiredMemorySize -> 0");
+    RET(0);
+}
 
 /* ---- nn::time: the host clock --------------------------------------------------------------------------------- */
 HLE(_ZN2nn4time10InitializeEv) { RET(0); }
