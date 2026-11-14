@@ -8,6 +8,7 @@
 #include "vk_imgui.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -397,6 +398,12 @@ bool init() {
     ii.MinImageCount = 2;
     ii.ImageCount = 4;            // (its vertex buffers in turn: one more than the three frames present_image keeps in flight)
     ii.UseDynamicRendering = true;
+    // (its failures, logged: a vertex or index buffer it cannot make leaves that frame's overlays out, nx2/imgui_backend.py)
+    ii.CheckVkResultFn = [](VkResult r) {
+        static std::atomic<int> told{0};
+        if (r < 0 && told.fetch_add(1) < 8)
+            logf("vk: ui: a Vulkan call of the overlays failed (%d, out of memory?): this frame's overlays are left out", (int)r);
+    };
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &pipeline_format;

@@ -2218,6 +2218,49 @@ uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, Vk
     return key;
 }
 
+/// (hookshot) Fast-linked pipelines the full build replaced. A draw's first pipeline is linked from stage libraries (RX_VK_GPL)
+/// and the worker's full build of the same state takes its place in the entry when it is done. The linked one was left alone
+/// until the process ended, so every pipeline a run drew held the driver memory of two: NX2navi (chrg6, commit bc28416) measured
+/// 907 replaced in one play session while the driver's memory outside the allocator grew by 491 MiB, and ported here with
+/// its author's permission. A replaced one is destroyed once the GPU is past every submission that may have bound it. A
+/// draw reads the entry's pipeline when it records (and keeps it no further than its recording: last_pipeline starts again
+/// with each, draw_begin_recording), and each recording's value is handed out (vk_values_handed_out) before it is replayed;
+/// so after the exchange no recording with a later value can bind the old one, and the timeline reaching the newest value
+/// handed out then means the GPU is done with it. No timeline (vk_timeline_completed 0): kept, as before. Counted in the
+/// stage libraries' part of the frame statistics (draw_stats4).
+struct FastRetired { uint64_t at; VkPipeline pipeline; };
+std::mutex fast_retired_mu;
+std::vector<FastRetired> fast_retired;   // (fast_retired_mu)
+std::atomic<int64_t> st_fast_replaced{0}, st_fast_given_back{0};
+/// The replaced ones the GPU is done with, destroyed (from a worker after a replace, and with the frame statistics)
+void fast_reap() {
+    const uint64_t done = vk_timeline_completed();
+    std::vector<VkPipeline> go;
+    {
+        std::lock_guard lk(fast_retired_mu);
+        for (size_t i = 0; i < fast_retired.size();)
+            if (fast_retired[i].at && done >= fast_retired[i].at) {
+                go.push_back(fast_retired[i].pipeline);
+                fast_retired[i] = fast_retired.back();
+                fast_retired.pop_back();
+            } else {
+                i++;
+            }
+    }
+    for (const VkPipeline pl : go) vkDestroyPipeline(dev.device, pl, nullptr);
+    st_fast_given_back += (int64_t)go.size();
+}
+/// old: the linked pipeline the full build just took the place of (the exchange is seq_cst, as the draws' loads)
+void fast_retire(VkPipeline old) {
+    const uint64_t at = vk_values_handed_out();
+    st_fast_replaced++;
+    {
+        std::lock_guard lk(fast_retired_mu);
+        fast_retired.push_back({at, old});
+    }
+    fast_reap();
+}
+
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
@@ -2311,9 +2354,10 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     auto job = std::make_shared<Job>();
     job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo, job->cold[0] = cold[0], job->cold[1] = cold[1];
     jobs_push([job] {
-        // (over a linked one, which is left alone: draws recorded with it may still be on their way)
+        // (over a linked one, which goes once the GPU is past every submission that may have bound it: fast_retire)
         use_counters.made_how = 0;
-        if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
+        if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo))
+            if (const VkPipeline linked = job->e->pipeline.exchange(full)) fast_retire(linked);
         job->e->how.store(use_counters.made_how, std::memory_order_relaxed);
         job->e->ready.store(true, std::memory_order_release);
         // (the cold libraries after it and behind what is queued, with no flag: the draw waits for the pipeline above, and
@@ -9662,9 +9706,12 @@ void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms) {
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms) {
     *pending_skips = st_pending_skips, *waits = st_waits, *wait_ms = st_wait_ms;
 }
-bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms) {
+bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms,
+                 int64_t* fast_replaced, int64_t* fast_given_back) {
+    fast_reap();
     *links = st_links.load(), *link_ms = st_link_us.load() / 1000.0, *lib_hits = st_lib_hits.load(), *lib_cold = st_lib_cold.load();
     *lib_built = st_lib_built.load(), *lib_build_ms = st_lib_build_us.load() / 1000.0;
+    *fast_replaced = st_fast_replaced.load(), *fast_given_back = st_fast_given_back.load();
     return gpl_wanted();
 }
 std::mutex rec_mu;

@@ -128,7 +128,8 @@ def check_source(draw):
     if job.index("job->e->ready.store(true") > job.index("gpl_build_cold("):
         raise SystemExit("the cold libraries are handed to the workers before the pipeline the draw waits for is ready")
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    if "if (draw_stats4(&links, &link_ms, &lib_hits, &lib_cold, &lib_built, &lib_build_ms))" not in replay:
+    if ("if (draw_stats4(&links, &link_ms, &lib_hits, &lib_cold, &lib_built, &lib_build_ms, &fast_replaced, "
+            "&fast_given_back))") not in replay:
         raise SystemExit("the links, the libraries had and cold and the workers' builds of them are not in the frame statistics, "
                          "or are there without stage libraries too")
     cold = between(draw, "void gpl_build_cold(", "\n}\n")

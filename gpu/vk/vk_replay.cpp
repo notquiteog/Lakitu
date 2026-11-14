@@ -2949,6 +2949,7 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
 uint64_t vk_retirement_value() {
     return timeline && signaled != UINT64_MAX ? signaled + 1 : 0;
 }
+uint64_t vk_values_handed_out() { return q_values.load(); }
 
 /// A submission or a wait came back VK_ERROR_DEVICE_LOST. Nothing sent from here on runs, and the replay kept going: no
 /// submission completed again, so no capture or staging arena was let go, and system memory filled until the window was
@@ -3165,15 +3166,16 @@ void log_frame_stats() {
         static int64_t l_pskip, l_pwaits;
         static double l_pwait_ms;
         static int64_t l_reused, l_saves;
-        int64_t links = 0, lib_hits = 0, lib_cold = 0, lib_built = 0;
+        int64_t links = 0, lib_hits = 0, lib_cold = 0, lib_built = 0, fast_replaced = 0, fast_given_back = 0;
         double link_ms = 0, lib_build_ms = 0;
         static int64_t l_links;
         static double l_link_ms;
-        char libs[256] = "";   // (the stage libraries' part of the line, with RX_VK_GPL only: other logs keep the line they had)
-        if (draw_stats4(&links, &link_ms, &lib_hits, &lib_cold, &lib_built, &lib_build_ms))
+        char libs[384] = "";   // (the stage libraries' part of the line, with RX_VK_GPL only: other logs keep the line they had)
+        if (draw_stats4(&links, &link_ms, &lib_hits, &lib_cold, &lib_built, &lib_build_ms, &fast_replaced, &fast_given_back))
             snprintf(libs, sizeof libs, "; %.2f library links tried (%.2f ms), %lld libraries the driver had and %lld cold in all; "
-                     "%lld of the cold built by workers (%.0f ms)", (links - l_links) / 120.0, (link_ms - l_link_ms) / 120.0,
-                     (long long)lib_hits, (long long)lib_cold, (long long)lib_built, lib_build_ms);
+                     "%lld of the cold built by workers (%.0f ms); %lld linked pipelines replaced by full builds, %lld given back",
+                     (links - l_links) / 120.0, (link_ms - l_link_ms) / 120.0, (long long)lib_hits, (long long)lib_cold,
+                     (long long)lib_built, lib_build_ms, (long long)fast_replaced, (long long)fast_given_back);
         {
             static int64_t p0, b0, u0, ss0, t0, sa0, i0;
             logf("vk: a frame: %lld bind_gen moves: program %.1f, many-binds %.1f, ubo %.1f, ssbo %.1f, tex %.1f, samp %.1f, img %.1f",

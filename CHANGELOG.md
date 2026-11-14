@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.0-rc.4](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.3...v2.3.0-rc.4) (2026-11-13)
+
+
+### Bug Fixes
+
+* **vk:** destroy a linked pipeline once its full build has replaced it ([#23](https://github.com/notquiteog/Hookshot/issues/23)) ([a9edafd](https://github.com/notquiteog/Hookshot/commit/a9edafda6b713fe41aae959e59665342a1b6afc8))
+* **vk:** leave the overlays out of a frame, not crash, when their buffer cannot be made ([#24](https://github.com/notquiteog/Hookshot/issues/24)) ([23c3609](https://github.com/notquiteog/Hookshot/commit/23c360923f0dce516131002f357ab5a4d7ff67bc))
+
 ## [2.3.0-rc.3](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.2...v2.3.0-rc.3) (2026-11-13)
 
 

@@ -45,6 +45,7 @@ import kit
 import lifted_c
 import rtgen
 import logo_rgba
+import imgui_backend
 import ui_fonts
 import toolchain
 import version
@@ -1461,9 +1462,13 @@ def main():
         imgui_deps = b"".join(open(os.path.join(d, f), "rb").read() for d in (imgui, os.path.join(imgui, "backends"), zbic)
                               for f in sorted(os.listdir(d)) if f.endswith(".h"))
         imgui_users = ("vk_imgui.cpp", "vk_menu.cpp")
-        for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
-            vk_jobs.append((cxx, os.path.join(imgui, *f.split("/")),
-                            os.path.join(obj_dir, "vk_imgui_" + os.path.basename(f)[:-4] + ".o"), vflags + imgui_flags, imgui_deps))
+        for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp"):
+            vk_jobs.append((cxx, os.path.join(imgui, f), os.path.join(obj_dir, "vk_imgui_" + f[:-4] + ".o"), vflags + imgui_flags,
+                            imgui_deps))
+        # (its Vulkan back end from a copy of the build's own with nx2/imgui_backend.py's changes: third_party stays upstream's)
+        vk_jobs.append((cxx, imgui_backend.write(os.path.join(gen_dir, "imgui")),
+                        os.path.join(obj_dir, "vk_imgui_imgui_impl_vulkan.o"),
+                        vflags + imgui_flags + ["-I" + os.path.join(imgui, "backends")], imgui_deps))
         # (zstd's decoder and encoder: third_party/zbic's single file, built below with the program cache's zstd; it serves
         # the game's font files too, so the decompression-only third_party/zstd is not built as well)
         # (the bundled fonts, compiled in: nx2/ui_fonts.py's file of the build's own)

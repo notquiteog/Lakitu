@@ -118,6 +118,8 @@ class ShaderStampCacheTests(unittest.TestCase):
             # (the back end's branch makes its logo header and fonts file itself since #1567: no files written here)
             "logo_rgba": SimpleNamespace(write=lambda path: ""),
             "ui_fonts": SimpleNamespace(write=lambda path: None),
+            # (the ImGui back end's copy with nx2/imgui_backend.py's changes: here the fixture's file, copied as it is)
+            "imgui_backend": SimpleNamespace(write=self.imgui_backend_copy),
             "NGX_SDK": ngx,   # ("": no NVIDIA NGX SDK, vk_dlss.cpp built without DLSS, as by default)
             "NGX_MSVC_RT": "vk_ngx_msvc_rt.cpp",
             "FSR": fsr,   # (HOOKSHOT_FSR=1: vk_fsr4.cpp built with AMD FSR 4)
@@ -129,6 +131,12 @@ class ShaderStampCacheTests(unittest.TestCase):
             return {str(Path(src).relative_to(self.root)).replace("\\", "/"):
                     {"key": namespace["object_key"](src, flags, deps), "flags": flags}
                     for _, src, _, flags, deps in namespace["vk_jobs"]}
+
+    def imgui_backend_copy(self, out_dir):
+        out = Path(out_dir) / "imgui_impl_vulkan.cpp"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes((self.root / "third_party/imgui/backends/imgui_impl_vulkan.cpp").read_bytes())
+        return str(out)
 
     def changed(self, before, after):
         self.assertEqual(before.keys(), after.keys())

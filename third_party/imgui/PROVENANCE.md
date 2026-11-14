@@ -8,3 +8,6 @@ Settings are given as compiler defines by nx2/build.py, not by editing imconfig.
 Used by gpu/vk/vk_imgui.cpp and vk_menu.cpp: the Insert menu, the FPS counter and the start-up screen, drawn over the
 window's image. ImGui's own widgets and input are not used: the menu draws on its draw lists and keeps its own keys, gamepad
 and mouse. Textures go to the GPU through vk_imgui.cpp's own copies, not the backend's (which waits on the queue).
+The renderer compiles the Vulkan back end from a copy made at build time with the changes in `nx2/imgui_backend.py`
+(a buffer that cannot be made leaves the frame's draw out instead of copying through a null mapping; after NX2navi by
+chrg6, commit 18aa16f, with its author's permission); this folder stays unmodified.
