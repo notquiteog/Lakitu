@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.3.0-rc.8](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.7...v2.3.0-rc.8) (2026-11-14)
+
+
+### Bug Fixes
+
+* **linux:** a headless run ends on SIGINT and SIGTERM again ([#27](https://github.com/notquiteog/Hookshot/issues/27)) ([0602531](https://github.com/notquiteog/Hookshot/commit/0602531e4d9129a1114f26dae67f88600e75c07b))
+
+## [2.3.0-rc.7](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.6...v2.3.0-rc.7) (2026-11-14)
+
+
+### Features
+
+* a game profile, chosen by main's build id, holds what is one game's ([#10](https://github.com/notquiteog/Hookshot/issues/10)) ([99f0ee9](https://github.com/notquiteog/Hookshot/commit/99f0ee9739da9c3a6235e9999af641fc254aefb0))
+
+
+### Bug Fixes
+
+* answer random bytes and the default display resolution a game asks for at start ([#9](https://github.com/notquiteog/Hookshot/issues/9)) ([4513f91](https://github.com/notquiteog/Hookshot/commit/4513f913ff3fe4f1b9cf1caf5227618d997fe3f3))
+* **hid:** answer GetNpadState, the single-state controller read ([#8](https://github.com/notquiteog/Hookshot/issues/8)) ([4e9ff07](https://github.com/notquiteog/Hookshot/commit/4e9ff0772139731c5af2e537e0970554e5d701e4))
+* **lift:** bind R_AARCH64_TLSDESC relocations to a host stop instead of refusing the game ([#7](https://github.com/notquiteog/Hookshot/issues/7)) ([1b9a277](https://github.com/notquiteog/Hookshot/commit/1b9a2778a940c969c0a6b29c50fce4966b1d1b28))
+
 ## [2.3.0-rc.6](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.5...v2.3.0-rc.6) (2026-11-14)
 
 
