@@ -50,6 +50,7 @@ PY = [sys.executable, "-I", "-u", "-X", "utf8"]   # (utf8: every step's output i
 STARTED = time.time()   # (the build's total time, kept in build_times.json and said as @@times)
 sys.path[:0] = [HERE, os.path.join(ROOT, "third_party", "a64-kit", "tools")]   # (python -I leaves the script folder off)
 import game_profile   # noqa: E402  (which builds have a game profile, nx2/game_profile.py)
+import game_folders   # noqa: E402  (each game's own folders beside the default game's, nx2/game_folders.py)
 # The default game's build, as the docs quote it (Ocarina's e0f3ccfa: the version its patches, the hot list and the
 # profile were made from). Which builds are accepted is the game profiles' list (supported_build), not this one.
 BUILD_ID = game_profile.GAMES[game_profile.DEFAULT].build_id[:8]
@@ -615,9 +616,9 @@ def check_cpu():
              "instead (see the readme): a source build follows your processor." % m)
 
 
-def check(a, work):
-    check_windows_sdk(work)   # (first: said in plain words when the game is chosen, not after it has been read)
-    check_cpu()
+def dump_build_id(a, work):
+    """main's build id of the copy a names (a .nup: only its exefs unpacked, to work/probe and gone again; a folder: read
+    where it lies)"""
     if a.nup:
         probe = os.path.join(work, "probe")
         shutil.rmtree(probe, ignore_errors=True)
@@ -625,8 +626,30 @@ def check(a, work):
         check_modules(os.path.join(probe, "exefs"))
         bid = build_id(os.path.join(probe, "exefs", "main"))
         shutil.rmtree(probe, ignore_errors=True)
-    else:
-        bid = build_id(os.path.join(a.exefs, "main"))
+        return bid
+    return build_id(os.path.join(a.exefs, "main"))
+
+
+def game_folders_for_dump(a):
+    """(--prepare with no --out) The game folder and the work folder of the game the copy is: the dump decides the game
+    (game_profile.for_build), and a game other than the default one builds beside it in <folder>-<key>, with a work
+    folder <work>-<key> when the work folder is the builder's own (nx2/game_folders.py). The default game's are the ones
+    it always had. A copy no profile knows is left to check_supported_build, which refuses it as before."""
+    profile = supported_build(dump_build_id(a, a.work))
+    if profile is None:
+        return
+    a.out = game_folders.folder(a.out, profile.key)
+    if os.path.abspath(a.work) == os.path.abspath(a.default_work):
+        a.work = game_folders.folder(a.work, profile.key)
+        os.makedirs(a.work, exist_ok=True)
+    if profile.key != game_profile.DEFAULT:
+        print("%s: its own game folder %s" % (profile.game, a.out), file=sys.stderr if PREPARE else sys.stdout, flush=True)
+
+
+def check(a, work):
+    check_windows_sdk(work)   # (first: said in plain words when the game is chosen, not after it has been read)
+    check_cpu()
+    bid = dump_build_id(a, work)
     if supported_build(bid):   # (a build some game profile knows: nx2/game_profile.py)
         say("check", "ok", "This is the version Hookshot supports (build %s)." % bid[:8])
     else:
@@ -2060,6 +2083,8 @@ def parse_args():
                    help="with --fsr (Windows): download AMD's FSR runtime (scripts/ffx_sdk.py) and put it in the game folder")
     p.add_argument("--accept-amd-license", action="store_true", help="AMD's FSR SDK license, accepted (with --fetch-fsr-runtime)")
     a = p.parse_args()
+    # (--prepare with no --out: the default game's folder below, and main makes it the copy's game's: game_folders_for_dump)
+    a.out_from_game = bool(a.prepare and not a.out)
     if a.prepare:   # (first: a bad --game below is said as RecompLauncher's "error" line)
         global PREPARE
         PREPARE = True
@@ -2182,6 +2207,8 @@ def main(a=None):
         a.out = a.update
     if not a.out or not (a.update or a.nup or (a.romfs and a.exefs)):
         fail("needs --out, and --nup or --romfs with --exefs")
+    if getattr(a, "out_from_game", False) and not a.update:   # (--prepare, no --out: the game's own folder)
+        game_folders_for_dump(a)
     out = os.path.abspath(a.out)
     work = os.path.abspath(a.work)
     a.language = build_language(a, out)   # (now: the folder's own language.txt is still the one the player left)

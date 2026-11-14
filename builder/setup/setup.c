@@ -976,18 +976,57 @@ static int launch_installed(const wchar_t *args) {
 
 /* (RecompLauncher's Play) --play <game folder>: bin\hookshot.exe there, started like the game folder's launcher starts it but without
    its update question, and waited for, so the launcher knows when the session ends. */
-static int play_folder(const wchar_t *args) {
-    wchar_t folder[MAX_PATH], cmd[MAX_PATH + 32];
+/* (hookshot) The default game's profile key (nx2/game_profile.py DEFAULT): its folder takes no suffix, so Ocarina's
+   stays where it always was (nx2/game_folders.py). tests/test_launcher_games.py holds the two the same. */
+#ifndef HOOKSHOT_DEFAULT_GAME
+#define HOOKSHOT_DEFAULT_GAME "oot"
+#endif
+#define HOOKSHOT_DEFAULT_GAME_W HOOKSHOT_WIDEN(HOOKSHOT_DEFAULT_GAME)
+
+/* --play <folder> [--game <key>]: the folder to start, into folder (cap characters). The launcher's games[] add
+   --game <key> after start.args' --play <folder>: the default game's folder is <folder>, another game's <folder>-<key>
+   (nx2/game_folders.py). 0, or -1 for a key that is not one (a to z, 0 to 9, 1 to 16 of them); folder is then "". */
+static int play_target(const wchar_t *args, wchar_t *folder, size_t cap) {
     while (*args == L' ') args++;
     const int quoted = *args == L'"';
     size_t k = 0;
-    for (args += quoted; *args && !(quoted ? *args == L'"' : *args == L' ') && k + 1 < MAX_PATH; ) folder[k++] = *args++;
+    for (args += quoted; *args && !(quoted ? *args == L'"' : *args == L' ') && k + 1 < cap; ) folder[k++] = *args++;
     folder[k] = 0;
+    if (quoted && *args == L'"') args++;
+    while (*args == L' ') args++;
+    if (wcsncmp(args, L"--game", 6) || (args[6] != L' ' && args[6])) return 0;
+    args += 6;
+    while (*args == L' ') args++;
+    wchar_t key[17];
+    size_t n = 0;
+    for (; *args && *args != L' '; args++) {
+        if (n == 16 || !((*args >= L'a' && *args <= L'z') || (*args >= L'0' && *args <= L'9'))) { folder[0] = 0; return -1; }
+        key[n++] = *args;
+    }
+    key[n] = 0;
+    if (!n) { folder[0] = 0; return -1; }
+    if (!wcscmp(key, HOOKSHOT_DEFAULT_GAME_W) || !k) return 0;
+    while (k && (folder[k - 1] == L'\\' || folder[k - 1] == L'/')) folder[--k] = 0;
+    if (k + 1 + n + 1 > cap) { folder[0] = 0; return -1; }
+    folder[k++] = L'-';
+    wcscpy(folder + k, key);
+    return 0;
+}
+
+static int play_folder(const wchar_t *args) {
+    wchar_t folder[MAX_PATH], cmd[MAX_PATH + 32];
+    const int bad_key = play_target(args, folder, MAX_PATH) < 0;
+    const size_t k = wcslen(folder);
     swprintf(cmd, MAX_PATH + 32, L"\"%ls\\bin\\hookshot.exe\"", folder);
     _wputenv_s(L"HOOKSHOT_NO_UPDATE_CHECK", L"1");
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
     DWORD code = 1;
+    if (bad_key) {
+        g_headless = 1;
+        say_error(L"--game takes a game's key: a to z and 0 to 9, up to 16 of them.");
+        return 2;
+    }
     if (!k || !CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, folder, &si, &pi)) {
         g_headless = 1;
         say_error(L"No built game to start. Build it first (the game folder needs bin\\hookshot.exe).");

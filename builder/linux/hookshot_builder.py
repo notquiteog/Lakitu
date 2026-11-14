@@ -1542,9 +1542,21 @@ class Builder(tk.Tk):
         self.destroy()
 
 
+def play_folder_for(folder, game):
+    """--play <folder> --game <key>: that game's own folder, <folder> for the default game and <folder>-<key> for another
+    (nx2/game_folders.py, the rule builder/linux/hookshot-launch and builder/setup/setup.c keep too)"""
+    if not game or not folder:
+        return folder
+    sys.path.insert(0, os.path.join(ROOT, "nx2"))
+    import game_folders
+    return game_folders.folder(folder, game)
+
+
 def main():
     if "--play" in sys.argv[1:]:
-        folder = _arg("--play") or load_config().get("out")
+        given = _arg("--play")
+        given = None if given and given.startswith("--") else given   # (--play --game <key>: the saved folder, that game's)
+        folder = play_folder_for(given or load_config().get("out"), _arg("--game"))
         if game_ready(folder):
             play(folder)
             return
