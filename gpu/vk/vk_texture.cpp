@@ -1288,11 +1288,21 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         return false;
     }
     std::vector<uint8_t> scratch;
+    // (hookshot, smoothness) the BC1/BC3 choice below reads the blocks where they came from, as they are copied: the staging
+    // arena is write-combined memory (or VRAM through the BAR), and reading it back on the CPU took 10-160 ms for one 1-2K
+    // texture and 12-14 s for a 2048 x 2048 x 68 array (Mario Kart World's races and course loads, the replay thread)
+    const bool choose_bc = tex.bc && !tex.bc_resized && linear_twin(tex.format) != VK_FORMAT_BC7_UNORM_BLOCK && bc1_on();
+    astc_opaque::Scan sc;
     for (size_t k = 0; k < layers.size(); k++) {
         const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;
         if (at >= total) continue;
         const uint64_t n = std::min(tail, total - at);
-        std::memcpy(s.data + k * tail, guest_bytes(tex.gpu + at, n, scratch), n);
+        const uint8_t* src = guest_bytes(tex.gpu + at, n, scratch);
+        std::memcpy(s.data + k * tail, src, n);
+        if (choose_bc && !sc.alpha) {
+            const astc_opaque::Scan part = astc_opaque::scan(src, n);
+            sc.opaque += part.opaque, sc.empty += part.empty, sc.alpha += part.alpha;
+        }
     }
     const uint64_t staged = tail * layers.size();
     flush_mapped_range(s.allocation, s.offset, staged);   // (encoded blocks read by the GPU decoder, not necessarily coherent)
@@ -1300,10 +1310,9 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     VkCommandBuffer cmd = upload_cmd();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
-    if (tex.bc && !tex.bc_resized && linear_twin(tex.format) != VK_FORMAT_BC7_UNORM_BLOCK && bc1_on()) {   // (hookshot: BC1 for a
-        // texture whose blocks are all opaque, astc_opaque.h; a BC7 image, RX_VK_ASTC_BC7's, stays BC7)
+    if (choose_bc) {   // (hookshot: BC1 for a texture whose blocks are all opaque, astc_opaque.h; a BC7 image, RX_VK_ASTC_BC7's,
+        // stays BC7; sc: its blocks, read as they were copied above)
         const bool is_bc1 = tex.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-        const astc_opaque::Scan sc = astc_opaque::scan(s.data, staged);
         if (is_bc1 && sc.alpha) {   // (new contents with alpha: BC3 again, every layer uploaded into it)
             if (bc_reformat(tex, VK_FORMAT_BC3_UNORM_BLOCK)) {
                 tex.bc1 = 1;
