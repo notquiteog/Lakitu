@@ -64,7 +64,15 @@ struct Texture {
     VkImageType type = VK_IMAGE_TYPE_2D; VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     uint32_t layers = 2; struct { uint64_t layer_size = 1536; } L;
     uint64_t gpu = 0;
+    // (the BC1/BC3 choice's inputs, read in the gather since the scan moved onto the copy's source: not kept as BC here)
+    bool bc = false, bc_resized = false; VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
 };
+VkFormat linear_twin(VkFormat f) { return f; }
+bool bc1_on() { return false; }
+namespace astc_opaque {
+struct Scan { uint64_t opaque = 0, alpha = 0, empty = 0; };
+Scan scan(const uint8_t*, uint64_t) { require(false, "no scan: the fixture's textures are not kept as BC"); return {}; }
+}  // namespace astc_opaque
 struct { uint64_t offset = 0; } geo;
 auto level_geo(const Texture&, int) { return geo; }
 bool astc_ready() { return true; }
