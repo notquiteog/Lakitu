@@ -52,8 +52,9 @@ Discord: https://discord.gg/rexed
 > filled in with numbers that look plausible &mdash; a wrong address there is a crash or silent corruption. On
 > 2026-11-13 a `HOOKSHOT_GAME=mkw` build of a 1.0.0 dump lifted, compiled and reached the animated title screen
 > on Linux with an RTX 5060 Ti; driven headless through the control bridge (L+R, Single Player, Grand Prix, Mushroom
-> Cup, 50cc), it plays the cup's opening and a whole first race (three laps, the results) and goes into the cup's
-> second race ([tested configurations](docs/tested-configurations.md)). Not tried: a whole cup, other modes, a
+> Cup, 50cc, accelerate held), it plays the cup's opening and three of its four races to their results; the fourth
+> was on its second lap when the 25-minute run ended, slowed from the third race on to 2-35 fps by the game's threads
+> waiting for virtual cores ([tested configurations](docs/tested-configurations.md)). Not tried: other modes, a
 > window, a real controller, sound.
 >
 > Since Hookshot's game profile (#10) the dump decides the game: a Mario Kart World 1.0.0 copy builds as Mario Kart
