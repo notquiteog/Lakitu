@@ -64,8 +64,6 @@ class BuildHarness:
                                           askokcancel=lambda title, text: True),
             # (the hard drive warning is asked first: these builds are on a folder that is not a hard drive)
             "slow_disk_warning": lambda folder: None,
-            # (the names the builder shows, which it takes from the game profile: nx2/game_profile.py)
-            "PRODUCT": "Builder", "GAME": "a game",
             "save_config": lambda cfg: self.events.append(("save", dict(cfg))),
             "time": SimpleNamespace(time=lambda: 123.0),
             "subprocess": SimpleNamespace(Popen=start_process, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT),
@@ -156,7 +154,7 @@ class BuilderBuildJobsTests(unittest.TestCase):
         self.assertFalse(hasattr(harness.gui, "proc"))
         self.assertEqual(len(harness.events), 1)
         kind, title, message = harness.events[0]
-        self.assertEqual((kind, title), ("error", "Builder"))   # (the PRODUCT the harness supplies: the project's name)
+        self.assertEqual((kind, title), ("error", "Hookshot"))
         self.assertIn("HOOKSHOT_JOBS", message)
         self.assertIn("0 for automatic", message)
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": raw, "RX_JOBS": "2"})

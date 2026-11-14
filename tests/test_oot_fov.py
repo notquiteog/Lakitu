@@ -45,10 +45,10 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(self.install(words=words), (0, {}))
 
     def test_lift_and_menu_wiring(self):
-        # (Lakitu: the lift installs the game profile's modules, oot_fov among Ocarina's, before discovery)
-        import game_profile
-        self.assertIn("oot_fov", game_profile.OOT.patch_modules)
         lift = (ROOT / "nx2/lift.py").read_text(encoding="utf-8")
+        # installed through Ocarina's game profile, which lift.py installs before it discovers functions
+        import game_profile
+        self.assertIn("oot_fov", game_profile.GAMES["oot"].patch_modules)
         self.assertLess(lift.index("game_profile.install_patches("), lift.index("L.discover("))
         menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
         api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")

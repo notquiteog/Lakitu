@@ -49,7 +49,6 @@ def check(cond, what):
 
 
 FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
-#include "game_profile.h"   /* (the graphics module's offsets realtime_step reads: game/game_profile.h, the oot profile) */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,7 +238,7 @@ def main():
     check("V-Sync" in row and "real time" in row, "the row's help does not say Uncapped keeps real time and V-Sync limits it")
 
     vi = (ROOT / "host" / "nn_vi.c").read_text(encoding="utf-8")
-    host = "\n".join(block(vi, m) for m in ("static int gfx_have(", "static float text_scale(", "static float camera_scale(", "static int fps_max(void) {",
+    host = "\n".join(block(vi, m) for m in ("static float text_scale(", "static float camera_scale(", "static int fps_max(void) {",
                                              "int hos_vi_native_interval(", "static int realtime_rate(", "static void realtime_step("))
     # (the option ids realtime_step names: vk_api.h's HOS_OPT_* enums)
     opts = "\n".join(re.findall(r"enum \{ HOS_OPT_[^}]*\};", (ROOT / "gpu" / "vk" / "vk_api.h").read_text(encoding="utf-8")))
@@ -249,8 +248,9 @@ def main():
         c = Path(tmp) / "fixture.c"
         exe = Path(tmp) / "fixture.exe"
         c.write_text(fixture, encoding="utf-8")
-        subprocess.run([a.cc, "-std=c11", "-include", ENV_ON_H, "-I", str(ROOT / "game"), "-Wall", "-Wextra", "-Werror", str(c),
-                        "-o", str(exe)], check=True)
+        # (realtime_step reads the graphics module's offsets from the game profile, the committed one Ocarina's)
+        subprocess.run([a.cc, "-std=c11", "-include", ENV_ON_H, "-include", str(ROOT / "game" / "game_profile.h"), "-Wall",
+                        "-Wextra", "-Werror", str(c), "-o", str(exe)], check=True)
         for mode, cap, step, index in (("cap 120", "120", None, None), ("cap 60", None, None, None), ("step off", "120", "0", None),
                                        ("no hook", "120", None, None), ("uncapped", None, None, "6"), ("uncapped", "1000", None, None),
                                        ("unknown index", None, None, "8"), ("cap 120", None, None, "2"), ("clock log", "60", None, None),

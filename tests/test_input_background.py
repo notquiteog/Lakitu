@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
          "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
          "pads-insert",
-         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty")
+         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty", "single-state")
 
 
 def main():
@@ -96,7 +96,8 @@ static void player_used(void) {}
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
         block(hid, "static void mouse_buttons_arm("), block(hid, "static int bound_down("),
         block(hid, "static void oc_notes("), block(hid, "static uint64_t oc_pad_word("),
-        block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
+        block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states("),
+        block(hid, "static void npad_state_one("), block(hid, "static void npad_state_absent(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")
                                   for name in ("hos_title_input", "hos_frame_step_buttons"))

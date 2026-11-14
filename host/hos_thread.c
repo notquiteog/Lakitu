@@ -5,6 +5,7 @@
    there. TPIDRRO_EL0 (thread-local region): 0x200 bytes; the SDK's nn::os keeps the current ThreadType* at
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
+#include "game_profile.h"   /* (the return addresses below are the game profile's) */
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/hookshot_env.h"
 #endif
@@ -318,6 +319,15 @@ void hos_log(const char *fmt, ...) {
     fflush(stderr);
 }
 
+/* The resolver every R_AARCH64_TLSDESC descriptor is bound to (nx2/image.py: thread-local storage descriptors are not
+   implemented). x0 is the descriptor, whose second word nx2/image.py set to its own address. Called only when the game
+   first reaches that thread-local variable: the run stops there and says which one it was, rather than going on with an
+   offset nobody worked out. */
+HLE(hos_tlsdesc_unsupported) {
+    hos_fatal(c, "a thread-local variable reached through a TLS descriptor at %#llx (lr %#llx): TLS descriptors "
+              "(R_AARCH64_TLSDESC) are not implemented, see nx2/image.py", (unsigned long long)c->x[0],
+              (unsigned long long)c->x[30]);
+}
 void hos_fatal(Ctx *c, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -1319,11 +1329,15 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
    into guest memory itself, so the sleep looks at it between yields (its virtual core given up) and ends once it is
    1, at the latest when the asked time is up. Only where the poll is nvnEventGetValue. HOS_PRESENT_POLL=1 (an
    experiment: no fps change measured, and it keeps a core busy while it looks) */
+/* the present poll's SleepThread, by the game profile's return address; a profile without one has none */
+static int is_present_poll(uint64_t lr) {
+    return GAME_HAVE_LR_PRESENT_POLL && lr == GAME_LR_PRESENT_POLL && hos_game_profile_live();
+}
 static int present_poll(Ctx *c, int64_t ns) {
     static int on = -1;
     static uint64_t fn_ok, fn_bad;
     if (on < 0) on = getenv("HOS_PRESENT_POLL") && atoi(getenv("HOS_PRESENT_POLL")) != 0;
-    if (!on || c->x[30] != 0x80590520 || ns <= 0 || ns > 20000000) return 0;
+    if (!on || !is_present_poll(c->x[30]) || ns <= 0 || ns > 20000000) return 0;
     const uint64_t fp = G64(c->x[24]);
     if (fp != fn_ok) {
         if (fp == fn_bad) return 0;
@@ -1358,13 +1372,13 @@ _Thread_local int64_t hos_slept_ns[2];
 static void slept_since(uint64_t lr, int64_t t0) {
     if (!t0) return;
     const int64_t d = hos_now_ns() - t0;
-    if ((lr & ~1ull) == 0x80590520) InterlockedAdd64(&hos_poll_slept_ns, d);
+    if (is_present_poll(lr & ~1ull)) InterlockedAdd64(&hos_poll_slept_ns, d);
     else hos_slept_ns[1] += d;
 }
 HLE(_ZN2nn2os11SleepThreadENS_8TimeSpanE) {
     const int64_t t0 = hos_fps_timing ? hos_now_ns() : 0;
     if (present_poll(c, (int64_t)ARG(0))) { slept_since(c->x[30], t0); return; }
-    if (c->x[30] == 0x80590520 && env_on("HOS_SLEEP_LOG")) {   /* (hookshot, diagnostic: OoT's present poll) */
+    if (is_present_poll(c->x[30]) && env_on("HOS_SLEEP_LOG")) {   /* (hookshot, diagnostic: OoT's present poll) */
         static int logged;
         if (logged++ < 3) {
             const char *hos_hostcall_name(uint64_t addr);
@@ -1426,9 +1440,10 @@ HLE(_ZN2nn2os13GetSystemTickEv) {
     static int on = -1;
     if (on < 0) on = env_on("HOS_TICK_LOG");
     if (on) tick_log(c->x[30]);
-    /* (hookshot) The graphics module: x19 at its frame-end clock read (main+0x346c770 is after the bl), for nn_vi.c's
-       real-time step */
-    if (c->x[30] == 0x8348c770) hos_gfx_module = c->x[19];
+    /* (hookshot) The graphics module: x19 at its frame-end clock read, for nn_vi.c's real-time step. The
+       return address is the game profile's (Ocarina's main+0x346c770, after the bl), and only in the build it is for:
+       on any other game the same number is an unrelated call, and nn_vi.c would write ints into whatever x19 held */
+    if (GAME_HAVE_LR_GFX_CLOCK && c->x[30] == GAME_LR_GFX_CLOCK && hos_game_profile_live()) hos_gfx_module = c->x[19];
     RET(hos_ticks());
 }
 HLE(_ZN2nn2os22GetSystemTickFrequencyEv) { RET(HOS_TICK_HZ); }

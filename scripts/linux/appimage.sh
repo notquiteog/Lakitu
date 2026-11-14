@@ -1,9 +1,9 @@
 #!/bin/bash
-# The Linux AppImage: the builder with everything it needs to build the game on the player's PC. No game data and
+# The Linux AppImage: Hookshot Builder with everything it needs to build the game on the player's PC. No game data and
 # nothing made from it is in it: the game is built from the player's own copy, as on Windows.
 #
 #   scripts/linux/deps.sh        (first: the compiler, Python, FFmpeg, SDL2, headers into build-linux/deps)
-#   scripts/linux/appimage.sh    -> build-linux/<the project's name>-<version>-x86_64.AppImage and its .zsync
+#   scripts/linux/appimage.sh    -> build-linux/Hookshot-<version>-x86_64.AppImage and its .zsync
 # The same image builds the game and, with --play, starts the one it saved.
 #
 # Built on the oldest system it is for (CI: Ubuntu 22.04): the sysroot it carries is that system's C library, so the
@@ -46,7 +46,7 @@ T=$APPDIR/usr/share/hookshot
 L=$APPDIR/usr/lib/hookshot
 
 # ---- the tools (the sources the player's build compiles, and the scripts) ----
-# (game/: the game profile's header, nx2/build.py GAME)
+# (game/: the game profile's C view, nx2/game_profile.py, which the runtime and the back end compile with)
 cp -a nx2 host game scripts LICENSE readme.md assets "$T/"
 printf '%s
 ' "$VERSION" > "$T/VERSION"   # (no git history in here: nx2/version.py reads the release name from it)
@@ -96,7 +96,7 @@ for d in "$DEPS"/cpm/*/*; do
     mkdir -p "$T/cpm/${d#"$DEPS/cpm/"}"
     cp -a "$d/include" "$T/cpm/${d#"$DEPS/cpm/"}/"
 done
-cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides the project)
+cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides Hookshot)
 # ---- the licences of the third-party parts compiled into hookshot_vk.so (tests/test_appimage_licenses.py) ----
 mkdir -p "$T/licenses/imgui" "$T/licenses/zstd" "$T/licenses/libertinus"
 cp third_party/imgui/LICENSE.txt third_party/imgui/PROVENANCE.md "$T/licenses/imgui/"

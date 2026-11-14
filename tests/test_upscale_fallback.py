@@ -21,7 +21,6 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'gpu/vk/vk_draw.
 
 PREFIX = r'''
 #define _CRT_SECURE_NO_WARNINGS
-#include "game_profile.h"   // (the game profile's TAAU key prefixes: game/game_profile.h, the oot profile)
 
 #include <algorithm>
 #include <atomic>
@@ -262,15 +261,16 @@ def main():
     parser.add_argument('--cxx', default='clang++')
     args = parser.parse_args()
     text = args.source.read_text(encoding='utf-8')
-    # (the game profile's TAAU key, which upscale_stub asks: the real function, over game/game_profile.h)
-    body = block(text, 'static bool profile_taau_key(') + '\n' + block(text, 'bool upscale_stub(')
+    # the game profile's keys, as production reads them: its helpers and the committed game/game_profile.h
+    body = '\n'.join((block(text, 'const char* profile_keys('), block(text, 'static bool key_listed('),
+                      block(text, 'bool upscale_stub(')))
     env = os.environ.copy()
     env.pop('RX_VK_NO_UPSCALE_STUB', None)
     with tempfile.TemporaryDirectory(prefix='upscale-fallback-') as tmp:
         tmp = Path(tmp)
         source = tmp / 'check.cpp'
         exe = tmp / ('check.exe' if os.name == 'nt' else 'check')
-        source.write_text(PREFIX + body + SUFFIX, encoding='utf-8')
+        source.write_text('#include "game_profile.h"\n' + PREFIX + body + SUFFIX, encoding='utf-8')
         if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
             command = [args.cxx, '/nologo', '/std:c++20', "/FI" + ENV_ON_H, '/I' + str(ROOT / 'game'), '/EHsc', '/UNDEBUG', str(source),
                        '/Fo' + str(tmp / 'check.obj'), '/Fe' + str(exe)]

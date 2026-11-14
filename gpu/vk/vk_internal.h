@@ -404,6 +404,8 @@ int driver_faults();   // (hookshot, vk_draw.cpp) the driver faults the pipeline
 void prepare_left_workers_note();   // (hookshot, vk_draw.cpp) predict_run or precompile_run left workers inside the driver
 bool prepare_left_workers();
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
+// the game profile's program keys: the runtime's (HOOKSHOT_PROFILE_*), else the built-in header's (vk_draw.cpp)
+const char* profile_keys(const char* runtime, const char* built);
 
 } // namespace mkwvk
 

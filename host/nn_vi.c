@@ -2,6 +2,7 @@
    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
+#include "game_profile.h"   /* (the graphics module's offsets, below) */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*, HOS_OPT_CAMERA_SPEED: the Insert menu's HDR and Camera speed, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,26 +12,6 @@
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/hookshot_env.h"
 #endif
-
-/* (hookshot) Where the frame limiter, the nominal frame rate, the variable-refresh gate and the engine's adaptive
-   controller sit inside the game's graphics module. These are offsets into one game's engine object, found by
-   reading that game's code, so they belong to the game profile (game/game_profile.h, generated from
-   nx2/game_profile.py) and not to this file. A profile that does not know one of them says so, and the pacing that
-   needed it is simply off: gfx_have() below logs the missing field once and every reader checks it first. That is
-   deliberately not the same as guessing an offset, which would have this code write ints into the middle of some
-   other object every frame. */
-#include "game_profile.h"
-
-static int gfx_have(int have, const char *what) {
-    static const char *said[8];
-    static int n;
-    if (have) return 1;   /* (the ordinary case: no cost at all) */
-    for (int i = 0; i < n; i++)
-        if (!strcmp(said[i], what)) return 0;
-    if (n < (int)(sizeof said / sizeof said[0])) said[n++] = what;
-    hos_log("vi: the %s game profile has no %s offset in the graphics module: left alone", GAME_PROFILE_KEY, what);
-    return 0;
-}
 
 void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
 void hos_system_event_signal(uint64_t key);
@@ -108,9 +89,8 @@ HLE(_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE) {
 /* (hookshot) HOS_DISPLAY_VRR=1: tell the game the display does variable refresh.
  *
  * This is what holds the frame rate at 60, and it took three experiments to find. The game's
- * limiter (the profile's frame limiter; Ocarina's +0xfc) is written by f_804fc0f0, which stores a
- * rate only when a mode is 1, the rate is 40 or more, and the profile's variable-refresh gate byte
- * (Ocarina's +0x232) is set. That byte reads 0, and raising the limiter or the
+ * limiter at +0xfc is written by f_804fc0f0, which stores a rate only when a mode is 1, the rate is
+ * 40 or more, and the byte at +0x232 is set. That byte reads 0, and raising the limiter or the
  * engine's controller words from outside does not stick: the game writes them back every frame,
  * because it believes the display cannot do better. It believes that because this very function
  * answered no, and because SetDisplay120HzRefreshRateCapability and
@@ -265,8 +245,7 @@ static void scan_dt(long long presents) {
     hos_log("vi: scan %s: %zu floats", name, hits);
 }
 /* (hookshot) Game time follows the clock. The engine steps every frame by ratio = 60 / <the graphics module's nominal fps,
-   an int at the offset the game profile calls the nominal frame rate, Ocarina's +0x2c8> (main+0x6e6cc4, f_83b6e300
-   makes seconds = ratio / 60 and the rest), so at 50 fps the game ran at 83%
+   an int at +0x2c8> (main+0x6e6cc4, f_83b6e300 makes seconds = ratio / 60 and the rest), so at 50 fps the game ran at 83%
    speed: walking the same 8 s at 52 and 33 fps went as far as those rates. Each present writes the rate of the last 5
    display intervals there, the rounding error carried to the next frame so that no time is lost; a step is at most
    1/15 s, as TotK Recomp's frame_rate.c (slower frames slow the game down, as on the console), at least 1/60 s (the game's
@@ -413,27 +392,24 @@ static void realtime_step(int64_t now) {
     }
     const uint64_t mod = hos_gfx_module;
     if (!mod) return;
-    {   /* (hookshot) The frame limiter (for Ocarina +0xfc, which f_8042cd20 sleeps to 1 / of; the offset itself is
-           the game profile's). The engine's adaptive controller writes it when variable refresh is on
-           (f_804fc0f0), any rate from 40 up. HOS_FPS_TARGET=<fps>: that rate kept, 0: left alone;
+    /* The offsets below are the game profile's (game/game_profile.h; Ocarina's +0xfc, +0x231, +0x232, +0x2c8
+       and +0x270). A module is only captured for a profile that names them all (host/hos_thread.c, and
+       host/game_profile_check.h stops a build that names the module and not its offsets), so they are used as they
+       are. */
+    static const unsigned ctl_words[] = GAME_GFX_CONTROLLER_WORDS, ctl_rate_words[] = GAME_GFX_CONTROLLER_RATE_WORDS;
+    {   /* (hookshot) The frame limiter (f_8042cd20 sleeps to 1 / +0xfc). The engine's adaptive controller writes +0xfc when
+           variable refresh is on (+0x231, f_804fc0f0), any rate from 40 up. HOS_FPS_TARGET=<fps>: that rate kept, 0: left alone;
            HOS_FPS_LOG=1: what the game asks for, every 300 presents */
         static int target = -1, log_on = -1;
         static long long n;
         if (target < 0) target = getenv("HOS_FPS_TARGET") ? atoi(getenv("HOS_FPS_TARGET")) : 0, log_on = env_on("HOS_FPS_LOG");
-        int *const limit = gfx_have(GAME_GFX_HAVE_FRAME_LIMITER, "frame limiter")
-                               ? (int *)GP(mod + GAME_GFX_FRAME_LIMITER) : NULL;
-        if (limit && log_on && !(n++ % 300)) {
-            /* (the controller's words in one line, however many of them the profile names) */
-            static const unsigned words[] = GAME_GFX_CONTROLLER_WORDS;
-            char tail[128] = "";
-            if (GAME_GFX_HAVE_CONTROLLER)
-                for (int i = 0, at = 0; i < GAME_GFX_CONTROLLER_WORD_COUNT && at < (int)sizeof tail - 16; i++)
-                    at += snprintf(tail + at, sizeof tail - at, " %d",
-                                   *(int *)GP(mod + GAME_GFX_CONTROLLER + words[i]));
-            hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller%s", *limit,
-                    GAME_GFX_HAVE_VRR_MODE ? *(uint8_t *)GP(mod + GAME_GFX_VRR_MODE) : 0,
-                    GAME_GFX_HAVE_VRR_GATE ? *(uint8_t *)GP(mod + GAME_GFX_VRR_GATE) : 0,
-                    GAME_GFX_HAVE_NOMINAL_FPS ? *(int *)GP(mod + GAME_GFX_NOMINAL_FPS) : 0, tail);
+        int *limit = (int *)GP(mod + GAME_GFX_FRAME_LIMITER);
+        if (log_on && !(n++ % 300)) {
+            char ctl[96] = "";   /* (the controller's words, as many as the profile names) */
+            for (int i = 0, at = 0; i < GAME_GFX_CONTROLLER_WORD_COUNT && at < (int)sizeof ctl - 16; i++)
+                at += snprintf(ctl + at, sizeof ctl - at, " %d", *(int *)GP(mod + GAME_GFX_CONTROLLER + ctl_words[i]));
+            hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x%x..%s", *limit, *(uint8_t *)GP(mod + GAME_GFX_VRR_MODE),
+                    *(uint8_t *)GP(mod + GAME_GFX_VRR_GATE), *(int *)GP(mod + GAME_GFX_NOMINAL_FPS), ctl_words[0], ctl);
         }
         if (log_on && !((n - 1) % 300) && hos_step_probe) {   /* (game speed: the game clock's 1/60 s units a second of wall time, 60.0 at speed 1) */
             static double clock_before;
@@ -447,41 +423,34 @@ static void realtime_step(int64_t now) {
             }
             clock_before = game_clock, at_before = now;
         }
-        if (limit && target && *limit > 0 && *limit < target) *limit = target;
-        /* (hookshot) EXPERIMENT, HOS_FPS_FORCE=1: raising the limiter alone does not hold. With variable
+        if (target && *limit > 0 && *limit < target) *limit = target;
+        /* (hookshot) EXPERIMENT, HOS_FPS_FORCE=1: raising +0xfc alone does not hold. With variable
            refresh on the engine's adaptive controller writes it back every frame, so a run with
            HOS_FPS_TARGET=120 logs "frame limiter 60" at every sample and presents a locked 60. This
            also raises the three controller words that sample read as 60, and the nominal rate, to
            see whether the rate the controller settles on is what caps the frame. Unknown engine
            fields written every frame: opt-in, and off by default for that reason. */
-        if (limit && target && env_on("HOS_FPS_FORCE")) {
-            /* f_804fc0f0 is what stores a rate into the limiter, and it does so only when a mode is
-               1, the rate is 40 or more, and the profile's variable-refresh gate byte is set. The
-               sample prints that pair as "vrr %d %d": the mode is 1 here and the gate is 0, so the
-               store never runs and the limiter keeps the 60 it has, whatever the controller words
-               say. Setting it lets the game's own code take a higher rate. */
-            if (gfx_have(GAME_GFX_HAVE_VRR_GATE, "variable-refresh gate")) {
-                uint8_t *const gate = (uint8_t *)GP(mod + GAME_GFX_VRR_GATE);
-                if (!*gate) *gate = 1;
-            }
-            /* NOT the nominal rate. The real-time frame step below owns that word, and the engine
-               steps game time by 60 / it: forcing it to 165 while the game renders at 57 steps time
-               by 0.36 a frame, which is slow motion on screen. Reported from a real run, and the
-               commit that added this block had already warned it changed two things at once. That
-               is why the profile keeps the controller's rate words apart from the ones it only
-               logs, rather than raising everything it knows about. */
-            if (gfx_have(GAME_GFX_HAVE_CONTROLLER, "adaptive controller")) {
-                static const unsigned rate_words[] = GAME_GFX_CONTROLLER_RATE_WORDS;
-                for (int i = 0; i < GAME_GFX_CONTROLLER_RATE_WORD_COUNT; i++) {
-                    int *const word = (int *)GP(mod + GAME_GFX_CONTROLLER + rate_words[i]);
-                    if (*word > 0 && *word < target) *word = target;
-                }
+        if (target && env_on("HOS_FPS_FORCE")) {
+            /* f_804fc0f0 is what stores a rate into +0xfc, and it does so only when a mode is 1,
+               the rate is 40 or more, and the byte at +0x232 is set. The sample prints that pair as
+               "vrr %d %d": +0x231 is 1 here and +0x232 is 0, so the store never runs and +0xfc
+               keeps the 60 it has, whatever the controller words say. Setting it lets the game's
+               own code take a higher rate. */
+            uint8_t *const gate = (uint8_t *)GP(mod + GAME_GFX_VRR_GATE);
+            if (!*gate) *gate = 1;
+            /* NOT +0x2c8. The real-time frame step above owns that word, and the engine steps
+               game time by 60 / it: forcing it to 165 while the game renders at 57 steps time by
+               0.36 a frame, which is slow motion on screen. Reported from a real run, and the
+               commit that added this block had already warned it changed two things at once. */
+            /* (the profile keeps these apart from the words it only logs: Ocarina's +0x58, +0x28, +0x2c) */
+            for (int i = 0; i < GAME_GFX_CONTROLLER_RATE_WORD_COUNT; i++) {
+                int *const word = (int *)GP(mod + GAME_GFX_CONTROLLER + ctl_rate_words[i]);
+                if (*word > 0 && *word < target) *word = target;
             }
         }
-        if (limit && fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
-        if (limit && fps_max() == 30 && *limit > 30) *limit = 30;
+        if (fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
+        if (fps_max() == 30 && *limit > 30) *limit = 30;
     }
-    if (!gfx_have(GAME_GFX_HAVE_NOMINAL_FPS, "nominal frame rate")) return;   /* (no real-time step without it) */
     /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time. Only at a cap of 60: other caps
        keep the real-time step whatever that row says, so 30 fps does not run at half speed) */
     if (!rx_option(0, 1) && fps_max() == 60) {
@@ -507,7 +476,7 @@ static void realtime_step(int64_t now) {
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
     /* (hookshot) A cap other than 60: the engine's own rate is 60 / <whole display intervals>, and its controller puts 60 back over a
-       higher nominal rate (the profile's GAME_GFX_NOMINAL_FPS) before the step is made from it, so every frame still stepped 1/60 s and the game ran fps / 60 times too fast.
+       higher +0x2c8 before the step is made from it, so every frame still stepped 1/60 s and the game ran fps / 60 times too fast.
        The step is then the frames' own time at the two places the engine makes it (nx2/oot_patches.py, hos_frame_seconds_bits):
        this same average, at most 1/15 s as below and at least 1/240 s (a 1000th uncapped: a shorter frame stepped a 240th ran the
        game fast), and the rate under it stays the engine's, 60 at most.

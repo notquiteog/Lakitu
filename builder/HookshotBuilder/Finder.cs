@@ -102,7 +102,7 @@ static class Finder
                 sl.SetPath(exe);
                 sl.SetWorkingDirectory(gameFolder);
                 sl.SetIconLocation(icon, 0);
-                sl.SetDescription("Mario Kart World, built by Lakitu");
+                sl.SetDescription("The Legend of Zelda: Ocarina of Time, built by Hookshot");
                 Directory.CreateDirectory(Path.GetDirectoryName(link)!);
                 ((System.Runtime.InteropServices.ComTypes.IPersistFile)sl).Save(link, true);
             }

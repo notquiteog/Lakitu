@@ -86,7 +86,7 @@ def main():
         (tmp / "driver.c").write_text(DRIVER, encoding="utf-8")
         exe = tmp / "reopen"
         subprocess.run([a.cc, "-std=gnu11", "-D_GNU_SOURCE", "-w", "-I", str(tmp), "-I", str(ROOT / "host/posix"),
-                        "-I", str(ROOT / "host"), "-I", str(ROOT / "game"), str(tmp / "driver.c"), str(tmp / "hos_sdl.c"),
+                        "-I", str(ROOT / "host"), str(tmp / "driver.c"), str(tmp / "hos_sdl.c"),
                         str(ROOT / "host/posix/win32_posix.c"), "-o", str(exe), "-lpthread", "-ldl", "-lm"], check=True)
         env = dict(os.environ, SDL_AUDIODRIVER="dummy", SDL_AUDIO_DRIVER="dummy")
         r = subprocess.run([str(exe)], capture_output=True, text=True, env=env, timeout=60)

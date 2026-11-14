@@ -52,12 +52,14 @@ Discord: https://discord.gg/rexed
 > filled in with numbers that look plausible &mdash; a wrong address there is a crash or silent corruption. On
 > 2026-11-13 a `HOOKSHOT_GAME=mkw` build of a 1.0.0 dump lifted, compiled and reached the animated title screen
 > on Linux with an RTX 5060 Ti; driven headless through the control bridge (L+R, Single Player, Grand Prix, Mushroom
-> Cup, 50cc), it plays the cup's opening and the first race on Mario Bros. Circuit, and the kart drives
-> ([tested configurations](docs/tested-configurations.md)). Not tried: a whole race or cup, other modes, a window, a
-> real controller, sound.
+> Cup, 50cc), it plays the cup's opening and a whole first race (three laps, the results) and goes into the cup's
+> second race ([tested configurations](docs/tested-configurations.md)). Not tried: a whole cup, other modes, a
+> window, a real controller, sound.
 >
-> So: the default build is still the Ocarina one (`HOOKSHOT_GAME=oot`), and everything below about installing and
-> playing describes that. A Mario Kart World build is `HOOKSHOT_GAME=mkw` from source. "[What a Mario Kart World build still
+> Since Hookshot's game profile (#10) the dump decides the game: a Mario Kart World 1.0.0 copy builds as Mario Kart
+> World (main's build id picks the `mkw` profile; `HOOKSHOT_GAME=mkw` still forces it), its saves in
+> `$XDG_DATA_HOME/hookshot-mkw`. Everything below about installing and playing was written for Ocarina, the default
+> where there is no dump to go by. "[What a Mario Kart World build still
 > needs](#what-a-mario-kart-world-build-still-needs)" lists what has to be found first.
 
 > [!IMPORTANT]
@@ -125,10 +127,10 @@ Somebody with a Mario Kart World dump has to find, in roughly this order:
    limits, its romfs layout, its movies. That is stage S3 onwards in the [design notes](docs/design.md), and it is
    the same work for any new game.
 
-Until step 1, `HOOKSHOT_GAME=mkw` builds and runs: it simply has no patches, no pacing fields and no special shader
+Until step 1, a Mario Kart World build runs: it simply has no patches, no pacing fields and no special shader
 keys. That is deliberate. An unknown offset is a feature that is off; a *wrong* offset is a crash or silently
 corrupted memory in somebody's game, which is why the profile holds `None` rather than a plausible number, and why
-every patch site carries the instruction word it expects and is skipped when the game does not have it there.
+every patch site checks the instruction word it expects and is skipped when the game does not have it there.
 
 ## Install and play
 

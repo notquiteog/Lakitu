@@ -11,13 +11,10 @@ The sites and what each does come from NX2navi's recomp/patches-v111.txt, where 
 "The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF"); the picture and scene size sites are the same
 constants that file names; the save picture's site is Hookshot's own (issue 952). Here each is written as C after the
 original instruction instead of a replacement of it.
-Each site's original instruction word is checked by nx2/game_profile.py's install_sites: another game version leaves
-the site out (and says so). This module belongs to the "oot" profile, which is what names it (nx2/game_profile.py);
-every offset below is relative to that profile's main base, so it cannot be reused for another game.
+Each site's original instruction word is checked: another game version leaves the site out (and says so).
 """
-import game_profile
 
-MAIN = game_profile.OOT.main_base   # (main's base in this image: nx2/eden_image.py; the profile is where it is written down)
+MAIN = 0x80020000   # (main's base in this image: nx2/eden_image.py)
 UI_M00, UI_M11 = "(2.0f / 3840.0f)", "(2.0f / 2160.0f)"   # (the UI's full-screen orthographic projection, 3840x2160 grid)
 # (the screens whose UI keeps the whole picture: the item-wheel and pause / system menu backgrounds redraw a capture of
 # the whole picture; the event and loading fades cover it. Bit k of host/hos_main.c's hos_wide_keep_mask keeps screen k
@@ -97,6 +94,19 @@ SITES = (
 )
 
 
-def install(lifter, img, profile=None):
-    """The sites into lifter.after, each checked against the instruction word the game has at it."""
-    return game_profile.install_sites(lifter, img, profile or game_profile.OOT, SITES, "widescreen")
+def install(lifter, img):
+    """The sites into lifter.after; a site whose word differs (another game version) is left out"""
+    n = 0
+    for off, word, text in SITES:
+        pc = MAIN + off
+        try:
+            have = img.word(pc)
+        except Exception:
+            have = None
+        if have != word:
+            print("widescreen: main+%#x holds %s, not %08x: left out" % (off, "?" if have is None else "%08x" % have, word))
+            continue
+        lifter.after[pc] = text
+        n += 1
+    print("widescreen: %d of %d sites" % (n, len(SITES)))
+    return n

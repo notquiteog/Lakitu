@@ -9,6 +9,11 @@
    Environment: HOS_TRACE=1 (log HLE calls), HOS_MEMORY_MB (memory the game is told it has),
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
+#include "game_profile.h"   /* (the game this runtime is compiled for) */
+#ifndef GAME_SAVES_DIR   /* (a header from before the saves had a folder per game: two games would share one) */
+#error "game_profile.h has no GAME_SAVES_DIR: emit it again (python -I nx2/game_profile.py --emit-header), or lift again"
+#endif
+#include "game_profile_check.h"
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/hookshot_env.h"
 #endif
@@ -75,6 +80,58 @@ static void no_power_throttling(void) {
 #endif
 
 int hos_game_is_mkw(void) { return !strcmp(hos_main_build_id, "d00e4f399e411d0613aa8d26b1c02fef"); }
+
+/* Whether the image this runs is the build the game profile was compiled for (game_profile.h, from
+   nx2/game_profile.py; a lift writes the dump's own). Every return address and offset the profile names is that
+   build's, so none of them is recognised in any other: a runtime built for one game and started on another, or built
+   from the committed header without a lift, recognises nothing rather than something that only looks the same. The
+   build ids are compared as far as the image's goes (gen/hos_image.c's is main's NSO build id, which may be shorter
+   than the 40 digits nx2/dump.py prints), and at least 16 digits of it. */
+int hos_game_profile_live(void) {
+    static int live = -1;
+    if (live < 0) {
+        size_t n = strlen(hos_main_build_id);
+        if (n > sizeof GAME_BUILD_ID - 1) n = sizeof GAME_BUILD_ID - 1;
+        live = GAME_HAVE_BUILD_ID && n >= 16 && !strncmp(hos_main_build_id, GAME_BUILD_ID, n);
+    }
+    return live;
+}
+
+/* (its own line, after the log's first: hos_game_profile_live is first asked in game_profile_env, before stderr is
+   hookshot_log.txt, and a line written then never reached a player's log) */
+static void game_profile_log(void) {
+    hos_log(hos_game_profile_live() ? "game profile: %s (%s), main %s"
+                                    : "game profile: %s (%s) is not for main %s: none of its addresses, offsets or "
+                                      "program keys are used",
+            GAME_PROFILE_KEY, GAME_NAME, hos_main_build_id);
+}
+
+/* The renderer is built once for every game (the AppImage's and a build's alike) with the committed
+   profile's program keys as its defaults; the runtime is compiled for its game. So the runtime hands the renderer its
+   profile's keys before the renderer reads any: HOOKSHOT_PROFILE_* are not switches a player sets (hookshot_env.txt's
+   RX_VK_TAAU_KEYS and RX_VK_NETWORK_KEEP still stand over them), only this channel. An image the profile is not for
+   gets no keys at all. "None" is written "-", which every reader of these lists takes as none: an empty value would
+   do on Linux, but on Windows _putenv("X=") removes X, and the renderer then took its built-in (Ocarina's) keys. */
+static void game_profile_env(void) {
+    const int live = hos_game_profile_live();
+    char gameplay[18 * (GAME_GAMEPLAY_NETWORK_KEY_COUNT + 1)] = "";
+    static const unsigned long long keys[] = GAME_GAMEPLAY_NETWORK_KEYS;
+    for (int i = 0, at = 0; live && i < GAME_GAMEPLAY_NETWORK_KEY_COUNT; i++)
+        at += snprintf(gameplay + at, sizeof gameplay - at, "%s%016llx", i ? "," : "", keys[i]);
+    const char *const vars[][2] = {{"HOOKSHOT_PROFILE_TAAU_KEYS", live ? GAME_UPSCALE_TAAU_KEYS : ""},
+                                   {"HOOKSHOT_PROFILE_NETWORK_KEEP", live ? GAME_NETWORK_KEEP_KEYS : ""},
+                                   {"HOOKSHOT_PROFILE_GAMEPLAY_KEYS", gameplay}};
+    for (size_t i = 0; i < sizeof vars / sizeof *vars; i++) {
+        const char *value = *vars[i][1] ? vars[i][1] : "-";
+#ifdef _WIN32
+        char line[512];
+        snprintf(line, sizeof line, "%s=%s", vars[i][0], value);
+        _putenv(line);
+#else
+        setenv(vars[i][0], value, 1);
+#endif
+    }
+}
 
 /* gen/hos_image.c (build.py lift) */
 extern const uint64_t hos_main_stack_size;
@@ -269,7 +326,8 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
 }
 
 #ifndef _WIN32
-/* (linux) Saves live in $XDG_DATA_HOME/hookshot (~/.local/share/hookshot), so a rebuilt game folder still finds them.
+/* (linux) Saves live in $XDG_DATA_HOME/hookshot (~/.local/share/hookshot; another game's in hookshot-<key>, below), so a
+   rebuilt game folder still finds them.
    A user/ folder beside the executable from before is moved there the first time, entry by entry. Anything that
    cannot be moved keeps the old place. --user still wins.
    A symbolic link in it, to saves the player keeps elsewhere (a synced folder, another drive), is made again in the
@@ -375,6 +433,14 @@ static void delete_tree(const char *p) {
     }
     RemoveDirectoryA(p);
 }
+/* Each game's saves in a folder of its own: game_profile.h's GAME_SAVES_DIR, Ocarina's "hookshot" and any other game's
+   "hookshot-<profile key>". The save folder has no word of which game wrote it, and the forks of this engine all used
+   "hookshot", so a second game's first run wrote into Ocarina's saves (DK Bananza fork, 4f417fd7 and 58d94fb4). The
+   fallback is for tests/test_linux_saves_move.py, which compiles this code alone; the runtime's own build stops above
+   on a header without the name. */
+#ifndef GAME_SAVES_DIR
+#define GAME_SAVES_DIR "hookshot"
+#endif
 static const char *saves_dir(const char *beside) {
     static char dir[MAX_PATH];
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
@@ -386,7 +452,7 @@ static const char *saves_dir(const char *beside) {
         snprintf(dir, sizeof dir, "%s/.local/share", home);
     } else return beside;
     CreateDirectoryA(dir, NULL);
-    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/hookshot");
+    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/" GAME_SAVES_DIR);
     CreateDirectoryA(dir, NULL);
     if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
     char pattern[MAX_PATH];
@@ -1808,6 +1874,7 @@ static int game_main(int argc, char **argv) {
         hos_relaunch_keep_env();
     }
     load_hookshot_env();
+    game_profile_env();
 #endif
     occlusion_switch();
     {
@@ -1857,6 +1924,7 @@ static int game_main(int argc, char **argv) {
         }
     }
     hos_log("hookshot %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */
+    game_profile_log();
     removed_switch_notes();
     void hos_control_start(const char *version);
     hos_control_start(HOOKSHOT_VERSION);   /* (HOS_CONTROL=<socket>: the control bridge, host/control.c) */
@@ -2112,6 +2180,7 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+    game_profile_env();
     driver_cache_room();
     driver_cache_folder();
     game_argc = argc, game_argv = argv;

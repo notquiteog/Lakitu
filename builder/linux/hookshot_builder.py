@@ -1,4 +1,4 @@
-"""The builder for Linux: what builder/HookshotBuilder (WPF) is on Windows, in Tk. It runs nx2/make_game.py and
+"""Hookshot Builder for Linux: what builder/HookshotBuilder (WPF) is on Windows, in Tk. It runs nx2/make_game.py and
 follows its @@ lines (make_game.py's docstring), then offers to start the game. The AppImage starts it (builder/linux/AppRun),
 with the compiler, sysroot and libraries it brings in the environment.
 
@@ -30,12 +30,6 @@ import linux_update  # noqa: E402  (the release check and the part download)
 import make_game  # noqa: E402  (LANGUAGES, BUILD_ID)
 import pipeline_share  # noqa: E402  (Save my pipeline list: the zip for the "Submit your pipelines" issue)
 import toolchain  # noqa: E402  (default_jobs: RX_JOBS)
-import game_profile  # noqa: E402  (the project's name and the game this build is for: nx2/game_profile.py)
-
-# The names shown to the player, from the one place that holds them. The builder is the project, not the game, so
-# its own name is PRODUCT and the game it builds is GAME.
-PRODUCT = game_profile.PROJECT
-GAME = game_profile.active().game
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hookshot", "builder.ini")
 STAGES = {"read": "Reading your game files", "lift": "Translating the game to PC code", "compile": "Compiling",
@@ -306,7 +300,7 @@ def desktop_exec(path):
     return '"%s"' % escaped.replace("%", "%%")
 
 
-APP_ID = "io.github.NotRexed.Lakitu"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
+APP_ID = "io.github.NotRexed.Hookshot"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
 
 
 def add_to_menu(folder):
@@ -320,9 +314,9 @@ def add_to_menu(folder):
     apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "applications")
     os.makedirs(apps, exist_ok=True)
     with open(os.path.join(apps, "hookshot.desktop"), "w", encoding="utf-8") as f:
-        f.write("[Desktop Entry]\nType=Application\nName=%s\nComment=%s, built from your copy\n"
+        f.write("[Desktop Entry]\nType=Application\nName=Hookshot\nComment=The Legend of Zelda: Ocarina of Time, built from your copy\n"
                 "Exec=%s\nPath=%s\nIcon=%s\nCategories=Game;\nTerminal=false\nStartupWMClass=%s\n"
-                % (PRODUCT, GAME, desktop_exec(os.path.join(folder, "hookshot")), folder, icon, APP_ID))
+                % (desktop_exec(os.path.join(folder, "hookshot")), folder, icon, APP_ID))
 
 
 def free_gb(path):
@@ -501,7 +495,7 @@ def _arg(name):
 class Builder(tk.Tk):
     def __init__(self, launch=None, update=None, fetched=False, tag=None, allow_downgrade_from=None):
         super().__init__()
-        self.title(PRODUCT + " Builder")
+        self.title("Hookshot Builder")
         self.apply_scale()
         self.apply_theme()
         self.minsize(self.px(760), min(self.px(520), self.winfo_screenheight() * 2 // 3))   # (scaled up, no taller than the screen)
@@ -529,7 +523,7 @@ class Builder(tk.Tk):
         self.nup = tk.StringVar(value=self.cfg.get("nup", ""))
         self.romfs = tk.StringVar(value=self.cfg.get("romfs", ""))
         self.exefs = tk.StringVar(value=self.cfg.get("exefs", ""))
-        self.out = tk.StringVar(value=self.cfg.get("out", os.path.expanduser("~/Games/" + PRODUCT)))
+        self.out = tk.StringVar(value=self.cfg.get("out", os.path.expanduser("~/Games/Hookshot")))
         names = [n for _, n in make_game.LANGUAGES]
         code = self.cfg.get("language", "en-US")
         self.language = tk.StringVar(value=dict(make_game.LANGUAGES).get(code, names[0]))
@@ -844,7 +838,7 @@ class Builder(tk.Tk):
 
     # ---- the form ----
     def show_form(self):
-        self.title(PRODUCT + " Builder")
+        self.title("Hookshot Builder")
         if self.page:
             self.page.destroy()
         px = self.px
@@ -861,7 +855,7 @@ class Builder(tk.Tk):
         f.columnconfigure(1, minsize=px(20))
         f.columnconfigure(2, minsize=px(200))
         ttk.Label(f, text="Build your game", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(f, text="Pick your game files and where the game goes. %s does the rest, once." % PRODUCT, style="Sub.TLabel",
+        ttk.Label(f, text="Pick your game files and where the game goes. Hookshot does the rest, once.", style="Sub.TLabel",
                   wraplength=px(800)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(px(6), 0))
         if game_ready(self.cfg.get("out")):
             played = ttk.Frame(f)
@@ -1117,7 +1111,7 @@ class Builder(tk.Tk):
             self.status.set("Update builds your game again %s NVIDIA DLSS."
                             % ("with" if self.dlss.get() else "without"))
         elif self.mode == "update-game":
-            self.status.set(PRODUCT + " %s is available. Your game is %s. Update downloads only what changed, then compiles what changed."
+            self.status.set("Hookshot %s is available. Your game is %s. Update downloads only what changed, then compiles what changed."
                             % (target, game))
         elif self.mode == "up-to-date" and linux_update.older_version(target, game):
             self.status.set("Your game is %s, newer than this builder's update target %s. Play keeps this version; "
@@ -1127,7 +1121,7 @@ class Builder(tk.Tk):
         elif self.mode == "up-to-date":
             self.status.set("%s is the latest version." % game)
         elif self.mode == "update-builder":
-            self.status.set(PRODUCT + " Builder %s is available (this one is %s). Update it first, then build." % (target, self.tools or "this one"))
+            self.status.set("Hookshot Builder %s is available (this one is %s). Update it first, then build." % (target, self.tools or "this one"))
         else:
             self.status.set("")
 
@@ -1143,20 +1137,20 @@ class Builder(tk.Tk):
             self.launch_status.set("Update available: %s" % target)
             show = True
         elif target and game and game != target:
-            self.launch_status.set("%s is out. Build this folder again with %s Builder to get it." % (target, PRODUCT))
+            self.launch_status.set("%s is out. Build this folder again with Hookshot Builder to get it." % target)
         elif game and self.latest is None:
             self.launch_status.set("Up to date with this builder (GitHub did not answer)")
         elif game:
             self.launch_status.set("Up to date")
         else:
-            self.launch_status.set("Could not check for updates (GitHub did not answer)" if self.latest is None else PRODUCT)
+            self.launch_status.set("Could not check for updates (GitHub did not answer)" if self.latest is None else "Hookshot")
         if hasattr(self, "launch_update"):
             self.launch_update.pack(side="right", padx=self.px(4)) if show else self.launch_update.pack_forget()
 
     def show_launch(self, folder):
         if self.page:
             self.page.destroy()
-        self.title(PRODUCT)
+        self.title("Hookshot")
         px = self.px
         page = self.page = ttk.Frame(self)
         page.pack(fill="both", expand=True)
@@ -1166,11 +1160,8 @@ class Builder(tk.Tk):
         f = ttk.Frame(page, padding=(px(48), px(24), px(48), px(56)))
         f.pack(fill="both", expand=True)
         ttk.Frame(f, width=px(800), height=0).pack()
-        # (the game's name from its profile: a series over the title when the name has one, "The Legend of Zelda: ...")
-        series, _, title = GAME.rpartition(": ")
-        if series:
-            ttk.Label(f, text=series.upper(), style="Section.TLabel").pack()
-        ttk.Label(f, text=title, style="Display.TLabel").pack(pady=(px(4), 0))
+        ttk.Label(f, text="THE LEGEND OF ZELDA", style="Section.TLabel").pack()
+        ttk.Label(f, text="Ocarina of Time", style="Display.TLabel").pack(pady=(px(4), 0))
         ttk.Label(f, text=folder, style="Sub.TLabel", wraplength=px(600), justify="center").pack(pady=(px(8), 0))
         self.launch_status = tk.StringVar(value="Checking for updates...")
         ttk.Label(f, textvariable=self.launch_status, style="Note.TLabel", wraplength=px(600), justify="center").pack(pady=(px(16), 0))
@@ -1217,7 +1208,7 @@ class Builder(tk.Tk):
         downgrade_from = have if linux_update.older_version(target, have) else None
         if folder is not None:
             self.update_folder = folder
-        self.show_progress("Updating your game" if self.update_folder else "Updating the " + PRODUCT + " Builder")
+        self.show_progress("Updating your game" if self.update_folder else "Updating Hookshot Builder")
         folder = self.update_folder
         # (a game older than this builder is built again with it: nothing to download, and GitHub need not answer. So is one
         # from a builder that is not an older release, e.g. from the Actions tab: issue 902)
@@ -1303,20 +1294,20 @@ class Builder(tk.Tk):
         out = os.path.expanduser(self.out.get().strip())
         if self.kind.get() == "nup":
             if not os.path.isfile(self.nup.get()):
-                return messagebox.showerror(PRODUCT, "Choose your game's .nup file.")
+                return messagebox.showerror("Hookshot", "Choose your game's .nup file.")
             src = ["--nup", self.nup.get()]
         else:
             if not (os.path.isdir(self.romfs.get()) and os.path.isdir(self.exefs.get())):
-                return messagebox.showerror(PRODUCT, "Choose your game's romfs and exefs folders.")
+                return messagebox.showerror("Hookshot", "Choose your game's romfs and exefs folders.")
             src = ["--romfs", self.romfs.get(), "--exefs", self.exefs.get()]
         if not out:
-            return messagebox.showerror(PRODUCT, "Choose where to save the game.")
+            return messagebox.showerror("Hookshot", "Choose where to save the game.")
         try:
             jobs = make_game.requested_jobs(os.environ.get("HOOKSHOT_JOBS"))
             if jobs is None and os.environ.get("RX_JOBS"):   # (the older setting, still honoured)
                 jobs = toolchain.default_jobs()
         except ValueError as error:
-            return messagebox.showerror(PRODUCT, str(error))
+            return messagebox.showerror("Hookshot", str(error))
         code = next((c for c, n in make_game.LANGUAGES if n == self.language.get()), "en-US")
         dlss = bool(self.dlss.get()) if hasattr(self, "dlss") else False
         self.cfg.update(kind=self.kind.get(), nup=self.nup.get(), romfs=self.romfs.get(), exefs=self.exefs.get(), out=out, language=code,
@@ -1545,7 +1536,7 @@ class Builder(tk.Tk):
 
     def close(self):
         if self.proc and self.proc.poll() is None:
-            if not messagebox.askyesno(PRODUCT, "Stop the build and close?"):
+            if not messagebox.askyesno("Hookshot", "Stop the build and close?"):
                 return
             os.killpg(self.proc.pid, signal.SIGTERM)
         self.destroy()

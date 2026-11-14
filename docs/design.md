@@ -1,23 +1,9 @@
-# Lakitu (mkw fork of Hookshot): design
+# Hookshot (oot-recomp): design
 
-A native x86-64 Windows and Linux build of a Switch 2 title: the game's AArch64 code translated to C ahead of time
-from the user's own decrypted dump and compiled with clang, the Horizon OS and NVN2 implemented natively, and the
-GPU work replayed on Vulkan. No CPU or GPU emulation at any point: the same model as mkw-recomp (Mario Kart World),
-which Hookshot forked and retargeted to Ocarina of Time.
-
-> **Read this document as the Ocarina record.** It is Hookshot's design notes, and everything in it below section 1
-> was measured on, and reasoned about, Ocarina of Time: it is the history of how this engine was brought up on one
-> game, which is exactly why it is worth keeping while the same engine is pointed back at Mario Kart World. What is
-> general (sections 3, 4, 7, 8) applies to any game; what names addresses, builds, frame rates or areas (sections 5,
-> 6, 9, 10, 11) is Ocarina's and holds for the `oot` game profile only.
->
-> **Lakitu** is the fork that takes this engine back to Mario Kart World. Nothing of Mario Kart World has been
-> dumped, lifted, built or booted here, so the `mkw` game profile holds no measured value at all. What exists is the
-> seam: everything game-specific is named in one place (`nx2/game_profile.py`, and `game/game_profile.h` generated
-> from it), with Ocarina's values as the `oot` profile and an honestly empty `mkw` profile beside it. The readme's
-> "What a Mario Kart World build still needs" lists, in order, what somebody with a dump has to find. Unknown values
-> are `None` and the features that need them are off; a plausible-looking address would be a crash or silent
-> corruption.
+A native x86-64 Windows and Linux build of the Switch 2 *The Legend of Zelda: Ocarina of Time* remake: the game's AArch64
+code translated to C ahead of time from the user's own decrypted dump and compiled with clang, the Horizon OS and
+NVN2 implemented natively, and the GPU work replayed on Vulkan. No CPU or GPU emulation at any point: the same
+model as mkw-recomp (Mario Kart World), which this project forks.
 
 This document is the plan. The numbers in it that depend on the binaries are filled in from the dump (section 9);
 until it exists they are marked *dump*.
@@ -136,8 +122,7 @@ second game.
    with `scripts/prof.py`).
 
 Also inherited, and game-specific in MKW: MKW's frame-pacer hooks at fixed guest addresses are gated on MKW's build
-id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by address coincidence. The game profile is
-where that kind of value belongs now (section 8).
+id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by address coincidence.
 
 ## 5. What OoT needs that MKW did not (checked on the dump, 2026-11-04)
 
@@ -176,13 +161,6 @@ where that kind of value belongs now (section 8).
   profiler (`HOS_SAMPLE` + `scripts/prof.py`), and Eglantine as the A/B reference for what a frame should look like.
 
 ## 8. Rules
-
-- **Game-specific values go in the game profile, not in the code that uses them** (`nx2/game_profile.py`; the C side
-  reads `game/game_profile.h`, generated from it and committed). That covers patch sites, the base `main` loads at,
-  offsets into the game's own modules, and shader program keys. A value the profile does not know is `None`, and the
-  code it guards leaves its field alone and says so once: an unknown offset is a feature that is off, never a number
-  to invent. Every patch site carries the instruction word it expects and is skipped when the game does not have it
-  there, so a profile aimed at the wrong build cannot patch anything.
 
 - No game files in the repository: decompressed modules, the image, lifted C, builds, romfs copies, dumps and keys
   stay in `work/` (ignored) or in the dump's own folder. Nothing is pushed anywhere.

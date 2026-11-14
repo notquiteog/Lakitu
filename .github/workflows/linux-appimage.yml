@@ -133,7 +133,7 @@ jobs:
         id: objkey
         env:
           COMPILER: ${{ hashFiles('scripts/linux/deps.sh') }}
-          SOURCES: ${{ hashFiles('gpu/**', 'third_party/imgui/**', 'third_party/zstd/**', 'host/posix/**', 'nx2/build.py') }}
+          SOURCES: ${{ hashFiles('gpu/**', 'game/**', 'third_party/imgui/**', 'third_party/zstd/**', 'host/posix/**', 'nx2/build.py') }}
         run: |
           system=$(dpkg-query -W -f '${Package}=${Version}\n' libc6-dev libstdc++-13-dev libstdc++-12-dev | sha256sum | cut -c1-16)
           echo "prefix=linux-vk-objects-$COMPILER-$system-" >> "$GITHUB_OUTPUT"

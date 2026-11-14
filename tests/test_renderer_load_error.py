@@ -57,7 +57,7 @@ def check_posix(cc):
         tmp = Path(tmp)
         (tmp / "driver.c").write_text(DRIVER, encoding="utf-8")
         exe = tmp / "driver"
-        subprocess.run([cc, "-std=gnu11", "-D_GNU_SOURCE", "-w", "-I", str(ROOT / "host" / "posix"), "-I", str(ROOT / "game"), str(tmp / "driver.c"),
+        subprocess.run([cc, "-std=gnu11", "-D_GNU_SOURCE", "-w", "-I", str(ROOT / "host" / "posix"), str(tmp / "driver.c"),
                         str(ROOT / "host" / "posix" / "win32_posix.c"), "-o", str(exe), "-lpthread", "-ldl"], check=True)
         # a library that needs a symbol nothing loaded has, as hookshot_vk.so from another build would
         (tmp / "needs.c").write_text("extern int mkwvk_from_another_build(void);\nint use(void) { return mkwvk_from_another_build(); }\n",

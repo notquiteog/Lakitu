@@ -19,6 +19,7 @@
    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
+#include "game_profile.h"   /* (the present poll's return addresses) */
 #include "../gpu/render/rx_nvn.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1144,7 +1145,11 @@ NV(nvnEventGetValue) {
            while this one is replayed, as far as the window's textures and the replay's queue let it */
         static int nowait = -1;
         if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
-        if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
+        if (nowait && hos_game_profile_live()) {   /* (the poll's calls are the game profile's) */
+            static const unsigned long long lrs[] = GAME_LR_PRESENT_EVENTS;
+            for (int i = 0; i < GAME_LR_PRESENT_EVENT_COUNT; i++)
+                if (c->x[30] == lrs[i]) { RET(1); return; }
+        }
     }
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);

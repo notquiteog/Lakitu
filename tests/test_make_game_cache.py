@@ -326,8 +326,7 @@ class NupCacheTests(unittest.TestCase):
             self.run_to_lift(self.new_nup, supported=False)
         self.assertEqual(self.extractions, [self.new_nup])
         self.assertEqual(result.exception.code, 1)
-        self.assertIn("This is build 01234567. %s supports build %s." % (make_game.PRODUCT, make_game.BUILD_ID),
-                      self.output)   # (the project's name and the profile's build: nx2/game_profile.py)
+        self.assertIn("This is build 01234567. Hookshot supports build %s." % make_game.supported_text(), self.output)
         self.assertEqual(self.cache(), before)
         self.assertFalse((self.out / ".game").exists())
 
@@ -354,7 +353,7 @@ class NupCacheTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as result:
             self.run_to_lift(None, folders=self.extracted_dump(False, b"other version module"))
         self.assertEqual(result.exception.code, 1)
-        self.assertIn("This is build 01234567. %s supports build %s." % (make_game.PRODUCT, make_game.BUILD_ID), self.output)
+        self.assertIn("This is build 01234567. Hookshot supports build %s." % make_game.supported_text(), self.output)
         self.assertEqual(self.cache(), before)
         # (the .nup read before is still what the folder holds: reused, and its supported code reaches the lift)
         with self.assertRaises(Prepared):

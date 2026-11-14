@@ -23,7 +23,6 @@ HARNESS = r"""
 #include <vector>
 
 #define HOS_APP_ID "io.github.NotRexed.Hookshot"
-#define HOS_GAME_TITLE "Lakitu"   // (host/hos.h: the project's name, from game/game_profile.h)
 enum { HOS_SDL_VIDEO = 0x20, HOS_SDL_EVENTS = 0x4000 };
 static int version;
 static std::vector<std::string> hints;

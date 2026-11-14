@@ -56,9 +56,7 @@ def handlers(answer, run_worker=False):
         return types.SimpleNamespace(start=start)
     worker = types.SimpleNamespace(Thread=thread)
     namespace = dict(os=os, linux_update=linux_update, messagebox=popup, threading=worker,
-                     tk=types.SimpleNamespace(TclError=RuntimeError), folder_has_dlss=lambda _: False,
-                     # (the names the builder shows, which it takes from the game profile: nx2/game_profile.py)
-                     PRODUCT="Builder", GAME="a game")
+                     tk=types.SimpleNamespace(TclError=RuntimeError), folder_has_dlss=lambda _: False)
     exec(compile(ast.Module(body=methods, type_ignores=[]), "production-builder-handlers", "exec"), namespace)
     app = types.SimpleNamespace(tools="v2.1.0", latest=None, source_picked=False, update_tag=None,
                                 fetched=True, update_folder="prior", out=Value("authored-game"),

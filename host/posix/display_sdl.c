@@ -13,7 +13,7 @@
 #include "../hos_sdl.h"
 
 /* (the window's app id: the applications menu's entry names it as its StartupWMClass, builder/linux/hookshot_builder.py) */
-#define HOS_APP_ID "io.github.NotRexed.Lakitu"
+#define HOS_APP_ID "io.github.NotRexed.Hookshot"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,7 +228,7 @@ int hos_display_init(void) {
     }
     const char *env_class = getenv("HOS_WM_CLASS");
     const char *app_id = (env_class && env_class[0]) ? env_class : HOS_APP_ID;
-    hos_sdl_identity(window_title(HOS_GAME_TITLE), app_id);
+    hos_sdl_identity(window_title("Hookshot"), app_id);
     hos_sdl_hint("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
     hos_sdl_hint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     /* (bundled SDL tries x11 before wayland. NVIDIA's X11 surface has no mailbox, and an immediate

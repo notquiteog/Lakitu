@@ -6,10 +6,8 @@ only that load lets the game build both rendering and CPU culling from the chose
 angle, without changing the camera's authored angle or accumulating a scale.
 """
 
-import game_profile
-
-MAIN = game_profile.OOT.main_base   # (the "oot" profile names this module: nx2/game_profile.py)
-BUILD_ID = game_profile.OOT.build_id
+MAIN = 0x80020000
+BUILD_ID = "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348"
 SITE = MAIN + 0x4c52f8
 # The angle load, half-angle multiply and projection angle store.
 WORDS = (0xbd413e60, 0x1e210808, 0xbd00a280)
@@ -17,15 +15,10 @@ HOOK = ("{ extern void hos_oot_fov(Ctx *c, uint64_t camera); hos_oot_fov(c, c->x
         "   /* (nx2/oot_fov.py: gameplay field of view) */")
 
 
-# (main offset, the three consecutive words the hook relies on, the C after the first: nx2/game_profile.py install_sites)
-SITES = ((SITE - MAIN, WORDS, HOOK),)
-
-
-def install(lifter, img, build_id, profile=None):
-    if build_id != BUILD_ID:
+def install(lifter, img, build_id):
+    if build_id != BUILD_ID or any(img.word(SITE + 4 * i) != word for i, word in enumerate(WORDS)):
         print("field of view: unsupported camera code, left out")
         return 0
-    n = game_profile.install_sites(lifter, img, profile or game_profile.OOT, SITES, "field of view")
-    if n:
-        print("field of view: gameplay lens hooked")
-    return n
+    lifter.after[SITE] = (lifter.after[SITE] + "\n" if SITE in lifter.after else "") + HOOK
+    print("field of view: gameplay lens hooked")
+    return 1

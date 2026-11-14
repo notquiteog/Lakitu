@@ -26,7 +26,6 @@ of the scene's size, too little to see.
 Installed in every standalone lift (nx2/lift.py): FSR 3.1 needs no SDK, so a build without NVIDIA's has the jitter too.
 """
 
-import game_profile
 import oot_wide
 
 # (main offset, the original instruction word there, and the registers whose third lane gets the jitter's x and y: None
@@ -49,8 +48,19 @@ def _text(xreg, yreg):
             % (VIEW, PROJECTION, add))
 
 
-def install(lifter, img, profile=None):
-    """The sites into lifter.after, after what is there; a site whose word differs (another game version) is left out
-    (nx2/game_profile.py install_sites, against the profile's main base)"""
-    sites = tuple((off, word, _text(xreg, yreg)) for off, word, xreg, yreg in SITES)
-    return game_profile.install_sites(lifter, img, profile or game_profile.OOT, sites, "dlss jitter")
+def install(lifter, img):
+    """The sites into lifter.after, after what is there; a site whose word differs (another game version) is left out"""
+    n = 0
+    for off, word, xreg, yreg in SITES:
+        pc = oot_wide.MAIN + off
+        try:
+            have = img.word(pc)
+        except Exception:
+            have = None
+        if have != word:
+            print("dlss jitter: main+%#x holds %s, not %08x: left out" % (off, "?" if have is None else "%08x" % have, word))
+            continue
+        lifter.after[pc] = (lifter.after[pc] + "\n" if pc in lifter.after else "") + _text(xreg, yreg)
+        n += 1
+    print("dlss jitter: %d of %d sites" % (n, len(SITES)))
+    return n

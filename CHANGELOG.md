@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.3.0-rc.6](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.5...v2.3.0-rc.6) (2026-11-14)
+
+
+### Bug Fixes
+
+* **lift:** a compare above an unconditional branch no longer bounds the next block's jump table ([#31](https://github.com/notquiteog/Hookshot/issues/31)) ([8315fad](https://github.com/notquiteog/Hookshot/commit/8315fad2d680e43056c8951125a0805cd0a8758a))
+* **video:** answer the older SDK's video decoder calls [#16](https://github.com/notquiteog/Hookshot/issues/16) leaves out (Mario Kart World 1.0.0's movies) ([#21](https://github.com/notquiteog/Hookshot/issues/21)) ([5702c41](https://github.com/notquiteog/Hookshot/commit/5702c41dda28b80c3e64497402bbca36b12a4341))
+
+
+### Tests
+
+* catch an unordered vkDestroyBuffer and query read whatever the runner's timing ([#32](https://github.com/notquiteog/Hookshot/issues/32)) ([a8150d5](https://github.com/notquiteog/Hookshot/commit/a8150d5c8ea69b48d497100caae67f571ab03651))
+
 ## [2.3.0-rc.5](https://github.com/notquiteog/Hookshot/compare/v2.3.0-rc.4...v2.3.0-rc.5) (2026-11-14)
 
 

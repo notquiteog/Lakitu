@@ -87,7 +87,8 @@ def main():
     need(re.search(r"host_wide_menus,\s*host_slept_ns,\s*host_fps_timing", backend), "host/rx_backend.c does not give the back end its sleeps")
     need("host->fps_timing(" in pres, "the host is not told when to time its sleeps")
     threads = (ROOT / "host" / "hos_thread.c").read_text(encoding="utf-8")
-    need("0x80590520" in body(threads, "static void slept_since(") and "slept_since(" in body(threads, "HLE(_ZN2nn2os11SleepThread")
+    # (the present poll is the game profile's return address, Ocarina's 0x80590520, game/game_profile.h)
+    need("is_present_poll(" in body(threads, "static void slept_since(") and "slept_since(" in body(threads, "HLE(_ZN2nn2os11SleepThread")
          and "hos_poll_slept_ns" in backend and "hos_acquire_slept_ns" in backend,
          "the guest's sleeps are not counted, OoT's present poll apart")
     # (off: the host reads no clock for them)

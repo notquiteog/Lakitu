@@ -13,8 +13,9 @@ Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-fu
            to the native runtime in host/ or to generated stubs, plus hos_image.c (nx2/standalone.py). It shares the
            chunk boundaries of <work>/image, so its unhooked chunks are the emulator build's, byte for byte.
 
-  Which game this is a lift of, and so which patch sites, offsets and keys apply, comes from the game profile
-  (nx2/game_profile.py; HOOKSHOT_GAME=<key> selects one, default oot). This driver names no game itself.
+  Which game this is a lift of, and so which patches apply, comes from the game profile (nx2/game_profile.py),
+  chosen by main's build id (HOOKSHOT_GAME=<key> overrides it). This driver names no game itself; a build no profile
+  knows is lifted with no patches at all.
 """
 import argparse
 import collections
@@ -34,8 +35,8 @@ import insn
 import lift_fixes
 import suyu_rt_fixes
 import chunks
-import game_profile
 import standalone
+import game_profile
 import adr_entries  # noqa: E402
 import nso
 import poll
@@ -136,10 +137,6 @@ def main():
                    help="no extra entries at the code addresses ADR / ADRP+ADD take (nx2/adr_entries.py)")
     a = p.parse_args()
     a.exefs = a.exefs or kit.need_exefs()
-    # (which game this build is for, and so which patch sites, offsets and keys apply: nx2/game_profile.py)
-    profile = game_profile.active()
-    print("game profile: %s (%s)%s" % (profile.key, profile.game, "" if profile.main_base is not None else
-                                       ", no main base: its patches are off"))
     t0 = time.time()
     last = [t0]
 
@@ -175,12 +172,10 @@ def main():
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
     main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
-    if a.standalone:
-        # (hookshot) The game profile's patches: C after a few of the game's instructions, at addresses that are one
-        # build of one game's. Which modules those are comes from nx2/game_profile.py and not from imports here,
-        # because this driver is the same for every game the recompiler is pointed at; the profile's order matters
-        # (for Ocarina: widescreen, the gameplay lens, the upscalers' camera jitter, Occlusion Off).
-        game_profile.install_patches(L, img, profile, build_id=main_build)
+    profile = game_profile.active(build_id=main_build)
+    print("game profile: %s (%s) for main %s" % (profile.key, profile.game, main_build or "?"))
+    if a.standalone:   # (hookshot) the game's lift patches (Ocarina's: widescreen, the lens, the jitter, occlusion off)
+        game_profile.install_patches(L, img, profile, main_build)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     last[0] = time.time()
@@ -201,14 +196,13 @@ def main():
         gen = os.path.join(out_dir, "gen")
         files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
                              counters=[] if a.no_polls else [poll.stats], took=took)
-        # (the game's edits of the lifted C: which module, and whether the image is the one build its gated edits are
-        # for, come from the game profile; nx2/game_profile.py code_patches)
-        patches, supported = game_profile.code_patches(profile, main_build=main_build, standalone=a.standalone)
         def tables():   # (the runtime tables and the standalone files: they read the image, not the lifted C)
             lines = []
             a64_rtgen.write(gen)
             if a.standalone:
                 start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)
+                # the profile's C view beside the lifted C, for nx2/build.py to compile the runtime with
+                lines.append("standalone: %s" % game_profile.write_header(os.path.join(out_dir, "game"), profile))
                 lines.append("standalone: hos_image.c (thread hooks %#x, %#x), %d import stubs" % (
                     start, exit_, standalone.gen_stubs(gen, meta)))
                 nvn = standalone.nvn_exports(nso.load_exefs(a.exefs))
@@ -217,6 +211,9 @@ def main():
             return lines
         # (made in a process of their own while the C is edited: 4-8 s that waited for the edits. Where there is no fork, after them)
         side = chunks.start_side(tables)
+        patches = profile.code_patch_module   # (Ocarina's nx2/oot_patches.py; none for a game without them)
+        supported = bool(patches) and a.standalone and \
+            main_build == getattr(game_profile.load_module(patches), "LIFE_BUILD_ID", None)
         chunks.edit_c(gen, L.stats, supported, whole=not a.max_func, took=took, patches=patches)
         print("\n".join(chunks.end_side(side, tables)), flush=True)
         took("runtime tables and standalone files (beside the edits)" if side else "runtime tables and standalone files")

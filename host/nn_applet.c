@@ -192,6 +192,27 @@ uint64_t hos_rt_pool_size(uint64_t game) {
     return v;
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(handheld() ? 0 : 1); }     /* OperationMode_Handheld / _Console (docked) */
+/* GetDefaultDisplayResolution(int* width, int* height): what a Switch 2 answers: 1920 x 1080 in handheld mode (its
+   screen), 3840 x 2160 docked (the dock's output to a 4K TV, which is what HOS_HANDHELD=0, the runtime's default, plays
+   as; on a 1080p TV the console says 1920 x 1080). It is the console's output, not this runtime's: the picture's
+   size here is hos_output_size's and the game's own render targets, which this answer does not change. Kirby Air
+   Riders asks at start (found in Dragoon, its fork); left to the SDK's own code, which asks the applet service this
+   runtime does not serve over IPC, both stayed whatever the stack held. Ocarina's SDK has the call too; the log says
+   whether it asks. */
+HLE(_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_) {
+    const uint32_t w = handheld() ? 1920 : 3840, h = handheld() ? 1080 : 2160;
+    static int logged;
+    if (!logged++) hos_log("oe: default display resolution %ux%u (%s; lr %#llx)", w, h, handheld() ? "handheld" : "docked",
+                           (unsigned long long)c->x[30]);
+    if (ARG(0) && hos_guest_range(ARG(0), 4)) G32(ARG(0)) = w;
+    if (ARG(1) && hos_guest_range(ARG(1), 4)) G32(ARG(1)) = h;
+}
+/* GetDefaultDisplayResolutionChangeEvent(SystemEvent*): an event that is never signalled, because the output never
+   changes while the game runs. Left to the stub, the game's event was never made at all. */
+void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
+HLE(_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE) {
+    if (ARG(0)) hos_system_event_init(ARG(0), 0);
+}
 HLE(_ZN2nn2oe18GetPerformanceModeEv) { RET(handheld() ? 0 : 1); }   /* PerformanceMode_Normal / _Boost (docked) */
 HLE(_ZN2nn2oe20GetCurrentFocusStateEv) { RET(1); }    /* FocusState_InFocus */
 HLE(_ZN2nn2oe25GetProgramTotalActiveTimeEv) { RET(hos_now_ns() - boot_ns); }

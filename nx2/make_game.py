@@ -47,16 +47,23 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = [sys.executable, "-I", "-u", "-X", "utf8"]   # (utf8: every step's output in UTF-8 whatever the console's code page: lift.py crashed on a letter, #180)   # (-u: the steps' output as it comes, not in 8 KB blocks minutes apart)
-sys.path.insert(0, HERE)   # (python -I leaves the script folder off; also done again below)
-import game_profile
-PROFILE = game_profile.active()
-PRODUCT = game_profile.PROJECT
-# The game build the patches, the hot list and the profile were made from: the game profile's, not a constant here.
-# A profile with no build id (one whose game has not been dumped yet) cannot check the player's copy, and says so
-# rather than rejecting every copy or accepting any.
-BUILD_ID = (PROFILE.build_id or "")[:8]
 STARTED = time.time()   # (the build's total time, kept in build_times.json and said as @@times)
 sys.path[:0] = [HERE, os.path.join(ROOT, "third_party", "a64-kit", "tools")]   # (python -I leaves the script folder off)
+import game_profile   # noqa: E402  (which builds have a game profile, nx2/game_profile.py)
+# The default game's build, as the docs quote it (Ocarina's e0f3ccfa: the version its patches, the hot list and the
+# profile were made from). Which builds are accepted is the game profiles' list (supported_build), not this one.
+BUILD_ID = game_profile.GAMES[game_profile.DEFAULT].build_id[:8]
+
+
+def supported_text():
+    """The builds a game profile knows, as the refusal says them (e0f3ccfa or 9ede0383)"""
+    return " or ".join(prefix for _, prefix in game_profile.known_builds())
+
+
+def supported_build(bid):
+    """The game profile for this main's build id, or None when no profile knows it"""
+    p = game_profile.for_build(bid[:8])   # (by the 8 digits the messages quote, as the check always went)
+    return p if p.build_id else None
 import toolchain as _toolchain
 import disk as _disk
 # (hookshot) RX_TARGET=windows on Linux: the Windows game, with llvm-mingw's Linux release (HOOKSHOT_MINGW, or llvm-mingw
@@ -452,17 +459,13 @@ def check_modules(exefs):
                 head = f.read(16)
             if head[:4] != b"NSO0":
                 fail("The file %s in this dump is not a game module (it starts %s). Try another dump of the game, or send this message to the "
-                     "%s developers." % (name, head.hex(), PRODUCT))
+                     "Hookshot developers." % (name, head.hex()))
 
 
 def check_supported_build(exefs):
     bid = build_id(os.path.join(exefs, "main"))
-    if not BUILD_ID:
-        say("check", "bad", "The %s game profile does not say which build is supported, so this copy (build %s) "
-                            "cannot be checked." % (PROFILE.key, bid[:8]))
-        return
-    if not bid.startswith(BUILD_ID):
-        fail("This is build %s. %s supports build %s." % (bid[:8], PRODUCT, BUILD_ID))
+    if not supported_build(bid):
+        fail("This is build %s. Hookshot supports build %s." % (bid[:8], supported_text()))
 
 
 def file_progress(verb, clock=time.monotonic):
@@ -608,8 +611,8 @@ def check_cpu():
     from host_cpu import host_march
     m = host_march()
     if m != "x86-64-v3":
-        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build %s from source "
-             "instead (see the readme): a source build follows your processor." % (m, PRODUCT))
+        fail("Your processor has no AVX2 (it runs %s), and the AppImage's renderer needs it. Build Hookshot from source "
+             "instead (see the readme): a source build follows your processor." % m)
 
 
 def check(a, work):
@@ -624,13 +627,10 @@ def check(a, work):
         shutil.rmtree(probe, ignore_errors=True)
     else:
         bid = build_id(os.path.join(a.exefs, "main"))
-    if not BUILD_ID:
-        say("check", "bad", "The %s game profile does not say which build is supported, so this copy (build %s) "
-                            "cannot be checked." % (PROFILE.key, bid[:8]))
-    elif bid.startswith(BUILD_ID):
-        say("check", "ok", "This is the version %s supports (build %s)." % (PRODUCT, bid[:8]))
+    if supported_build(bid):   # (a build some game profile knows: nx2/game_profile.py)
+        say("check", "ok", "This is the version Hookshot supports (build %s)." % bid[:8])
     else:
-        say("check", "bad", "This is build %s. %s supports build %s." % (bid[:8], PRODUCT, BUILD_ID))
+        say("check", "bad", "This is build %s. Hookshot supports build %s." % (bid[:8], supported_text()))
 
 
 def visual_studio_environment():
@@ -1613,7 +1613,7 @@ def lift_sources():
     todo = [os.path.join(HERE, f) for f in LIFT_SCRIPTS]
     # (the game profiles' patch modules: nx2/game_profile.py imports them by the names its profiles hold, which this walk
     # cannot see, so every profile's are roots of it. All profiles', not the active one's: the key then does not depend
-    # on HOOKSHOT_GAME, and a change to any game's patches translates again, which is the safe direction)
+    # on HOOKSHOT_GAME, and a change to any game's patches translates again, which is the safe direction. Lakitu fafd5cde)
     for prof in game_profile.GAMES.values():
         for name in prof.patch_modules + ((prof.code_patch_module,) if prof.code_patch_module else ()):
             todo.append(os.path.join(HERE, name + ".py"))
@@ -2499,7 +2499,7 @@ def main(a=None):
         try:
             os.replace(dst + ".new", dst)   # (linux: a running copy keeps its own file; windows: a running exe cannot be replaced)
         except PermissionError:
-            fail("Could not replace %s. Close any running copy of the game and check that the file and folder are writable, then retry. "
+            fail("Could not replace %s. Close any running copy of Hookshot and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
@@ -2624,7 +2624,7 @@ def cli():
                 say("error", drive_error(e))
                 sys.exit(1)
             say("error", "The builder stopped on an error it did not expect: %s: %s. Please send the text under Show details to the "
-                "%s issues page." % (type(e).__name__, str(e)[:300], PRODUCT))
+                "Hookshot issues page." % (type(e).__name__, str(e)[:300]))
             sys.exit(1)
 
 

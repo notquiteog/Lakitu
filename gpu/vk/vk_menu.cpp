@@ -28,9 +28,6 @@
 #include <system_error>
 #include <vector>
 
-// (hookshot) the project's name for the menu's heading: the game profile
-#include "game_profile.h"
-
 #include "vk_paths.h"
 #include "vk_menu.h"
 #include "vk_menu_hit.h"

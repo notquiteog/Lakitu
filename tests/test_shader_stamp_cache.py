@@ -26,7 +26,7 @@ def production_code(path):
     # (opennr_jobs: open neural rendering's sources, which the branch adds; without third_party/opendlss-nr, as in
     # this fixture's tree, it adds none)
     names = {"tree_headers", "vk_sources", "flag_text", "object_key", "streamline_sdk_path", "opennr_jobs",
-             "zstd_jobs", "game_profile_key"}
+             "zstd_jobs"}
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {n.name for n in functions} == names
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -90,8 +90,6 @@ class ShaderStampCacheTests(unittest.TestCase):
             "third_party/zbic/zstd.c": "int zstd_zbic;\n",
             "third_party/zbic/zstd.h": "int zstd_zbic_h;\n",
             "third_party/zbic/zstd_errors.h": "int zstd_zbic_errors;\n",
-            # the game profile's C view: the renderer reads it, so a change to it has to rebuild the back end
-            "game/game_profile.h": '#define GAME_PROFILE_KEY "fixture"\n',
         }
         for name, text in self.files.items():
             path = self.root / name
@@ -103,7 +101,6 @@ class ShaderStampCacheTests(unittest.TestCase):
         namespace = {
             "os": os, "hashlib": hashlib,
             "GPU": str(self.root / "gpu"), "POSIX": str(self.root / "host/posix"), "HOST": str(self.root / "host"),
-            "GAME": str(self.root / "game"),
             "LINUX": linux, "CPU": ["-march=x86-64"],
             "kit": SimpleNamespace(ROOT=str(self.root), HERE=str(self.root / "nx2")),
             "toolchain": SimpleNamespace(find=lambda name: name, need=lambda name: name, mingw=lambda: mingw),
@@ -171,21 +168,6 @@ class ShaderStampCacheTests(unittest.TestCase):
                 path.write_bytes(b"int bank_changed;\n")
                 self.assertEqual(self.changed(before, self.jobs(linux)),
                                  {"gpu/vk/vk_bank.cpp", "gpu/vk/vk_shader.cpp"})
-
-    def test_game_profile_header_invalidates_the_back_end_but_not_the_translator(self):
-        """A different game profile has to rebuild the renderer's own objects, which read its keys, and nothing of
-        Eden or sirit, which do not: those ~500 files are the slow half of the build."""
-        path = self.root / "game/game_profile.h"
-        for linux in (False, True):
-            with self.subTest(linux=linux):
-                path.write_bytes(b'#define GAME_PROFILE_KEY "fixture"\n')
-                before = self.jobs(linux)
-                path.write_bytes(b'#define GAME_PROFILE_KEY "other"\n')
-                changed = self.changed(before, self.jobs(linux))
-                self.assertTrue(changed, "a game profile change rebuilt nothing")
-                self.assertIn("gpu/vk/vk_draw.cpp", changed)
-                self.assertNotIn("gpu/vk/eden/translate.cpp", changed)
-                self.assertNotIn("gpu/vk/sirit/src/sirit.cpp", changed)
 
     def test_headers_still_invalidate_the_existing_dependency_groups(self):
         path = self.root / "gpu/vk/eden/ir.h"

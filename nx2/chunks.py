@@ -24,7 +24,6 @@ import os
 import re
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-import game_profile   # (the game's code patch module, by the name its profile holds: load_module)
 import whole_write   # (rewrites written beside and moved over: issue 1197)
 
 import a64_lift
@@ -516,25 +515,25 @@ def split_big(gen_dir, files, budget=None, jobs=None):
 
 
 def _edit_patches(job):
-    """(edit_c, one file, in a process of its own) the game's patches (the game profile's code patch module, by name:
-    nx2/oot_patches.py for Ocarina)"""
+    """(edit_c, one file, in a process of its own) the game's patches (the game profile's code patch module)"""
     path, supported, patches = job
-    module = game_profile.load_module(patches)
     with open(path, encoding="utf-8", newline="") as f:
         s = f.read()
-    out, counts, lines = module.patch_file(s, os.path.basename(path), supported)
+    import game_profile
+    out, counts, lines = game_profile.load_module(patches).patch_file(s, os.path.basename(path), supported)
     if out != s:
         whole_write.write_whole(path, out, newline="")
     return counts, lines
 
 
 def _edit_marks(job):
-    """(edit_c, one file, in a process of its own) the output-size edits (the game's, when its profile has a code patch
+    """(edit_c, one file, in a process of its own) the output-size edits (the game's: none without a code patch
     module), then the page marks of each group of stores (a64_lift.mark_groups, which changes the text they match)"""
     path, patches = job
     with open(path, encoding="utf-8", newline="") as f:
         s = f.read()
     if patches:
+        import game_profile
         out, found, lines = game_profile.load_module(patches).output_size_file(s, os.path.basename(path))
     else:
         out, found, lines = s, [], []
@@ -622,33 +621,36 @@ def end_side(side, fn):
 
 def edit_c(gen, stats, supported, whole=True, took=None, jobs=None, patches="oot_patches"):
     """(nx2/lift.py, after the lift writes its C; here, beside the writing, so it imports without the lift's tools) The edits of the
-    written C, in this order: the game's patches (patches: the game profile's code patch module by name, nx2/oot_patches.py for
-    Ocarina, which find the lift's exact text; the supported build's whole standalone lift fails when an output-size edit finds no
-    place), then, last, the page marks of each group of stores shared (a64_lift.mark_groups), which changes that text. stats: the
-    lift's, for its report. patches None (a profile with no code patch module, nx2/game_profile.py code_patches): only the
-    page marks, which are the engine's and not a game's.
+    written C, in this order: the game's patches (nx2/oot_patches.py, which find the lift's exact text; the supported build's whole
+    standalone lift fails when an output-size edit finds no place), then, last, the page marks of each group of stores shared
+    (a64_lift.mark_groups), which changes that text. stats: the lift's, for its report.
     Each file's edits are its own; only the counts are over all of them. So the files go through two passes, each a process per
     file (jobs: file_jobs(); new processes where there is no fork): the patches; then, after the counts' rules (oot_patches.report: the step
     divides both or neither), the output size and the groups. Five passes over the 1.5 GB of C on one core took a minute. The
-    files and the lines printed are the one-process ones, byte for byte (tests/test_mark_groups.py)"""
-    module = game_profile.load_module(patches) if patches else None
+    files and the lines printed are the one-process ones, byte for byte (tests/test_mark_groups.py).
+    patches: the game profile's code patch module by name (nx2/game_profile.py; Ocarina's oot_patches), or
+    None for a game that has none: then only the page marks, which every game's C gets."""
     took = took or (lambda what: None)
     jobs = file_jobs() if jobs is None else jobs
     paths = sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c")))
-    if module is not None:
+    import game_profile
+    module = game_profile.load_module(patches) if patches else None
+    if module:
         done = _each(_edit_patches, [(p, supported, patches) for p in paths], jobs)
         for _, lines in done:
             if lines:
                 print("\n".join(lines))
         module.report(paths, [counts for counts, _ in done], supported)
         took("patches (%d processes)" % jobs)
-    found = [0] * len(module.OUT_EDITS) if module is not None else []
+    else:
+        print("patches: the game profile has no code patch module")
+    found = [0] * (len(module.OUT_EDITS) if module else 0)
     for here, lines, st in _each(_edit_marks, [(p, patches) for p in paths], jobs):
         found = [a + b for a, b in zip(found, here)]
         if lines:
             print("\n".join(lines))
         for k, v in st.items():
             stats[k] = stats.get(k, 0) + v
-    if module is not None:
+    if module:
         module.check_output_size(found, required=supported and whole)
     took("output size and page-mark groups")
